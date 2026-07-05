@@ -5,4 +5,15 @@ services:
       - "5000:5000"
     devices:
       - /dev/video0:/dev/video0
+      - /dev/dri/renderD129:/dev/dri/renderD129
+    privileged: true
+    volumes:
+      - /usr/lib/librknn_api.so:/usr/lib/librknn_api.so
+      - /usr/lib/librknnrt.so:/usr/lib/librknnrt.so
+      - /proc/device-tree/compatible:/proc/device-tree/compatible:ro
+      - ./model:/app/model:ro
+      - ./app.py:/app/app.py
+      - ./pipeline.py:/app/pipeline.py
+      - ./test_pipeline.py:/app/test_pipeline.py
+      - /home/orangepi/work/data/coco8:/app/coco8:ro
     restart: unless-stopped

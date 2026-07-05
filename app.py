@@ -76,6 +76,21 @@ def generate():
         )
 
 
+def generate_debug():
+    while True:
+        with lock:
+            jpeg = latest_jpeg
+        if jpeg is None:
+            continue
+        frame = cv2.imdecode(np.frombuffer(jpeg, dtype=np.uint8), cv2.IMREAD_COLOR)
+        canvas, pad, scale = pipeline.process_canvas(frame)
+        ret, out = cv2.imencode(".jpg", canvas)
+        yield (
+            b"--frame\r\n"
+            b"Content-Type: image/jpeg\r\n\r\n" + out.tobytes() + b"\r\n"
+        )
+
+
 @app.route("/")
 def index():
     return """<!DOCTYPE html>
@@ -97,6 +112,56 @@ img { width: 100vw; height: 100vh; object-fit: contain; }
 def stream():
     return Response(
         generate(),
+        mimetype="multipart/x-mixed-replace; boundary=frame",
+    )
+
+
+@app.route("/debug")
+def debug():
+    return Response(
+        generate_debug(),
+        mimetype="multipart/x-mixed-replace; boundary=frame",
+    )
+
+
+@app.route("/raw")
+def raw_debug():
+    with lock:
+        jpeg = latest_jpeg
+    if jpeg is None:
+        return "no frame"
+    frame = cv2.imdecode(np.frombuffer(jpeg, dtype=np.uint8), cv2.IMREAD_COLOR)
+    h, w = frame.shape[:2]
+    input_tensor, scale, pad = pipeline._preprocess(frame)
+    outputs = pipeline._infer(input_tensor)
+    from pipeline import COCO_CLASSES
+    lines = [f"Frame: {w}x{h}, scale={scale:.3f}, pad={pad}"]
+    lines.append(f"outputs: {len(outputs)} tensors")
+    for i, o in enumerate(outputs):
+        lines.append(f"  [{i}] shape={list(o.shape)} dtype={o.dtype}")
+    boxes, scores, class_ids = pipeline._postprocess(outputs, scale, pad, (w, h))
+    for box, score, cls_id in zip(boxes, scores, class_ids):
+        x1, y1, x2, y2 = box.astype(int)
+        lines.append(f"  {COCO_CLASSES[cls_id]}:{score:.2f} {x1},{y1},{x2},{y2}")
+    return "<pre>" + "\n".join(lines) + "</pre>"
+
+
+_test_objects = None
+
+
+def _get_test_objects():
+    global _test_objects
+    if _test_objects is None:
+        from test_pipeline import load_coco8_objects
+        _test_objects = load_coco8_objects()
+    return _test_objects
+
+
+@app.route("/test")
+def test():
+    from test_pipeline import generate_test_frames
+    return Response(
+        generate_test_frames(pipeline, _get_test_objects()),
         mimetype="multipart/x-mixed-replace; boundary=frame",
     )
 

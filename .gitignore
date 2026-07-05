@@ -1,0 +1,7 @@
+model/
+.ipynb_checkpoints/
+*.log
+__pycache__/
+*.pyc
+tmp/
+/tmp/

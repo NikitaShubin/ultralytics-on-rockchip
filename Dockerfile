@@ -7,7 +7,9 @@ WORKDIR /app
 
 COPY requirements.txt .
 RUN uv pip install --system --no-cache -r requirements.txt
+RUN uv pip install --system --no-cache rknn-toolkit-lite2
 
 COPY app.py pipeline.py .
+COPY model /app/model
 
 CMD ["python3", "app.py"]
