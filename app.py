@@ -38,6 +38,8 @@ class CameraManager:
         self._stopped = False
         self._thread = None
         self._proc = None
+        self._bad_devices = set()
+        self._proc_start_time = 0.0
 
     def start(self):
         self._stopped = False
@@ -90,13 +92,22 @@ class CameraManager:
     def _find_and_connect(self):
         while not self._stopped:
             devices = sorted(glob.glob("/dev/video[0-9]*"))
+            any_skipped = False
             for dev in devices:
                 if self._stopped:
                     return
+                if dev in self._bad_devices:
+                    any_skipped = True
+                    continue
                 if self._try_camera(dev):
+                    self._bad_devices.clear()
                     print(f"[[CAM]] connected to {dev}", flush=True)
                     return
-            time.sleep(0.2)
+            if any_skipped:
+                time.sleep(1.0)
+                self._bad_devices.clear()
+            else:
+                time.sleep(0.2)
 
     def _try_camera(self, dev):
         variants = [
@@ -135,32 +146,54 @@ class CameraManager:
             try:
                 proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
                                         stderr=subprocess.DEVNULL)
-                r, _, _ = select.select([proc.stdout], [], [], 0.5)
+                r, _, _ = select.select([proc.stdout], [], [], 1.5)
                 if r:
                     self._proc = proc
+                    self._proc_start_time = time.monotonic()
                     self.device = dev
                     with self._lock:
                         self.connected = True
                     print(f"[[CAM]] try {dev} variant {idx} OK", flush=True)
                     return True
                 proc.kill()
+                proc.wait(timeout=1)
                 print(f"[[CAM]] try {dev} variant {idx} timeout", flush=True)
             except Exception as e:
                 print(f"[[CAM]] try {dev} variant {idx} error: {e}", flush=True)
+            time.sleep(0.2)
         return False
 
     def _read_loop(self):
         buf = b""
         last_frame_time = time.monotonic()
         stat_check = time.monotonic()
-        loop_start = time.monotonic()
         while not self._stopped and self._proc:
-            if time.monotonic() - loop_start > 30.0:
-                print("[[CAM]] break: reconnect timer", flush=True)
-                self._kill_proc()
-                break
+            now = time.monotonic()
+            if now - stat_check > 3.0:
+                stat_check = now
+                if self.device:
+                    try:
+                        r = subprocess.run(["stat", self.device],
+                                           capture_output=True, timeout=2)
+                        if r.returncode != 0:
+                            print("[[CAM]] break: stat failed", flush=True)
+                            self._kill_proc()
+                            break
+                    except FileNotFoundError:
+                        print("[[CAM]] break: stat cmd not found", flush=True)
+                        self._kill_proc()
+                        break
+                    except subprocess.TimeoutExpired:
+                        print("[[CAM]] break: stat timeout", flush=True)
+                        self._kill_proc()
+                        break
             if self._proc.poll() is not None:
-                print("[[CAM]] break: proc exited", flush=True)
+                runtime = time.monotonic() - self._proc_start_time
+                if runtime < 1.5 and self.device:
+                    print(f"[[CAM]] break: proc exited after {runtime:.1f}s — marking {self.device} as bad", flush=True)
+                    self._bad_devices.add(self.device)
+                else:
+                    print("[[CAM]] break: proc exited", flush=True)
                 break
             if self.device and glob.glob(self.device) == []:
                 print("[[CAM]] break: device vanished", flush=True)
@@ -172,14 +205,7 @@ class CameraManager:
                 print("[[CAM]] break: select ValueError", flush=True)
                 break
             if not r:
-                now = time.monotonic()
-                if now - stat_check > 3.0:
-                    stat_check = now
-                    if self.device and not os.path.exists(self.device):
-                        print("[[CAM]] break: stat check failed", flush=True)
-                        self._kill_proc()
-                        break
-                since_last = now - last_frame_time
+                since_last = time.monotonic() - last_frame_time
                 if since_last > 1.5:
                     print(f"[[CAM]] break: frame timeout {since_last:.1f}s", flush=True)
                     self._kill_proc()
