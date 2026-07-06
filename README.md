@@ -1,25 +1,13 @@
 # webcam
 
-Real-time MJPEG-стрим с вебкамеры + YOLOv8 детекция на NPU (RK3588S).
+Real-time MJPEG-стрим с вебкамеры + YOLO детекция на NPU (RK3588S).
 
-## Внешние зависимости на хосте
+## Требования
 
-Docker Engine (https://docs.docker.com/engine/install/ubuntu/), пользователь в группе `docker`.
+- Docker Engine, пользователь в группе `docker`
+- RK3588S с установленными библиотеками NPU (`librknnrt.so`, `librknn_api.so`)
 
-### Обновление librknnrt.so
-
-Хостовая библиотека `librknnrt.so` (rknpu2 v1.4.0) несовместима с моделями,
-собранными rknn-toolkit2 v2.x — ошибка `Invalid RKNN model version 6`.
-Необходимо заменить её версией из репозитория airockchip:
-
-```bash
-sudo curl -sLo /usr/lib/librknnrt.so \
-  https://raw.githubusercontent.com/airockchip/rknn-toolkit2/master/rknpu2/runtime/Linux/librknn_api/aarch64/librknnrt.so
-sudo cp /usr/lib/librknnrt.so /usr/lib/librknn_api.so
-sudo ldconfig
-```
-
-## Сборка и запуск
+## Быстрый старт
 
 ```bash
 docker compose up -d --build
@@ -29,29 +17,48 @@ docker compose up -d --build
 
 ## Модели
 
-По умолчанию используется **YOLOv8n** (nano) — в 2.3× быстрее v8m (~9 FPS vs ~3 FPS
-end-to-end) и меньше ложных срабатываний.
+По умолчанию используется **yolo11n** (RK-opt ONNX → RKNN).
 
-Переключение на YOLOv8m — изменить `model_path` в `pipeline.py` на
-`/app/model/yolov8m-rk3588.rknn`.
+Готовые `.rknn` лежат в `model/`. Файл модели задаётся в `pipeline.py` (переменная `MODEL_PATH`).
 
-### Подготовка .rknn модели
+### Конвертация моделей
 
-Внутри контейнера с rknn-toolkit2 v2.3.2 (arm64) и ultralytics:
+Конвертер вынесен в отдельное docker-окружение (`converter/`):
 
-```python
-from ultralytics import YOLO
-model = YOLO("yolov8n.pt")  # или yolov8m.pt
-model.export(format="rknn")
+```bash
+cd converter
+docker compose run --rm converter convert <model_name>
 ```
 
-Готовый `.rknn` скопировать на хост и положить в `model/`.
+Например:
+
+```bash
+docker compose run --rm converter convert yolov8n
+```
+
+Результат (`.rknn` + `.onnx`) копируется в `model/`.
+
+**Пакетная выгрузка ONNX (без компиляции RKNN):**
+
+```bash
+docker compose run --rm converter batch-onnx --model-list models_detect_all.txt
+```
+
+Список поддерживаемых моделей: `models_detect.txt` (25 моделей), `models_detect_all.txt` (48 моделей).
+
+## Структура проекта
+
+```
+webcam/
+├── app.py              # Flask-приложение (MJPEG-стрим)
+├── pipeline.py         # Загрузка модели, pre/post-processing, инференс
+├── docker-compose.yml  # Сервис webcam
+├── Dockerfile          # Образ webcam (rknn-toolkit-lite2)
+├── model/              # Готовые .rknn и .onnx модели
+└── converter/          # Инструмент конвертации .pt → .onnx → .rknn
+```
 
 ## Известные проблемы
 
-### 3×3 тайлинг детекций (YOLOv8m)
-
-Модель YOLOv8m после экспорта через rknn-toolkit2 v2.3.2 выдаёт множественные
-детекции одного объекта в сетке 3×3 (артефакт stride-16 head).
-Смягчено пост-процессингом в `pipeline.py::_dedup()`: группировка боксов
-по классу и соотношению размеров (>75%), сохранение лучшего по score.
+- Модели с нестандартными головами (RT-DETR, YOLO-NAS, YOLOWorld) не поддерживаются
+- Компиляция RKNN (`rknn.build`) на aarch64 занимает много времени для больших моделей
