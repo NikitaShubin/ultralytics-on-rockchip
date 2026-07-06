@@ -50,13 +50,21 @@ docker compose run --rm converter batch-onnx --model-list models_detect_all.txt
 
 ```
 webcam/
-├── app.py              # Flask-приложение (MJPEG-стрим)
+├── app.py              # Flask-приложение (MJPEG-стрим + CameraManager)
 ├── pipeline.py         # Загрузка модели, pre/post-processing, инференс
+├── camtest.py          # Диагностика камеры/ffmpeg в контейнере
 ├── docker-compose.yml  # Сервис webcam
 ├── Dockerfile          # Образ webcam (rknn-toolkit-lite2)
 ├── model/              # Готовые .rknn и .onnx модели
 └── converter/          # Инструмент конвертации .pt → .onnx → .rknn
 ```
+
+## Горячее подключение камер
+
+Контейнер использует `volumes: /dev:/dev` вместо статического `devices: /dev/video0:/dev/video0`, 
+поэтому новые камеры, подключённые после запуска контейнера, автоматически обнаруживаются.
+Камера переподключается каждые 30 секунд — при отключении заглушка "Camera not connected"
+появляется в течение этого интервала.
 
 ## Известные проблемы
 

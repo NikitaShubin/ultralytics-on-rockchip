@@ -1,5 +1,9 @@
+import glob
+import os
+import select
 import subprocess
 import threading
+import time
 
 import cv2
 import numpy as np
@@ -7,88 +11,245 @@ from flask import Flask, Response
 
 from pipeline import Pipeline
 
-WIDTH, HEIGHT = 640, 480
-FPS = 15
+CAM_W, CAM_H = 640, 480
+CAM_FPS = 15
 
 app = Flask(__name__)
+
+_NC = np.full((480, 640, 3), (114, 114, 114), dtype=np.uint8)
+cv2.putText(_NC, "Camera not connected", (130, 240),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (50, 50, 50), 2)
+_ret, _NCJ = cv2.imencode(".jpg", _NC)
+NO_CAM_JPEG = _NCJ.tobytes() if _ret else b""
+
 pipeline = Pipeline()
 
-cmd = [
-    "ffmpeg",
-    "-fflags", "nobuffer",
-    "-flags", "low_delay",
-    "-analyzeduration", "0",
-    "-probesize", "32",
-    "-f", "v4l2",
-    "-input_format", "mjpeg",
-    "-video_size", f"{WIDTH}x{HEIGHT}",
-    "-framerate", str(FPS),
-    "-i", "/dev/video0",
-    "-f", "image2pipe",
-    "-vcodec", "copy",
-    "-",
-]
 
-proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+class CameraManager:
+    def __init__(self, width=CAM_W, height=CAM_H, fps=CAM_FPS):
+        self.width = width
+        self.height = height
+        self.fps = fps
+        self.device = None
+        self.latest_jpeg = None
+        self.connected = False
+        self.frame_time = 0.0
+        self._lock = threading.Lock()
+        self._stopped = False
+        self._thread = None
+        self._proc = None
 
-latest_jpeg = None
-lock = threading.Lock()
+    def start(self):
+        self._stopped = False
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
 
+    def stop(self):
+        self._stopped = True
+        self._kill_proc()
 
-def reader_thread():
-    global latest_jpeg
-    buf = b""
-    while True:
-        chunk = proc.stdout.read(65536)
-        if not chunk:
-            break
-        buf += chunk
-        while True:
-            start = buf.find(b"\xff\xd8")
-            if start < 0:
-                buf = b""
+    def get_state(self):
+        with self._lock:
+            return self.latest_jpeg, self.connected, self.frame_time
+
+    def disconnect(self):
+        self._kill_proc()
+
+    def _kill_proc(self):
+        proc, self._proc = self._proc, None
+        if proc is not None:
+            try:
+                proc.kill()
+                proc.wait(timeout=2)
+            except Exception:
+                pass
+
+    def _run(self):
+        while not self._stopped:
+            try:
+                self._find_and_connect()
+                if self._stopped:
+                    break
+                self._read_loop()
+                self._on_disconnect()
+            except Exception as e:
+                print(f"[[CAM]] _run exception: {e}", flush=True)
+                import traceback
+                traceback.print_exc()
+                self._on_disconnect()
+                time.sleep(1.0)
+
+    def _on_disconnect(self):
+        with self._lock:
+            self.connected = False
+            self.latest_jpeg = None
+            self.device = None
+        self._kill_proc()
+        print("[[CAM]] disconnected", flush=True)
+
+    def _find_and_connect(self):
+        while not self._stopped:
+            devices = sorted(glob.glob("/dev/video[0-9]*"))
+            for dev in devices:
+                if self._stopped:
+                    return
+                if self._try_camera(dev):
+                    print(f"[[CAM]] connected to {dev}", flush=True)
+                    return
+            time.sleep(0.2)
+
+    def _try_camera(self, dev):
+        variants = [
+            [
+                "ffmpeg",
+                "-fflags", "nobuffer",
+                "-flags", "low_delay",
+                "-analyzeduration", "0",
+                "-probesize", "32",
+                "-f", "v4l2",
+                "-input_format", "mjpeg",
+                "-video_size", f"{self.width}x{self.height}",
+                "-framerate", str(self.fps),
+                "-i", dev,
+                "-f", "image2pipe",
+                "-vcodec", "copy",
+                "-",
+            ],
+            [
+                "ffmpeg",
+                "-fflags", "nobuffer",
+                "-flags", "low_delay",
+                "-analyzeduration", "0",
+                "-probesize", "32",
+                "-f", "v4l2",
+                "-video_size", f"{self.width}x{self.height}",
+                "-framerate", str(self.fps),
+                "-i", dev,
+                "-f", "image2pipe",
+                "-c:v", "mjpeg",
+                "-q:v", "5",
+                "-",
+            ],
+        ]
+        for idx, cmd in enumerate(variants):
+            try:
+                proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                                        stderr=subprocess.DEVNULL)
+                r, _, _ = select.select([proc.stdout], [], [], 0.5)
+                if r:
+                    self._proc = proc
+                    self.device = dev
+                    with self._lock:
+                        self.connected = True
+                    print(f"[[CAM]] try {dev} variant {idx} OK", flush=True)
+                    return True
+                proc.kill()
+                print(f"[[CAM]] try {dev} variant {idx} timeout", flush=True)
+            except Exception as e:
+                print(f"[[CAM]] try {dev} variant {idx} error: {e}", flush=True)
+        return False
+
+    def _read_loop(self):
+        buf = b""
+        last_frame_time = time.monotonic()
+        stat_check = time.monotonic()
+        loop_start = time.monotonic()
+        while not self._stopped and self._proc:
+            if time.monotonic() - loop_start > 30.0:
+                print("[[CAM]] break: reconnect timer", flush=True)
+                self._kill_proc()
                 break
-            end = buf.find(b"\xff\xd9", start)
-            if end < 0:
-                buf = buf[start:]
+            if self._proc.poll() is not None:
+                print("[[CAM]] break: proc exited", flush=True)
                 break
-            jpeg = buf[start : end + 2]
-            buf = buf[end + 2 :]
-            with lock:
-                latest_jpeg = jpeg
+            if self.device and glob.glob(self.device) == []:
+                print("[[CAM]] break: device vanished", flush=True)
+                self._kill_proc()
+                break
+            try:
+                r, _, _ = select.select([self._proc.stdout], [], [], 0.5)
+            except ValueError:
+                print("[[CAM]] break: select ValueError", flush=True)
+                break
+            if not r:
+                now = time.monotonic()
+                if now - stat_check > 3.0:
+                    stat_check = now
+                    if self.device and not os.path.exists(self.device):
+                        print("[[CAM]] break: stat check failed", flush=True)
+                        self._kill_proc()
+                        break
+                since_last = now - last_frame_time
+                if since_last > 1.5:
+                    print(f"[[CAM]] break: frame timeout {since_last:.1f}s", flush=True)
+                    self._kill_proc()
+                    break
+                continue
+            try:
+                chunk = self._proc.stdout.read(65536)
+            except Exception:
+                print("[[CAM]] break: read exception", flush=True)
+                break
+            if not chunk:
+                print("[[CAM]] break: EOF", flush=True)
+                break
+            buf += chunk
+            while True:
+                start = buf.find(b"\xff\xd8")
+                if start < 0:
+                    buf = b""
+                    break
+                end = buf.find(b"\xff\xd9", start)
+                if end < 0:
+                    buf = buf[start:]
+                    break
+                jpeg = buf[start: end + 2]
+                buf = buf[end + 2:]
+                with self._lock:
+                    self.latest_jpeg = jpeg
+                    self.connected = True
+                    self.frame_time = time.monotonic()
+                last_frame_time = time.monotonic()
 
 
-threading.Thread(target=reader_thread, daemon=True).start()
+cam = CameraManager()
+cam.start()
 
 
 def generate():
     while True:
-        with lock:
-            jpeg = latest_jpeg
-        if jpeg is None:
+        jpeg, connected, frame_time = cam.get_state()
+        stale = connected and (time.monotonic() - frame_time > 2.0)
+        if not connected or jpeg is None or stale:
+            if stale:
+                print("[[STREAM]] stale frame >2s, disconnecting", flush=True)
+                cam.disconnect()
+            yield b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + NO_CAM_JPEG + b"\r\n"
+            time.sleep(0.2)
             continue
         frame = cv2.imdecode(np.frombuffer(jpeg, dtype=np.uint8), cv2.IMREAD_COLOR)
         frame = pipeline.process(frame)
         ret, out = cv2.imencode(".jpg", frame)
-        yield (
-            b"--frame\r\n"
-            b"Content-Type: image/jpeg\r\n\r\n" + out.tobytes() + b"\r\n"
-        )
+        if ret:
+            yield b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + out.tobytes() + b"\r\n"
 
 
 def generate_debug():
     while True:
-        with lock:
-            jpeg = latest_jpeg
-        if jpeg is None:
+        jpeg, connected, frame_time = cam.get_state()
+        stale = connected and (time.monotonic() - frame_time > 2.0)
+        if not connected or jpeg is None or stale:
+            if stale:
+                print("[[STREAM]] stale frame >2s, disconnecting", flush=True)
+                cam.disconnect()
+            yield b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + NO_CAM_JPEG + b"\r\n"
+            time.sleep(0.2)
             continue
         frame = cv2.imdecode(np.frombuffer(jpeg, dtype=np.uint8), cv2.IMREAD_COLOR)
         canvas, pad, scale = pipeline.process_canvas(frame)
         ret, out = cv2.imencode(".jpg", canvas)
-        yield (
-            b"--frame\r\n"
-            b"Content-Type: image/jpeg\r\n\r\n" + out.tobytes() + b"\r\n"
-        )
+        if ret:
+            yield b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + out.tobytes() + b"\r\n"
 
 
 @app.route("/")
@@ -126,10 +287,9 @@ def debug():
 
 @app.route("/raw")
 def raw_debug():
-    with lock:
-        jpeg = latest_jpeg
-    if jpeg is None:
-        return "no frame"
+    jpeg, connected, _ = cam.get_state()
+    if not connected or jpeg is None:
+        return "no camera"
     frame = cv2.imdecode(np.frombuffer(jpeg, dtype=np.uint8), cv2.IMREAD_COLOR)
     h, w = frame.shape[:2]
     input_tensor, scale, pad = pipeline._preprocess(frame)
@@ -151,4 +311,4 @@ if __name__ == "__main__":
         from waitress import serve
         serve(app, host="0.0.0.0", port=5000)
     finally:
-        proc.kill()
+        cam.stop()
