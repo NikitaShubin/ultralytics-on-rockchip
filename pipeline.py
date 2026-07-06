@@ -26,7 +26,7 @@ TEMP_WARN = 85
 
 
 class Pipeline:
-    def __init__(self, model_path: str = "/app/model/yolov8m.onnx"):
+    def __init__(self, model_path: str = "/app/model/yolov8n_rkopt_o19.rknn"):
         is_onnx = model_path.endswith(".onnx")
         if is_onnx:
             import onnxruntime as rt
@@ -52,7 +52,9 @@ class Pipeline:
         self._temp_warned = False
 
     def _infer_rknn(self, tensor):
-        return self.rknn.inference(inputs=[tensor])
+        # RKNN expects NHWC (batch, H, W, C); preprocess returns NCHW
+        tensor_nhwc = tensor.transpose(0, 2, 3, 1)
+        return self.rknn.inference(inputs=[tensor_nhwc])
 
     def _infer_onnx(self, tensor):
         return [self.sess.run(None, {self.input_name: tensor / 255.0})[0]]

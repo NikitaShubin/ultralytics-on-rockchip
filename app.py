@@ -146,26 +146,6 @@ def raw_debug():
     return "<pre>" + "\n".join(lines) + "</pre>"
 
 
-_test_objects = None
-
-
-def _get_test_objects():
-    global _test_objects
-    if _test_objects is None:
-        from test_pipeline import load_coco8_objects
-        _test_objects = load_coco8_objects()
-    return _test_objects
-
-
-@app.route("/test")
-def test():
-    from test_pipeline import generate_test_frames
-    return Response(
-        generate_test_frames(pipeline, _get_test_objects()),
-        mimetype="multipart/x-mixed-replace; boundary=frame",
-    )
-
-
 if __name__ == "__main__":
     try:
         from waitress import serve

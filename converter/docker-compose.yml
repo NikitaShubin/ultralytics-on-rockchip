@@ -1,0 +1,10 @@
+services:
+  converter:
+    build: .
+    image: webcam-converter:latest
+    devices:
+      - /dev/dri:/dev/dri
+    volumes:
+      - ../model:/app/converter/model
+      - ./weights:/app/converter/weights
+      - .:/app/converter
