@@ -69,14 +69,15 @@ class Pipeline:
 
     def reload(self):
         print("[[V4]] reloading model and postprocess...", flush=True)
-        if self.rknn:
-            try:
-                self.rknn.release()
-            except Exception:
-                pass
-            self.rknn = None
-        self._session = None
-        self._load_model()
+        with self._infer_lock:
+            if self.rknn:
+                try:
+                    self.rknn.release()
+                except Exception:
+                    pass
+                self.rknn = None
+            self._session = None
+            self._load_model()
 
         if "postprocess_mod" in sys.modules:
             del sys.modules["postprocess_mod"]

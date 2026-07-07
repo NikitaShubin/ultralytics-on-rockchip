@@ -351,6 +351,10 @@ def _detect_model_info(pt_path):
         names = model.names if hasattr(model, "names") else {}
     num_classes = len(names)
 
+    head = model.model.model[-1]
+    kpt_shape = getattr(head, "kpt_shape", None)
+    num_kpts = kpt_shape[0] if kpt_shape else 0
+
     return {
         "task": task,
         "strides": strides,
@@ -358,6 +362,7 @@ def _detect_model_info(pt_path):
         "input_size": input_size,
         "num_classes": num_classes,
         "names": names,
+        "num_kpts": num_kpts,
     }
 
 
@@ -376,17 +381,19 @@ def _generate_postprocess(info, dst_dir):
     class_names = [info["names"].get(i, f"cls_{i}") for i in range(info["num_classes"])]
 
     is_obb = task == "obb"
+    is_pose = task == "pose"
     substitutions = {
         "INPUT_SIZE": str(info["input_size"]),
         "STRIDES": str(info["strides"]),
         "GRID_SIZES": str(info["grid_sizes"]),
         "NUM_CLASSES": str(info["num_classes"]),
+        "NUM_KPTS": str(info.get("num_kpts", 0)),
         "COCO_CLASSES": json.dumps(class_names),
         "REG_MAX": "16",
         "BIN_COUNT": "4",
-        "CONF_THRESH": "0.25" if is_obb else "0.5",
+        "CONF_THRESH": "0.25" if (is_obb or is_pose) else "0.5",
         "IOU_THRESH": "0.5",
-        "MIN_WH": "20" if is_obb else "40",
+        "MIN_WH": "20" if (is_obb or is_pose) else "40",
     }
 
     for key, val in substitutions.items():

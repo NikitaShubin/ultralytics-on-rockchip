@@ -1,11 +1,15 @@
 # webcam
 
-Real-time MJPEG-стрим с вебкамеры + YOLO детекция на NPU (RK3588S).
+Real-time YOLO детекция/pose/OBB на NPU (RK3588S) с вебкамеры.
+
+**Архитектура**: OpenCV → Pipeline (RKNN inference + postprocess) → `/frame` endpoint → браузер через canvas-pull.
+Низкая задержка (~300ms), нет накопления буфера.
 
 ## Требования
 
 - Docker Engine, пользователь в группе `docker`
 - RK3588S с установленными библиотеками NPU (`librknnrt.so`, `librknn_api.so`)
+- USB камера с поддержкой MJPEG
 
 ## Быстрый старт
 
@@ -13,60 +17,64 @@ Real-time MJPEG-стрим с вебкамеры + YOLO детекция на NP
 docker compose up -d --build
 ```
 
-Стрим на `http://<host>:5000`.
+Просмотр: `http://<host>:5000/`  
+Тестовая страница: `http://<host>:5000/test`
 
 ## Модели
 
-По умолчанию используется **yolo11n** (RK-opt ONNX → RKNN).
-
-Готовые `.rknn` лежат в `model/`. Файл модели задаётся в `pipeline.py` (переменная `MODEL_PATH`).
-
-### Конвертация моделей
-
-Конвертер вынесен в отдельное docker-окружение (`converter/`):
+Конвертация `.pt` → `.onnx` → `.rknn` вынесена в `converter/`:
 
 ```bash
 cd converter
 docker compose run --rm converter convert <model_name>
 ```
 
-Например:
+Поддерживаемые задачи: `detect`, `pose`, `obb`.  
+Пример: `docker compose run --rm converter convert yolo11n-pose`
 
-```bash
-docker compose run --rm converter convert yolov8n
+Результат (`.rknn` + `postprocess.py`) копируется в `model/`, после чего нужно перезагрузить пайплайн:
+
+```
+curl http://<host>:5000/reload
 ```
 
-Результат (`.rknn` + `.onnx`) копируется в `model/`.
+### Готовые модели
 
-**Пакетная выгрузка ONNX (без компиляции RKNN):**
+- `yolo11n` — detect, 80 COCO классов, 2.9M params, ~12 FPS
+- `yolo11n-pose` — pose estimation, 17 keypoints, 2.9M params, ~12 FPS
 
-```bash
-docker compose run --rm converter batch-onnx --model-list models_detect_all.txt
-```
-
-Список поддерживаемых моделей: `models_detect.txt` (25 моделей), `models_detect_all.txt` (48 моделей).
-
-## Структура проекта
+## Структура
 
 ```
 webcam/
-├── app.py              # Flask-приложение (MJPEG-стрим + CameraManager)
+├── app.py              # Flask-приложение (CameraManager + endpoints)
 ├── pipeline.py         # Загрузка модели, pre/post-processing, инференс
-├── camtest.py          # Диагностика камеры/ffmpeg в контейнере
 ├── docker-compose.yml  # Сервис webcam
-├── Dockerfile          # Образ webcam (rknn-toolkit-lite2)
-├── model/              # Готовые .rknn и .onnx модели
-└── converter/          # Инструмент конвертации .pt → .onnx → .rknn
+├── Dockerfile          # Образ (rknn-toolkit-lite2 + OpenCV)
+├── model/              # .rknn + postprocess.py
+├── converter/          # Конвертация .pt → .onnx → .rknn
+│   ├── templates/      # Шаблоны postprocess (detect/pose/obb)
+│   ├── patches/        # RKNN-патчи для разных голов YOLO
+│   └── Dockerfile      # Образ с rknn-toolkit2 + onnxruntime
 ```
+
+## Эндпоинты
+
+| Route | Описание |
+|---|---|
+| `/` | Просмотр с камеры (canvas pull, `setTimeout(next, 0)`) |
+| `/frame` | Последний обработанный JPEG (no-cache) |
+| `/test` | Drag-and-drop загрузка изображений |
+| `/test/raw` | Тестовое изображение |
+| `/process` | POST — обработка загруженного файла |
+| `/reload` | Перезагрузить модель (после --deploy) |
 
 ## Горячее подключение камер
 
-Контейнер использует `volumes: /dev:/dev` вместо статического `devices: /dev/video0:/dev/video0`, 
-поэтому новые камеры, подключённые после запуска контейнера, автоматически обнаруживаются.
-Камера переподключается каждые 30 секунд — при отключении заглушка "Camera not connected"
-появляется в течение этого интервала.
+`volumes: /dev:/dev` — камера автоматически обнаруживается при подключении.
+При отключении отображается заглушка "Camera not connected".
 
 ## Известные проблемы
 
-- Модели с нестандартными головами (RT-DETR, YOLO-NAS, YOLOWorld) не поддерживаются
-- Компиляция RKNN (`rknn.build`) на aarch64 занимает много времени для больших моделей
+- RT-DETR, YOLO-NAS, YOLOWorld не поддерживаются
+- Компиляция RKNN на aarch64 медленная для больших моделей

@@ -1,8 +1,5 @@
 import glob
-import importlib
 import os
-import select
-import subprocess
 import sys
 import threading
 import time
@@ -14,8 +11,6 @@ from flask import Flask, Response, request
 from pipeline import Pipeline
 
 CAM_W, CAM_H = 640, 480
-CAM_FPS = 15
-
 TEST_MODE = os.environ.get("TEST_MODE", "0") == "1"
 TEST_IMG_PATH = "/app/model/test.jpg"
 
@@ -29,27 +24,19 @@ NO_CAM_JPEG = _NCJ.tobytes() if _ret else b""
 
 pipeline = Pipeline()
 
-def _get_postprocess_mod():
-    if "postprocess_mod" in sys.modules:
-        return sys.modules["postprocess_mod"]
-    return None
-
 
 class CameraManager:
-    def __init__(self, width=CAM_W, height=CAM_H, fps=CAM_FPS):
+    def __init__(self, width=CAM_W, height=CAM_H):
         self.width = width
         self.height = height
-        self.fps = fps
-        self.device = None
-        self.latest_jpeg = None
+        self.latest_processed_jpeg = None
+        self.processed_time = 0.0
         self.connected = False
-        self.frame_time = 0.0
+        self.device = None
         self._lock = threading.Lock()
         self._stopped = False
         self._thread = None
-        self._proc = None
-        self._bad_devices = set()
-        self._proc_start_time = 0.0
+        self._cap = None
 
     def start(self):
         self._stopped = False
@@ -58,21 +45,17 @@ class CameraManager:
 
     def stop(self):
         self._stopped = True
-        self._kill_proc()
+        self._release_cap()
 
-    def get_state(self):
+    def get_processed_state(self):
         with self._lock:
-            return self.latest_jpeg, self.connected, self.frame_time
+            return self.latest_processed_jpeg, self.connected, self.processed_time
 
-    def disconnect(self):
-        self._kill_proc()
-
-    def _kill_proc(self):
-        proc, self._proc = self._proc, None
-        if proc is not None:
+    def _release_cap(self):
+        cap, self._cap = self._cap, None
+        if cap is not None:
             try:
-                proc.kill()
-                proc.wait(timeout=2)
+                cap.release()
             except Exception:
                 pass
 
@@ -94,198 +77,64 @@ class CameraManager:
     def _on_disconnect(self):
         with self._lock:
             self.connected = False
-            self.latest_jpeg = None
+            self.latest_processed_jpeg = None
             self.device = None
-        self._kill_proc()
+        self._release_cap()
         print("[[CAM]] disconnected", flush=True)
 
     def _find_and_connect(self):
         while not self._stopped:
             devices = sorted(glob.glob("/dev/video[0-9]*"))
-            any_skipped = False
             for dev in devices:
                 if self._stopped:
                     return
-                if dev in self._bad_devices:
-                    any_skipped = True
-                    continue
                 if self._try_camera(dev):
-                    self._bad_devices.clear()
                     print(f"[[CAM]] connected to {dev}", flush=True)
                     return
-            if any_skipped:
-                time.sleep(1.0)
-                self._bad_devices.clear()
-            else:
-                time.sleep(0.2)
+            time.sleep(0.2)
 
     def _try_camera(self, dev):
-        variants = [
-            [
-                "ffmpeg",
-                "-fflags", "nobuffer",
-                "-flags", "low_delay",
-                "-analyzeduration", "0",
-                "-probesize", "32",
-                "-f", "v4l2",
-                "-input_format", "mjpeg",
-                "-video_size", f"{self.width}x{self.height}",
-                "-framerate", str(self.fps),
-                "-i", dev,
-                "-f", "image2pipe",
-                "-vcodec", "copy",
-                "-",
-            ],
-            [
-                "ffmpeg",
-                "-fflags", "nobuffer",
-                "-flags", "low_delay",
-                "-analyzeduration", "0",
-                "-probesize", "32",
-                "-f", "v4l2",
-                "-video_size", f"{self.width}x{self.height}",
-                "-framerate", str(self.fps),
-                "-i", dev,
-                "-f", "image2pipe",
-                "-c:v", "mjpeg",
-                "-q:v", "5",
-                "-",
-            ],
-        ]
-        for idx, cmd in enumerate(variants):
-            try:
-                proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
-                                        stderr=subprocess.DEVNULL)
-                r, _, _ = select.select([proc.stdout], [], [], 1.5)
-                if r:
-                    self._proc = proc
-                    self._proc_start_time = time.monotonic()
-                    self.device = dev
-                    with self._lock:
-                        self.connected = True
-                    print(f"[[CAM]] try {dev} variant {idx} OK", flush=True)
-                    return True
-                proc.kill()
-                proc.wait(timeout=1)
-                print(f"[[CAM]] try {dev} variant {idx} timeout", flush=True)
-            except Exception as e:
-                print(f"[[CAM]] try {dev} variant {idx} error: {e}", flush=True)
-            time.sleep(0.2)
+        try:
+            cap = cv2.VideoCapture(dev)
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
+            cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            ret, _ = cap.read()
+            if ret:
+                self._cap = cap
+                with self._lock:
+                    self.connected = True
+                self.device = dev
+                return True
+            cap.release()
+        except Exception as e:
+            print(f"[[CAM]] opencv error: {e}", flush=True)
         return False
 
     def _read_loop(self):
-        buf = b""
-        last_frame_time = time.monotonic()
-        stat_check = time.monotonic()
-        while not self._stopped and self._proc:
-            now = time.monotonic()
-            if now - stat_check > 3.0:
-                stat_check = now
-                if self.device:
-                    try:
-                        r = subprocess.run(["stat", self.device],
-                                           capture_output=True, timeout=2)
-                        if r.returncode != 0:
-                            print("[[CAM]] break: stat failed", flush=True)
-                            self._kill_proc()
-                            break
-                    except FileNotFoundError:
-                        print("[[CAM]] break: stat cmd not found", flush=True)
-                        self._kill_proc()
-                        break
-                    except subprocess.TimeoutExpired:
-                        print("[[CAM]] break: stat timeout", flush=True)
-                        self._kill_proc()
-                        break
-            if self._proc.poll() is not None:
-                runtime = time.monotonic() - self._proc_start_time
-                if runtime < 1.5 and self.device:
-                    print(f"[[CAM]] break: proc exited after {runtime:.1f}s — marking {self.device} as bad", flush=True)
-                    self._bad_devices.add(self.device)
-                else:
-                    print("[[CAM]] break: proc exited", flush=True)
-                break
+        while not self._stopped and self._cap is not None:
             if self.device and glob.glob(self.device) == []:
                 print("[[CAM]] break: device vanished", flush=True)
-                self._kill_proc()
+                break
+            ret, frame = self._cap.read()
+            if not ret:
+                print("[[CAM]] break: cap.read() failed", flush=True)
                 break
             try:
-                r, _, _ = select.select([self._proc.stdout], [], [], 0.5)
-            except ValueError:
-                print("[[CAM]] break: select ValueError", flush=True)
-                break
-            if not r:
-                since_last = time.monotonic() - last_frame_time
-                if since_last > 1.5:
-                    print(f"[[CAM]] break: frame timeout {since_last:.1f}s", flush=True)
-                    self._kill_proc()
-                    break
-                continue
-            try:
-                chunk = self._proc.stdout.read(65536)
-            except Exception:
-                print("[[CAM]] break: read exception", flush=True)
-                break
-            if not chunk:
-                print("[[CAM]] break: EOF", flush=True)
-                break
-            buf += chunk
-            while True:
-                start = buf.find(b"\xff\xd8")
-                if start < 0:
-                    buf = b""
-                    break
-                end = buf.find(b"\xff\xd9", start)
-                if end < 0:
-                    buf = buf[start:]
-                    break
-                jpeg = buf[start: end + 2]
-                buf = buf[end + 2:]
+                processed = pipeline.process(frame)
+            except Exception as e:
+                print(f"[[CAM]] process error: {e}", flush=True)
+                processed = frame
+            ret, out = cv2.imencode(".jpg", processed)
+            if ret:
                 with self._lock:
-                    self.latest_jpeg = jpeg
-                    self.connected = True
-                    self.frame_time = time.monotonic()
-                last_frame_time = time.monotonic()
+                    self.latest_processed_jpeg = out.tobytes()
+                    self.processed_time = time.monotonic()
 
 
 cam = CameraManager()
 cam.start()
-
-
-def generate():
-    while True:
-        jpeg, connected, frame_time = cam.get_state()
-        stale = connected and (time.monotonic() - frame_time > 2.0)
-        if not connected or jpeg is None or stale:
-            if stale:
-                print("[[STREAM]] stale frame >2s, disconnecting", flush=True)
-                cam.disconnect()
-            yield b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + NO_CAM_JPEG + b"\r\n"
-            time.sleep(0.2)
-            continue
-        frame = cv2.imdecode(np.frombuffer(jpeg, dtype=np.uint8), cv2.IMREAD_COLOR)
-        frame = pipeline.process(frame)
-        ret, out = cv2.imencode(".jpg", frame)
-        if ret:
-            yield b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + out.tobytes() + b"\r\n"
-
-
-def generate_debug():
-    while True:
-        jpeg, connected, frame_time = cam.get_state()
-        stale = connected and (time.monotonic() - frame_time > 2.0)
-        if not connected or jpeg is None or stale:
-            if stale:
-                print("[[STREAM]] stale frame >2s, disconnecting", flush=True)
-                cam.disconnect()
-            yield b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + NO_CAM_JPEG + b"\r\n"
-            time.sleep(0.2)
-            continue
-        frame = cv2.imdecode(np.frombuffer(jpeg, dtype=np.uint8), cv2.IMREAD_COLOR)
-        canvas, pad, scale = pipeline.process_canvas(frame)
-        ret, out = cv2.imencode(".jpg", canvas)
-        if ret:
-            yield b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + out.tobytes() + b"\r\n"
 
 
 @app.route("/")
@@ -300,25 +149,25 @@ img { width: 100vw; height: 100vh; object-fit: contain; }
 </style>
 </head>
 <body>
-<img src="/stream">
+<img id="s">
+<script>
+const i = document.getElementById('s');
+function next() { i.src = '/frame?_=' + performance.now(); }
+i.onload = next;
+i.onerror = () => setTimeout(next, 500);
+next();
+</script>
 </body>
 </html>"""
 
 
-@app.route("/stream")
-def stream():
-    return Response(
-        generate(),
-        mimetype="multipart/x-mixed-replace; boundary=frame",
-    )
-
-
-@app.route("/debug")
-def debug():
-    return Response(
-        generate_debug(),
-        mimetype="multipart/x-mixed-replace; boundary=frame",
-    )
+@app.route("/frame")
+def frame():
+    jpeg, connected, _ = cam.get_processed_state()
+    if not connected or jpeg is None:
+        return Response(NO_CAM_JPEG, mimetype="image/jpeg")
+    return Response(jpeg, mimetype="image/jpeg",
+                    headers={"Cache-Control": "no-cache, no-store, must-revalidate"})
 
 
 DOTA_CLASSES = ['plane', 'ship', 'storage-tank', 'storage tank',
@@ -356,13 +205,11 @@ def _draw_gt_boxes(img, label_path):
 
 @app.route("/reload")
 def reload_pipeline():
-    """Reload model and postprocess script. Call after --deploy."""
     try:
         pipeline.reload()
         return "OK", 200
     except Exception as e:
         return f"FAIL: {e}", 500
-
 
 
 _TEST_HTML = """<!DOCTYPE html>
