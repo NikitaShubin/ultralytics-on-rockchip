@@ -2,7 +2,6 @@ import importlib.util
 import os
 import sys
 import threading
-from datetime import datetime
 
 import cv2
 import numpy as np
@@ -62,6 +61,7 @@ class Pipeline:
         spec.loader.exec_module(mod)
         self._postprocess = getattr(mod, "postprocess", None)
         self._visualize = getattr(mod, "visualize", None)
+        self._custom_preprocess = getattr(mod, "preprocess", None)
         if self._postprocess is None:
             raise RuntimeError("postprocess.py must define postprocess()")
         self.input_size = getattr(mod, "INPUT_SIZE", 640)
@@ -91,6 +91,8 @@ class Pipeline:
         with self._infer_lock:
             if self.backend == "cpu":
                 return self._session.run(None, {self._input_name: tensor / 255.0})
+            if self._custom_preprocess:
+                return self.rknn.inference(inputs=[tensor])
             nhwc = tensor.transpose(0, 2, 3, 1)
             return self.rknn.inference(inputs=[nhwc])
 
@@ -102,10 +104,6 @@ class Pipeline:
             return None
 
     def process(self, frame: np.ndarray) -> np.ndarray:
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        cv2.putText(frame, timestamp, (10, 30),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
-
         temp = self._npu_temp()
         if temp is not None and temp >= TEMP_WARN and not self._temp_warned:
             print(f"[[TEMP]] NPU={temp}°C (≥{TEMP_WARN}) — high temp warning", flush=True)
@@ -163,6 +161,8 @@ class Pipeline:
         return canvas, pad, scale
 
     def _preprocess(self, frame: np.ndarray):
+        if self._custom_preprocess:
+            return self._custom_preprocess(frame)
         h, w = frame.shape[:2]
         scale = min(self.input_size / w, self.input_size / h)
         new_w, new_h = int(w * scale), int(h * scale)

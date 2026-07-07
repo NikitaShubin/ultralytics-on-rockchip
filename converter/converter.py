@@ -346,14 +346,16 @@ def _detect_model_info(pt_path):
     if not isinstance(input_size, int):
         input_size = 640
 
-    names = getattr(model.model, "names", None)
-    if names is None:
-        names = model.names if hasattr(model, "names") else {}
+    names = model.names if hasattr(model, "names") else getattr(model.model, "names", {})
+    if not names:
+        names = getattr(model.model, "names", {})
     num_classes = len(names)
 
     head = model.model.model[-1]
     kpt_shape = getattr(head, "kpt_shape", None)
     num_kpts = kpt_shape[0] if kpt_shape else 0
+
+    nm = getattr(head, "nm", 0)
 
     return {
         "task": task,
@@ -363,6 +365,7 @@ def _detect_model_info(pt_path):
         "num_classes": num_classes,
         "names": names,
         "num_kpts": num_kpts,
+        "nm": nm,
     }
 
 
@@ -382,18 +385,22 @@ def _generate_postprocess(info, dst_dir):
 
     is_obb = task == "obb"
     is_pose = task == "pose"
+    is_seg = task == "segment"
+    is_cls = task == "classify"
+    low_thresh = is_obb or is_pose or is_seg
     substitutions = {
         "INPUT_SIZE": str(info["input_size"]),
         "STRIDES": str(info["strides"]),
         "GRID_SIZES": str(info["grid_sizes"]),
         "NUM_CLASSES": str(info["num_classes"]),
         "NUM_KPTS": str(info.get("num_kpts", 0)),
+        "NM": str(info.get("nm", 0)),
         "COCO_CLASSES": json.dumps(class_names),
         "REG_MAX": "16",
         "BIN_COUNT": "4",
-        "CONF_THRESH": "0.25" if (is_obb or is_pose) else "0.5",
+        "CONF_THRESH": "0.25" if low_thresh else "0.5",
         "IOU_THRESH": "0.5",
-        "MIN_WH": "20" if (is_obb or is_pose) else "40",
+        "MIN_WH": "20" if low_thresh else "40",
     }
 
     for key, val in substitutions.items():
