@@ -5,3 +5,6 @@ __pycache__/
 *.pyc
 tmp/
 /tmp/
+*.pt
+*.onnx
+*_rknn_model/
