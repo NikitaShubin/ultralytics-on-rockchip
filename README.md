@@ -45,11 +45,20 @@ docker compose run --rm converter convert yolo11s-pose.pt --deploy
 
 ## Конвертация новой модели
 
-Положить `.pt` файл в `converter/weights/` и запустить:
+Поддерживаются любые Ultralytics-совместимые `.pt` веса (YOLOv5-v11, официальные или кастомно обученные) 
+с задачами `detect`, `segment`, `pose`, `obb`, `classify`.
+
+Скопировать `.pt` файл в `converter/weights/` и запустить:
 
 ```bash
 cd converter
 docker compose run --rm converter convert my-model.pt
+```
+
+Если файл лежит в корне `converter/`, передать путь явно:
+
+```bash
+docker compose run --rm converter convert ./my-custom-model.pt
 ```
 
 Конвертер сам:
@@ -57,8 +66,6 @@ docker compose run --rm converter convert my-model.pt
 2. Экспортирует ONNX (RK-opt) + компилирует RKNN
 3. Генерирует `postprocess.py` под задачу модели
 4. Копирует результат в `converter/model/` и `model/`
-
-Поддерживаемые задачи: `detect`, `segment`, `pose`, `obb`, `classify`.
 
 ### Параметры
 
