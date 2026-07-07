@@ -86,11 +86,20 @@ def export_and_compile(pt_path):
     rknn_dir = model.export(format="rknn", opset=12)
     log(f"RKNN model directory: {rknn_dir}")
 
-    # Find the ONNX file produced during export (matches model name stem)
+    # Find the ONNX file produced during export
     rknn_dir_path = Path(rknn_dir)
     model_stem = Path(pt_path).stem
-    onnx_path = f"{model_stem}.onnx"
-    if not os.path.exists(onnx_path):
+    pt_dir = Path(pt_path).parent
+    onnx_candidates = [
+        f"{model_stem}.onnx",
+        str(pt_dir / f"{model_stem}.onnx"),
+    ]
+    onnx_path = None
+    for c in onnx_candidates:
+        if os.path.exists(c):
+            onnx_path = c
+            break
+    if not onnx_path:
         onnx_paths = list(Path(".").glob("*.onnx"))
         onnx_path = str(onnx_paths[-1]) if onnx_paths else None
 
@@ -321,33 +330,163 @@ def validate(onnx_path, rknn_path):
     return result
 
 
+TEMPLATES_DIR = Path(__file__).parent / "templates"
+DEPLOY_DIR = Path("/app/converter/model")
+
+
+def _detect_model_info(pt_path):
+    """Load YOLO model and extract parameters for postprocess generation."""
+    from ultralytics import YOLO
+    model = YOLO(pt_path)
+
+    task = getattr(model, "task", "detect")
+    stride = model.model.stride
+    strides = [int(s) for s in stride.tolist()] if hasattr(stride, "tolist") else [8, 16, 32]
+    input_size = getattr(model.model, "args", {}).get("imgsz", 640)
+    if not isinstance(input_size, int):
+        input_size = 640
+
+    names = getattr(model.model, "names", None)
+    if names is None:
+        names = model.names if hasattr(model, "names") else {}
+    num_classes = len(names)
+
+    return {
+        "task": task,
+        "strides": strides,
+        "grid_sizes": [input_size // s for s in strides],
+        "input_size": input_size,
+        "num_classes": num_classes,
+        "names": names,
+    }
+
+
+def _generate_postprocess(info, dst_dir):
+    """Generate postprocess.py for the given model info."""
+    task = info["task"]
+    template_name = f"{task}_postprocess.py"
+    template_path = TEMPLATES_DIR / template_name
+
+    if not template_path.exists():
+        log(f"No template found for task '{task}' at {template_path}, using detect")
+        template_path = TEMPLATES_DIR / "detect_postprocess.py"
+
+    template = template_path.read_text()
+
+    class_names = [info["names"].get(i, f"cls_{i}") for i in range(info["num_classes"])]
+
+    is_obb = task == "obb"
+    substitutions = {
+        "INPUT_SIZE": str(info["input_size"]),
+        "STRIDES": str(info["strides"]),
+        "GRID_SIZES": str(info["grid_sizes"]),
+        "NUM_CLASSES": str(info["num_classes"]),
+        "COCO_CLASSES": json.dumps(class_names),
+        "REG_MAX": "16",
+        "BIN_COUNT": "4",
+        "CONF_THRESH": "0.25" if is_obb else "0.5",
+        "IOU_THRESH": "0.5",
+        "MIN_WH": "20" if is_obb else "40",
+    }
+
+    for key, val in substitutions.items():
+        template = template.replace("{{" + key + "}}", val)
+
+    dst = Path(dst_dir)
+    dst.mkdir(parents=True, exist_ok=True)
+    out_path = dst / "postprocess.py"
+    out_path.write_text(template)
+    log(f"Generated {out_path}")
+    return str(out_path)
+
+
+def _deploy(onnx_path, rknn_path, postprocess_path):
+    """Copy model + postprocess to DEPLOY_DIR and signal reload."""
+    DEPLOY_DIR.mkdir(parents=True, exist_ok=True)
+
+    if rknn_path and os.path.exists(rknn_path):
+        dst = DEPLOY_DIR / "model.rknn"
+        shutil.copy2(rknn_path, str(dst))
+        log(f"Deployed {rknn_path} → {dst}")
+
+    if onnx_path and os.path.exists(onnx_path):
+        dst = DEPLOY_DIR / "model.onnx"
+        shutil.copy2(onnx_path, str(dst))
+        log(f"Deployed {onnx_path} → {dst}")
+
+    if postprocess_path and os.path.exists(postprocess_path):
+        dst = DEPLOY_DIR / "postprocess.py"
+        shutil.copy2(postprocess_path, str(dst))
+        log(f"Deployed {postprocess_path} → {dst}")
+
+    _signal_reload()
+
+
+def _signal_reload():
+    """Send HTTP reload signal to webcam service."""
+    import urllib.request
+    urls = ["http://localhost:5000/reload", "http://webcam:5000/reload"]
+    ok = False
+    for url in urls:
+        try:
+            resp = urllib.request.urlopen(url, timeout=5)
+            log(f"Reload signal sent to {url}: {resp.status}")
+            ok = True
+            break
+        except Exception:
+            continue
+    if not ok:
+        log("Reload signal failed (is webcam running?)")
+        log("Restart manually: docker compose restart webcam")
+
+
 def cmd_convert(args):
     pt = resolve_pt(args.model)
     log(f"Converting {pt}")
 
-    log("Step 1: Export ONNX + compile RKNN")
+    log("Step 1: Detect model info")
+    info = _detect_model_info(pt)
+    log(f"  task={info['task']} classes={info['num_classes']} strides={info['strides']}")
+
+    log("Step 2: Export ONNX + compile RKNN")
     onnx_path, rknn_path = export_and_compile(pt)
 
-    log("Step 2: Validate")
-    if onnx_path and os.path.exists(onnx_path):
-        result = validate(onnx_path, rknn_path)
+    if args.test:
+        log("Step 3: Validate")
+        if info["task"] == "detect":
+            if onnx_path and os.path.exists(onnx_path):
+                result = validate(onnx_path, rknn_path)
+            else:
+                log("No ONNX found, attempting validation with RKNN only")
+                result = validate(None, rknn_path)
+            print(json.dumps(result, indent=2))
+            status = "PASS" if result.get("pass") else "FAIL"
+            log(f"Validation: {status}")
+            if result.get("pass") is False:
+                log("Validation failed, skipping deploy")
+                return result
+        else:
+            log(f"Validation skipped for task '{info['task']}' (detect-only)")
+            result = {"note": f"validation not implemented for task '{info['task']}'"}
     else:
-        log("No ONNX found, attempting validation with RKNN only")
-        result = validate(None, rknn_path)
+        result = {"note": "validation skipped (use --test to enable)"}
 
-    print(json.dumps(result, indent=2))
-    status = "PASS" if result.get("pass") else "FAIL"
-    log(f"Validation: {status}")
+    log("Step 4: Generate postprocess.py")
+    postprocess_path = _generate_postprocess(info, ".")
 
-    # Copy results to model/ directory
-    stem = Path(args.model).stem.replace(".pt", "")
-    for src_ext in [(onnx_path, ".onnx"), (rknn_path, ".rknn")]:
-        src, ext = src_ext
-        if src and os.path.exists(src):
-            dst = MODEL_DIR / f"{stem}_rkopt_o19{ext}"
-            os.makedirs(MODEL_DIR, exist_ok=True)
-            shutil.copy2(src, str(dst))
-            log(f"Copied to {dst}")
+    if args.deploy:
+        log("Step 5: Deploy")
+        _deploy(onnx_path, rknn_path, postprocess_path)
+    else:
+        # Copy results to model/ directory (versioned)
+        stem = Path(args.model).stem.replace(".pt", "")
+        for src_ext in [(onnx_path, ".onnx"), (rknn_path, ".rknn")]:
+            src, ext = src_ext
+            if src and os.path.exists(src):
+                dst = MODEL_DIR / f"{stem}_rkopt_o19{ext}"
+                os.makedirs(MODEL_DIR, exist_ok=True)
+                shutil.copy2(src, str(dst))
+                log(f"Copied to {dst}")
 
     return result
 
@@ -503,6 +642,10 @@ def main():
 
     p_convert = sub.add_parser("convert", help="Convert .pt → ONNX (RK-opt) → RKNN → validate")
     p_convert.add_argument("model", help="Model name or path (e.g. yolov8m.pt)")
+    p_convert.add_argument("--test", action="store_true",
+                           help="Validate ONNX vs RKNN on coco8 before deploy")
+    p_convert.add_argument("--deploy", action="store_true",
+                           help="Copy model.rknn + postprocess.py to model/ and reload webcam")
 
     p_validate = sub.add_parser("validate", help="Validate existing .rknn against coco8")
     p_validate.add_argument("model", help="Path or name of .rknn file")
