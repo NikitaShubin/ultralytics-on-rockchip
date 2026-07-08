@@ -31,7 +31,7 @@ ls converter/model/
 # Развернуть нужную (например yolo11s-pose)
 cp converter/model/yolo11s-pose_rkopt_o19.rknn  model/model.rknn
 cp converter/model/yolo11s-pose_rkopt_o19.onnx   model/model.onnx
-cp converter/postprocess.py                       model/postprocess.py
+cp converter/model/yolo11s-pose_postprocess.py   model/postprocess.py
 
 # Перезагрузить pipeline
 curl http://localhost:5000/reload
@@ -43,9 +43,17 @@ cd converter
 docker compose run --rm converter convert yolo11s-pose.pt --deploy
 ```
 
+Модели YOLO26 (OBB26, Pose26, Segment26) можно переключать по имени:
+```bash
+# Положить .rknn, .onnx, _postprocess.py в converter/model/
+# Затем перезагрузить с указанием имени:
+curl "http://localhost:5000/reload?model=yolo26n-obb"
+# Без ?model= загружается model.rknn / MODEL env / yolo11n по умолчанию
+```
+
 ## Конвертация новой модели
 
-Поддерживаются любые Ultralytics-совместимые `.pt` веса (YOLOv5-v11, официальные или кастомно обученные) 
+Поддерживаются любые Ultralytics-совместимые `.pt` веса (YOLOv5-v11, YOLO26, RT-DETR, официальные или кастомно обученные)
 с задачами `detect`, `segment`, `pose`, `obb`, `classify`.
 
 Скопировать `.pt` файл в `converter/weights/` и запустить:
@@ -62,9 +70,9 @@ docker compose run --rm converter convert ./my-custom-model.pt
 ```
 
 Конвертер сам:
-1. Применяет патчи для совместимости с RKNN
+1. Применяет патчи для совместимости с RKNN (YOLO26, fuse bug workaround, и т.д.)
 2. Экспортирует ONNX (RK-opt) + компилирует RKNN
-3. Генерирует `postprocess.py` под задачу модели
+3. Генерирует `postprocess.py` под задачу модели (с учетом `reg_max`, anchor offset и т.д.)
 4. Копирует результат в `converter/model/` и `model/`
 
 ### Параметры
@@ -92,19 +100,27 @@ docker compose run --rm converter convert <model> [--test] [--deploy]
 | `yolo11n-obb` | obb | 6.1 MB | 2.9M |
 | `yolo11n-cls` | classify | 6.5 MB | 1.6M |
 
+YOLO26 (reg_max=1, no DFL):
+| Модель | Задача | Размер RKNN |
+|--------|--------|-------------|
+| `yolo26n-seg` | segment | ~7 MB |
+| `yolo26n-pose` | pose | ~6 MB |
+| `yolo26x-pose` | pose | ~? MB |
+| `yolo26n-obb` | obb | 8.0 MB (INT8) |
+
 ## Структура
 
 ```
 webcam/
 ├── app.py              # Flask-приложение (CameraManager + endpoints)
-├── pipeline.py         # Загрузка модели, pre/post-processing, инференс
-├── docker-compose.yml  # Сервис webcam
+├── pipeline.py         # Загрузка модели, pre/post-processing, инференс (RLock, model_name)
+├── docker-compose.yml  # Сервис webcam (MODEL env var)
 ├── Dockerfile          # Образ (rknn-toolkit-lite2 + OpenCV)
 ├── model/              # Текущая активная модель (model.rknn + postprocess.py)
 ├── converter/
 │   ├── converter.py    # Конвертация .pt → ONNX → RKNN + генерация postprocess
-│   ├── templates/      # Шаблоны postprocess (detect/pose/segment/obb/classify)
-│   ├── patches/        # RKNN-патчи для разных голов YOLO
+│   ├── templates/      # Шаблоны postprocess (detect/pose/segment/obb/classify/detr)
+│   ├── patches/        # RKNN-патчи для разных голов YOLO (+ YOLO26, fuse bug)
 │   ├── model/          # Скомпилированные .rknn/.onnx всех моделей
 │   ├── weights/        # Исходные .pt файлы
 │   ├── docker-compose.yml
@@ -120,7 +136,7 @@ webcam/
 | `/test` | Drag-and-drop загрузка изображений |
 | `/test/raw` | Тестовое изображение |
 | `/process` | POST — обработка загруженного файла |
-| `/reload` | Перезагрузить модель (после ручного копирования) |
+| `/reload` | Перезагрузить модель (с опцией `?model=name`) |
 
 ## Горячее подключение камер
 
@@ -129,5 +145,8 @@ webcam/
 
 ## Известные проблемы
 
-- RT-DETR, YOLO-NAS, YOLOWorld не поддерживаются
+- YOLO-NAS, YOLOWorld не поддерживаются
 - Компиляция RKNN на aarch64 медленная для больших моделей
+- RT-DETR: runtime init падает на NPU (используется CPU), GridSample — CPU fallback
+- INT8 квантование OBB может сильно резать точность (ONNX находит 60 объектов, RKNN — 1 на test.jpg)
+- `quantize='fp16'` в `model.export(format="rknn")` игнорируется (используется INT8 по умолчанию)

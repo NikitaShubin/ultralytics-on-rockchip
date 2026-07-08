@@ -11,7 +11,9 @@ IOU_THRESH = {{IOU_THRESH}}
 MIN_WH = {{MIN_WH}}
 NUM_CLASSES = {{NUM_CLASSES}}
 COCO_CLASSES = {{COCO_CLASSES}}
-
+{{NO_DFL}}
+def dfl_nodfl(position):
+    return position
 
 def dfl(position):
     n, c, h, w = position.shape
@@ -22,6 +24,7 @@ def dfl(position):
     weights = np.arange(mc, dtype=np.float32).reshape(1, 1, mc, 1, 1)
     return (y_softmax * weights).sum(axis=2)
 
+_dfl = dfl_nodfl if {{NO_DFL}} else dfl
 
 def process_head(box_dist, cls_scores, stride, grid_h, grid_w):
     col = np.arange(grid_w, dtype=np.float32).reshape(1, 1, 1, grid_w)
@@ -29,7 +32,7 @@ def process_head(box_dist, cls_scores, stride, grid_h, grid_w):
     grid_x = np.broadcast_to(col, (1, 1, grid_h, grid_w))
     grid_y = np.broadcast_to(row, (1, 1, grid_h, grid_w))
     grid = np.concatenate([grid_x, grid_y], axis=1)
-    dbox = dfl(box_dist)
+    dbox = _dfl(box_dist)
     dbox = np.nan_to_num(dbox, nan=0.0, posinf=1e6, neginf=-1e6)
     l, t, r, b = dbox[:, 0:1], dbox[:, 1:2], dbox[:, 2:3], dbox[:, 3:4]
     x1 = (grid[:, 0:1] + 0.5 - l) * stride
@@ -96,17 +99,6 @@ def dedup(boxes, scores, class_ids):
 
 
 def postprocess(outputs, scale, pad, orig_shape):
-    """Decode RKNN outputs into detection objects.
-
-    Args:
-        outputs: list of numpy arrays from RKNN inference (9 tensors: 3 heads × [box, cls, sm])
-        scale: float, resize scale from preprocess
-        pad: tuple (total_pad_w, total_pad_h)
-        orig_shape: tuple (orig_h, orig_w)
-
-    Returns:
-        list of dicts: [{"bbox": [x1,y1,x2,y2], "score": float, "class_id": int, "class_name": str}, ...]
-    """
     orig_h, orig_w = orig_shape
     all_boxes, all_scores, all_cls = [], [], []
 
@@ -158,10 +150,10 @@ def postprocess(outputs, scale, pad, orig_shape):
 
     results = []
     for i in range(len(boxes)):
-        x1, y1, x2, y2 = boxes[i].astype(int).tolist()
+        x1_i, y1_i, x2_i, y2_i = boxes[i].astype(int).tolist()
         c = int(cls_ids[i])
         results.append({
-            "bbox": [x1, y1, x2, y2],
+            "bbox": [x1_i, y1_i, x2_i, y2_i],
             "score": float(scores[i]),
             "class_id": c,
             "class_name": COCO_CLASSES[c] if c < len(COCO_CLASSES) else str(c),
@@ -170,25 +162,21 @@ def postprocess(outputs, scale, pad, orig_shape):
 
 
 def visualize(frame, objects):
-    """Draw detection results on frame.
-
-    Args:
-        frame: numpy array (H, W, 3) BGR
-        objects: list of dicts from postprocess()
-
-    Returns:
-        numpy array with drawn detections
-    """
     h, w = frame.shape[:2]
     s = max(h, w) / 1000
     thick = max(1, int(s * 3))
     fs = max(0.3, s * 0.5)
     fthick = max(1, int(s * 1.5))
-    for obj in objects:
+    colors = [
+        (0, 255, 0), (255, 0, 0), (0, 0, 255), (255, 255, 0),
+        (255, 0, 255), (0, 255, 255), (128, 255, 0), (255, 128, 0),
+    ]
+    for i, obj in enumerate(objects):
         x1, y1, x2, y2 = obj["bbox"]
+        color = colors[i % len(colors)]
         score = obj["score"]
         label = f"{obj['class_name']}: {score:.2f}"
-        cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), thick)
+        cv2.rectangle(frame, (x1, y1), (x2, y2), color, thick)
         cv2.putText(frame, label, (x1, y1 - 5),
-                    cv2.FONT_HERSHEY_SIMPLEX, fs, (0, 255, 0), fthick)
+                    cv2.FONT_HERSHEY_SIMPLEX, fs, color, fthick)
     return frame

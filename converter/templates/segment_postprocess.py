@@ -12,7 +12,10 @@ MIN_WH = {{MIN_WH}}
 NUM_CLASSES = {{NUM_CLASSES}}
 NM = {{NM}}
 COCO_CLASSES = {{COCO_CLASSES}}
+{{NO_DFL}}
 
+def dfl_nodfl(position):
+    return position
 
 def dfl(position):
     n, c, h, w = position.shape
@@ -23,6 +26,7 @@ def dfl(position):
     weights = np.arange(mc, dtype=np.float32).reshape(1, 1, mc, 1, 1)
     return (y_softmax * weights).sum(axis=2)
 
+_dfl = dfl_nodfl if {{NO_DFL}} else dfl
 
 def process_head(box_dist, cls_scores, stride, grid_h, grid_w):
     col = np.arange(grid_w, dtype=np.float32).reshape(1, 1, 1, grid_w)
@@ -30,7 +34,7 @@ def process_head(box_dist, cls_scores, stride, grid_h, grid_w):
     grid_x = np.broadcast_to(col, (1, 1, grid_h, grid_w))
     grid_y = np.broadcast_to(row, (1, 1, grid_h, grid_w))
     grid = np.concatenate([grid_x, grid_y], axis=1)
-    dbox = dfl(box_dist)
+    dbox = _dfl(box_dist)
     dbox = np.nan_to_num(dbox, nan=0.0, posinf=1e6, neginf=-1e6)
     l, t, r, b = dbox[:, 0:1], dbox[:, 1:2], dbox[:, 2:3], dbox[:, 3:4]
     x1 = (grid[:, 0:1] + 0.5 - l) * stride

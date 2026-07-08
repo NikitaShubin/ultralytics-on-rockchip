@@ -2,6 +2,7 @@ import importlib.util
 import os
 import sys
 import threading
+from threading import RLock
 
 import cv2
 import numpy as np
@@ -11,15 +12,16 @@ TEMP_WARN = 85
 
 
 class Pipeline:
-    def __init__(self, model_dir: str = "/app/model"):
+    def __init__(self, model_dir: str = "/app/model", model_name: str = ""):
         self.model_dir = model_dir
+        self.model_name = model_name or os.environ.get("MODEL", "yolo11n")
         self.rknn = None
         self._session = None
         self._postprocess = None
         self._visualize = None
         self.input_size = 640
         self._temp_warned = False
-        self._infer_lock = threading.Lock()
+        self._infer_lock = threading.RLock()
         self.backend = os.environ.get("BACKEND", "npu")
         self._load_model()
         self._load_postprocess()
@@ -32,7 +34,9 @@ class Pipeline:
 
     def _load_model_rknn(self):
         from rknnlite.api import RKNNLite
-        model_path = os.path.join(self.model_dir, "model.rknn")
+        model_path = os.path.join(self.model_dir, f"{self.model_name}.rknn")
+        if not os.path.exists(model_path):
+            model_path = os.path.join(self.model_dir, "model.rknn")
         self.rknn = RKNNLite()
         ret = self.rknn.load_rknn(model_path)
         if ret != 0:
@@ -40,19 +44,23 @@ class Pipeline:
         ret = self.rknn.init_runtime(core_mask=RKNNLite.NPU_CORE_0_1_2)
         if ret != 0:
             raise RuntimeError(f"Failed to init runtime: {ret}")
-        print(f"[[V4]] pipeline started (RKNN)", flush=True)
+        print(f"[[V4]] pipeline started (RKNN) model={self.model_name}", flush=True)
 
     def _load_model_onnx(self):
         import onnxruntime as rt
-        model_path = os.path.join(self.model_dir, "model.onnx")
+        model_path = os.path.join(self.model_dir, f"{self.model_name}.onnx")
+        if not os.path.exists(model_path):
+            model_path = os.path.join(self.model_dir, "model.onnx")
         if not os.path.exists(model_path):
             raise RuntimeError(f"ONNX model not found at {model_path}")
         self._session = rt.InferenceSession(model_path, providers=["CPUExecutionProvider"])
         self._input_name = self._session.get_inputs()[0].name
-        print(f"[[V4]] pipeline started (ONNX CPU)", flush=True)
+        print(f"[[V4]] pipeline started (ONNX CPU) model={self.model_name}", flush=True)
 
     def _load_postprocess(self):
-        post_path = os.path.join(self.model_dir, "postprocess.py")
+        post_path = os.path.join(self.model_dir, f"{self.model_name}_postprocess.py")
+        if not os.path.exists(post_path):
+            post_path = os.path.join(self.model_dir, "postprocess.py")
         if not os.path.exists(post_path):
             raise RuntimeError(f"postprocess.py not found at {post_path}")
         spec = importlib.util.spec_from_file_location("postprocess_mod", post_path)
@@ -67,8 +75,10 @@ class Pipeline:
         self.input_size = getattr(mod, "INPUT_SIZE", 640)
         print(f"[[V4]] postprocess loaded from {post_path} (input_size={self.input_size})", flush=True)
 
-    def reload(self):
-        print("[[V4]] reloading model and postprocess...", flush=True)
+    def reload(self, model_name: str = ""):
+        if model_name:
+            self.model_name = model_name
+        print(f"[[V4]] reloading model={self.model_name}...", flush=True)
         with self._infer_lock:
             if self.rknn:
                 try:
@@ -79,22 +89,21 @@ class Pipeline:
             self._session = None
             self._load_model()
 
-        if "postprocess_mod" in sys.modules:
-            del sys.modules["postprocess_mod"]
-        self._postprocess = None
-        self._visualize = None
-        self._load_postprocess()
+            if "postprocess_mod" in sys.modules:
+                del sys.modules["postprocess_mod"]
+            self._postprocess = None
+            self._visualize = None
+            self._load_postprocess()
 
-        print("[[V4]] reload complete", flush=True)
+        print(f"[[V4]] reload complete (model={self.model_name})", flush=True)
 
     def _infer(self, tensor):
-        with self._infer_lock:
-            if self.backend == "cpu":
-                return self._session.run(None, {self._input_name: tensor / 255.0})
-            if self._custom_preprocess:
-                return self.rknn.inference(inputs=[tensor])
-            nhwc = tensor.transpose(0, 2, 3, 1)
-            return self.rknn.inference(inputs=[nhwc])
+        if self.backend == "cpu":
+            return self._session.run(None, {self._input_name: tensor / 255.0})
+        if self._custom_preprocess:
+            return self.rknn.inference(inputs=[tensor])
+        nhwc = tensor.transpose(0, 2, 3, 1)
+        return self.rknn.inference(inputs=[nhwc])
 
     def _npu_temp(self) -> int | None:
         try:
@@ -110,13 +119,13 @@ class Pipeline:
             self._temp_warned = True
 
         h, w = frame.shape[:2]
-        tensor, scale, pad = self._preprocess(frame)
-
-        try:
-            outputs = self._infer(tensor)
-        except Exception as e:
-            print(f"[[ERR]] inference failed: {e}", flush=True)
-            return frame
+        with self._infer_lock:
+            tensor, scale, pad = self._preprocess(frame)
+            try:
+                outputs = self._infer(tensor)
+            except Exception as e:
+                print(f"[[ERR]] inference failed: {e}", flush=True)
+                return frame
 
         if self._postprocess:
             objects = self._postprocess(outputs, scale, pad, (h, w))
@@ -127,15 +136,16 @@ class Pipeline:
 
     def process_canvas(self, frame: np.ndarray) -> tuple:
         h, w = frame.shape[:2]
-        tensor, scale, pad = self._preprocess(frame)
-        canvas = tensor[0].transpose(1, 2, 0).astype(np.uint8)
-        canvas = cv2.cvtColor(canvas, cv2.COLOR_RGB2BGR)
+        with self._infer_lock:
+            tensor, scale, pad = self._preprocess(frame)
+            canvas = tensor[0].transpose(1, 2, 0).astype(np.uint8)
+            canvas = cv2.cvtColor(canvas, cv2.COLOR_RGB2BGR)
 
-        try:
-            outputs = self._infer(tensor)
-        except Exception as e:
-            print(f"[[ERR]] inference failed (canvas): {e}", flush=True)
-            return canvas, pad, scale
+            try:
+                outputs = self._infer(tensor)
+            except Exception as e:
+                print(f"[[ERR]] inference failed (canvas): {e}", flush=True)
+                return canvas, pad, scale
 
         if self._postprocess:
             objects = self._postprocess(outputs, scale, pad, (h, w))

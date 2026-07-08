@@ -18,5 +18,6 @@ services:
       - /home/orangepi/work/data/coco8:/app/coco8:ro
     environment:
       - BACKEND=${BACKEND:-npu}
+      - MODEL=${MODEL:-yolo11n}
       - TEST_MODE=${TEST_MODE:-1}
     restart: unless-stopped

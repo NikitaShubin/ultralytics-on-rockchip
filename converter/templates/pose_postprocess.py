@@ -12,6 +12,21 @@ MIN_WH = {{MIN_WH}}
 NUM_CLASSES = {{NUM_CLASSES}}
 NUM_KPTS = {{NUM_KPTS}}
 COCO_CLASSES = {{COCO_CLASSES}}
+{{NO_DFL}}
+
+def dfl_nodfl(position):
+    return position
+
+def dfl(position):
+    n, c, h, w = position.shape
+    mc = c // BIN_COUNT
+    y = position.reshape(n, BIN_COUNT, mc, h, w)
+    y_exp = np.exp(y - y.max(axis=2, keepdims=True))
+    y_softmax = y_exp / y_exp.sum(axis=2, keepdims=True)
+    weights = np.arange(mc, dtype=np.float32).reshape(1, 1, mc, 1, 1)
+    return (y_softmax * weights).sum(axis=2)
+
+_dfl = dfl_nodfl if {{NO_DFL}} else dfl
 
 COCO_SKELETON = [
     (0, 1), (0, 2), (1, 3), (2, 4),
@@ -34,16 +49,6 @@ KP_COLORS = [
 ]
 
 
-def dfl(position):
-    n, c, h, w = position.shape
-    mc = c // BIN_COUNT
-    y = position.reshape(n, BIN_COUNT, mc, h, w)
-    y_exp = np.exp(y - y.max(axis=2, keepdims=True))
-    y_softmax = y_exp / y_exp.sum(axis=2, keepdims=True)
-    weights = np.arange(mc, dtype=np.float32).reshape(1, 1, mc, 1, 1)
-    return (y_softmax * weights).sum(axis=2)
-
-
 def process_head(box_dist, cls_scores, kpt_raw, stride, grid_h, grid_w):
     col = np.arange(grid_w, dtype=np.float32).reshape(1, 1, 1, grid_w)
     row = np.arange(grid_h, dtype=np.float32).reshape(1, 1, grid_h, 1)
@@ -51,7 +56,7 @@ def process_head(box_dist, cls_scores, kpt_raw, stride, grid_h, grid_w):
     grid_y = np.broadcast_to(row, (1, 1, grid_h, grid_w))
     grid = np.concatenate([grid_x, grid_y], axis=1)
 
-    dbox = dfl(box_dist)
+    dbox = _dfl(box_dist)
     dbox = np.nan_to_num(dbox, nan=0.0, posinf=1e6, neginf=-1e6)
     l, t, r, b = dbox[:, 0:1], dbox[:, 1:2], dbox[:, 2:3], dbox[:, 3:4]
     x1 = (grid[:, 0:1] + 0.5 - l) * stride
@@ -64,10 +69,14 @@ def process_head(box_dist, cls_scores, kpt_raw, stride, grid_h, grid_w):
 
     nk = NUM_KPTS
     kpts = kpt_raw.reshape(1, nk, 3, grid_h, grid_w).transpose(0, 3, 4, 1, 2).reshape(-1, nk, 3)
-    gx = grid_x.flatten()[:, None]
-    gy = grid_y.flatten()[:, None]
-    kpts[:, :, 0] = (kpts[:, :, 0] * 2.0 + gx) * stride
-    kpts[:, :, 1] = (kpts[:, :, 1] * 2.0 + gy) * stride
+    gx = (grid_x.flatten() + 0.5)[:, None]
+    gy = (grid_y.flatten() + 0.5)[:, None]
+    if {{NO_DFL}}:
+        kpts[:, :, 0] = (kpts[:, :, 0] + gx) * stride
+        kpts[:, :, 1] = (kpts[:, :, 1] + gy) * stride
+    else:
+        kpts[:, :, 0] = (kpts[:, :, 0] * 2.0 + gx - 0.5) * stride
+        kpts[:, :, 1] = (kpts[:, :, 1] * 2.0 + gy - 0.5) * stride
     kpts[:, :, 2] = 1.0 / (1.0 + np.exp(-kpts[:, :, 2]))
 
     return boxes, scores, kpts

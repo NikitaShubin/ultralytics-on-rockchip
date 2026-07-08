@@ -206,7 +206,8 @@ def _draw_gt_boxes(img, label_path):
 @app.route("/reload")
 def reload_pipeline():
     try:
-        pipeline.reload()
+        model_name = request.args.get("model", "")
+        pipeline.reload(model_name=model_name)
         return "OK", 200
     except Exception as e:
         return f"FAIL: {e}", 500

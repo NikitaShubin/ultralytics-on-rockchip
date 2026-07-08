@@ -12,7 +12,10 @@ IOU_THRESH = {{IOU_THRESH}}
 MIN_WH = {{MIN_WH}}
 NUM_CLASSES = {{NUM_CLASSES}}
 COCO_CLASSES = {{COCO_CLASSES}}
+{{NO_DFL}}
 
+def dfl_nodfl(position):
+    return position
 
 def dfl(position):
     n, c, h, w = position.shape
@@ -22,6 +25,8 @@ def dfl(position):
     y_softmax = y_exp / y_exp.sum(axis=2, keepdims=True)
     weights = np.arange(mc, dtype=np.float32).reshape(1, 1, mc, 1, 1)
     return (y_softmax * weights).sum(axis=2)
+
+_dfl = dfl_nodfl if {{NO_DFL}} else dfl
 
 
 def dist2rbox_np(pred_dist, angle, grid_x, grid_y, stride):
@@ -45,12 +50,12 @@ def dist2rbox_np(pred_dist, angle, grid_x, grid_y, stride):
 def process_head(box_dist, cls_scores, angle_raw, stride, grid_h, grid_w):
     gh, gw = grid_h, grid_w
 
-    dbox = dfl(box_dist)  # [n, 4, gh, gw]
+    dbox = _dfl(box_dist)  # [n, 4, gh, gw]
     dbox = np.nan_to_num(dbox, nan=0.0, posinf=1e6, neginf=-1e6)
     col = np.arange(gw, dtype=np.float32).reshape(1, 1, 1, gw)
     row = np.arange(gh, dtype=np.float32).reshape(1, 1, gh, 1)
-    grid_x = np.broadcast_to(col, (1, 1, gh, gw))
-    grid_y = np.broadcast_to(row, (1, 1, gh, gw))
+    grid_x = np.broadcast_to(col, (1, 1, gh, gw)) + 0.5
+    grid_y = np.broadcast_to(row, (1, 1, gh, gw)) + 0.5
 
     angle_raw_clip = np.clip(angle_raw, -80, 80)
     ang = (1 / (1 + np.exp(-angle_raw_clip)) - 0.25) * math.pi  # [-pi/4, 3pi/4]
