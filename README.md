@@ -100,13 +100,13 @@ docker compose run --rm converter convert <model> [--test] [--deploy]
 | `yolo11n-obb` | obb | 6.1 MB | 2.9M |
 | `yolo11n-cls` | classify | 6.5 MB | 1.6M |
 
-YOLO26 (reg_max=1, no DFL):
+YOLO26 (reg_max=1, no DFL, float — не INT8):
 | Модель | Задача | Размер RKNN |
 |--------|--------|-------------|
 | `yolo26n-seg` | segment | ~7 MB |
 | `yolo26n-pose` | pose | ~6 MB |
-| `yolo26x-pose` | pose | ~? MB |
-| `yolo26n-obb` | obb | 8.0 MB (INT8) |
+| `yolo26x-pose` | pose | 116 MB |
+| `yolo26n-obb` | obb | 7.2 MB |
 
 ## Структура
 
@@ -148,5 +148,5 @@ webcam/
 - YOLO-NAS, YOLOWorld не поддерживаются
 - Компиляция RKNN на aarch64 медленная для больших моделей
 - RT-DETR: runtime init падает на NPU (используется CPU), GridSample — CPU fallback
-- INT8 квантование OBB может сильно резать точность (ONNX находит 60 объектов, RKNN — 1 на test.jpg)
-- `quantize='fp16'` в `model.export(format="rknn")` игнорируется (используется INT8 по умолчанию)
+- OBB постпроцесс поддерживает два формата выхода модели: единый `(1, C, total_grid)` и 9 отдельных (бокс/класс/угол на stride). Определяется автоматически. Для единого выхода применяет Sigmoid к class scores.
+- `quantize=16` (по умолчанию) = float-модель (не INT8). INT8 только с `quantize=8` + calibration dataset.
