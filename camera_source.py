@@ -131,6 +131,92 @@ class FileSource(CameraSource):
         return f'file:{self.path}'
 
 
+class GigECamera(CameraSource):
+    """Basler GigE Vision camera via pypylon."""
+
+    def __init__(self, ip: str = '') -> None:
+        self.ip = ip
+        self._camera = None  # pylon.InstantCamera
+        self._converter = None  # pylon.ImageFormatConverter
+        self._device = ''
+
+    def _set_auto(self, feature: str, value: str) -> None:
+        """Set a pylon feature safely if the camera supports it."""
+        try:
+            getattr(self._camera, feature).SetValue(value)
+            log.debug('gige: %s = %s', feature, value)
+        except Exception:
+            log.debug('gige: %s not available, skipped', feature)
+
+    def _configure_auto(self) -> None:
+        """Enable auto-exposure, auto-gain, and auto-white-balance."""
+        if self._camera is None:
+            return
+        self._set_auto('ExposureAuto', 'Continuous')
+        self._set_auto('GainAuto', 'Continuous')
+        self._set_auto('BalanceWhiteAuto', 'Continuous')
+        log.info('gige: auto-exposure/gain/WB enabled')
+
+    def open(self) -> bool:
+        from pypylon import pylon
+        try:
+            tl = pylon.TlFactory.GetInstance()
+            devices = tl.EnumerateDevices()
+            if not devices:
+                log.warning('no GigE devices found')
+                return False
+            info = devices[0]
+            self._device = f'{info.GetFriendlyName()} ({info.GetIpAddress()})'
+            log.info('found GigE camera: %s', self._device)
+            dev = tl.CreateDevice(info)
+            self._camera = pylon.InstantCamera(dev)
+            self._camera.Open()
+            self._configure_auto()
+            self._camera.StartGrabbing(pylon.GrabStrategy_LatestImageOnly)
+            self._converter = pylon.ImageFormatConverter()
+            self._converter.OutputPixelFormat = pylon.PixelType_BGR8packed
+            log.info('connected to GigE camera: %s', self._device)
+            return True
+        except Exception as e:
+            log.error('failed to open GigE camera: %s', e)
+            self.close()
+            return False
+
+    def read(self) -> np.ndarray | None:
+        if self._camera is None or not self._camera.IsGrabbing():
+            return None
+        try:
+            result = self._camera.RetrieveResult(3000)
+            if result is None:
+                return None
+            if result.IsValid():
+                image = self._converter.Convert(result)
+                frame = image.GetArray()
+                result.Release()
+                return frame
+            result.Release()
+        except Exception as e:
+            log.error('GigE read error: %s', e)
+            self.close()
+        return None
+
+    def close(self) -> None:
+        if self._camera is not None:
+            try:
+                if self._camera.IsGrabbing():
+                    self._camera.StopGrabbing()
+                self._camera.Close()
+            except Exception:
+                pass
+            self._camera = None
+        self._converter = None
+        self._device = ''
+
+    @property
+    def name(self) -> str:
+        return f'gige:{self._device}' if self._device else 'gige:disconnected'
+
+
 class CameraManager:
     def __init__(
         self,
@@ -152,13 +238,25 @@ class CameraManager:
             self._source = FileSource(self.file_path)
             if self._source.open():
                 return True
-        source = USBCamera(self.width, self.height)
-        if source.open():
-            self._source = source
-            return True
+
+        if self.cam_mode in ('auto', 'ip'):
+            source = GigECamera()
+            if source.open():
+                self._source = source
+                return True
+            if self.cam_mode == 'ip':
+                return False
+
+        if self.cam_mode in ('auto', 'usb'):
+            source = USBCamera(self.width, self.height)
+            if source.open():
+                self._source = source
+                return True
+
         if self.file_path:
             self._source = FileSource(self.file_path)
             return self._source.open()
+
         return False
 
     def read(self) -> np.ndarray | None:

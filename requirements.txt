@@ -4,5 +4,6 @@ opencv-python-headless
 numpy
 onnxruntime
 websockets
+pypylon
 ruff
 mypy

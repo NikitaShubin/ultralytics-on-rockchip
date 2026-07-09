@@ -1,8 +1,7 @@
 services:
   webcam:
     build: .
-    ports:
-      - "${PORT:-5000}:${PORT:-5000}"
+    network_mode: host
     devices:
       - /dev/dri/renderD129:/dev/dri/renderD129
     privileged: true
