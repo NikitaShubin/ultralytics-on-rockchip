@@ -54,14 +54,16 @@ async def amain() -> None:
     ws_server: WebSocketServer | None = None
 
     if config.web_mode >= WebMode.WS_ONLY:
+        ws_port = 5001
         ws_server = WebSocketServer(
             host=config.host,
+            port=ws_port,
             mask_format=config.mask_format.value,
         )
         video_loop.register_consumer(ws_server.push_frame)
 
     if config.web_mode >= WebMode.WS_AND_UI:
-        app = create_app(config, pipeline, video_loop)
+        app = create_app(config, pipeline, video_loop, ws_port=ws_port)
         http_thread = threading.Thread(
             target=_run_http,
             args=(app, config.host, config.port),

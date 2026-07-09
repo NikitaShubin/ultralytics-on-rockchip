@@ -56,70 +56,51 @@ const canvas = document.getElementById('c');
 const ctx = canvas.getContext('2d');
 const info = document.getElementById('info');
 
-let currentFrame = { id: -1, blob: null, objects: [] };
-let pendingFrame = null;
-let ws = null;
-let wsConnected = false;
+let serverFps = 0;
+let clientFpsHistory = [];
+let clientFps = 0;
+let lastFrameId = -1;
 
-function connectWS() {
-  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-  ws = new WebSocket(proto + '//' + location.host + '/ws');
-  ws.binaryType = 'arraybuffer';
-  ws.onopen = () => { wsConnected = true; };
-  ws.onclose = () => { wsConnected = false; ws = null; setTimeout(connectWS, 1000); };
-  ws.onmessage = (e) => {
-    if (e.data instanceof ArrayBuffer) {
-      const dv = new DataView(e.data);
-      pendingFrame = { id: dv.getUint32(0, false), blob: new Blob([e.data.slice(4)], { type: 'image/jpeg' }), objects: [] };
-    } else {
-      const msg = JSON.parse(e.data);
-      if (msg.type === 'detections' && pendingFrame && msg.frame_id === pendingFrame.id) {
-        pendingFrame.objects = msg.objects;
-        currentFrame = pendingFrame;
-        pendingFrame = null;
-        scheduleRender();
-      }
-    }
-  };
-}
-
-function scheduleRender() {
-  requestAnimationFrame(renderFrame);
-}
-
-function renderFrame() {
-  const frame = currentFrame;
-  if (!frame.blob) return;
-  const url = URL.createObjectURL(frame.blob);
-  const img = new Image();
-  img.onload = () => {
-    canvas.width = img.width;
-    canvas.height = img.height;
-    ctx.clearRect(0, 0, canvas.width, canvas.height);
-    ctx.drawImage(img, 0, 0);
-    URL.revokeObjectURL(url);
-    ctx.globalAlpha = 0.5;
-    for (const obj of frame.objects) drawObject(obj);
-    ctx.globalAlpha = 1.0;
-    const first = frame.objects[0];
-    info.textContent = first
-      ? `frame ${frame.id >= 0 ? frame.id : '?'} | ${frame.objects.length} objects`
-      : 'no detections';
-  };
-  img.src = url;
-}
-
-async function pullFrame() {
+async function poll() {
   try {
     const [frameResp, objResp] = await Promise.all([
       fetch('/frame?_=' + Date.now()),
       fetch('/objects?_=' + Date.now()),
     ]);
+    const frameId = parseInt(frameResp.headers.get('X-Frame-Id') || '-1', 10);
+    if (frameId <= lastFrameId && frameId >= 0) { setTimeout(poll, 50); return; }
     const [frameBlob, objData] = await Promise.all([frameResp.blob(), objResp.json()]);
-    currentFrame = { id: -1, blob: frameBlob, objects: objData.objects || [] };
-    scheduleRender();
+    serverFps = objData.fps || 0;
+    lastFrameId = objData.frame_id || frameId;
+    const url = URL.createObjectURL(frameBlob);
+    const img = new Image();
+    img.onload = () => {
+      canvas.width = img.width;
+      canvas.height = img.height;
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      ctx.drawImage(img, 0, 0);
+      URL.revokeObjectURL(url);
+      ctx.globalAlpha = 0.5;
+      for (const obj of (objData.objects || [])) drawObject(obj);
+      ctx.globalAlpha = 1.0;
+    };
+    img.src = url;
+    updateClientFps();
+    const first = objData.objects?.[0];
+    const idText = lastFrameId >= 0 ? `#${lastFrameId}` : '?';
+    info.textContent = first
+      ? `SVR:${serverFps.toFixed(1)} CLT:${clientFps.toFixed(1)} | ${idText} | ${first ? objData.objects.length : 0} objects`
+      : `SVR:${serverFps.toFixed(1)} CLT:${clientFps.toFixed(1)} | ${idText} | no detections`;
   } catch {}
-  setTimeout(pullFrame, 50);
+  setTimeout(poll, 50);
+}
+
+function updateClientFps() {
+  const now = performance.now();
+  clientFpsHistory.push(now);
+  const cutoff = now - 2000;
+  clientFpsHistory = clientFpsHistory.filter(t => t > cutoff);
+  clientFps = clientFpsHistory.length > 1 ? clientFpsHistory.length / 2.0 : 0;
 }
 
 function drawObject(obj) {
@@ -202,8 +183,7 @@ function drawObject(obj) {
 
 }
 
-connectWS();
-setTimeout(pullFrame, 100);
+setTimeout(poll, 100);
 </script>
 </body>
 </html>

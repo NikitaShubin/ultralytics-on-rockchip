@@ -21,6 +21,8 @@ docker compose up -d --build
 Просмотр: `http://<host>:5000/`
 Тестовая страница: `http://<host>:5000/test`
 
+В углу экрана отображается `SVR:X.X CLT:X.X` — серверный FPS (захват + инференс) и клиентский FPS (реальный приём кадров в браузере).
+
 ## Режимы камеры
 
 Управляются переменной `CAM_MODE`:
@@ -38,6 +40,8 @@ CAM_MODE=auto docker compose up -d
 # или явно:
 CAM_MODE=ip CAM_SOURCE=192.168.5.1 docker compose up -d
 ```
+
+**Auto-fallback**: при потере GigE камеры (Ethernet отключён) система автоматически переключается на USB. При повторном подключении GigE — переключается обратно. Если камера пропадает, а USB недоступен — `/frame` возвращает "Camera not connected" через 2 секунды вместо замороженного последнего кадра.
 
 ## Управление моделями
 
@@ -116,9 +120,9 @@ docker compose run --rm converter convert <model> [--test] [--deploy]
 
 | Route | Метод | Описание |
 |-------|-------|----------|
-| `/` | GET | Просмотр с камеры (WebSocket + HTTP fallback) |
-| `/frame` | GET | Последний обработанный JPEG |
-| `/objects` | GET | JSON с детекциями |
+| `/` | GET | Просмотр с камеры (HTTP poll, SVR/CLT fps) |
+| `/frame` | GET | Последний обработанный JPEG (2s stale → placeholder) |
+| `/objects` | GET | JSON с детекциями + fps + frame_id |
 | `/reload` | GET | Перезагрузка модели (`?model=name&backend=cpu`) |
 | `/test` | GET | Тестовая страница |
 | `/test/images` | GET | JSON список тестовых изображений |
@@ -165,3 +169,5 @@ webcam/
 - OBB постпроцесс: автоматическое определение формата выхода (единый или 9 отдельных)
 - `quantize=16` (default) = float-модель; INT8 только с `quantize=8` + calibration
 - GigE камера: первый захват может быть медленным (GVCP discovery + auto-negotiation packet size)
+- USB камера на WiFi: HTTP poll может давать ~5fps из-за RTT; проводная сеть ~10fps
+- GigE автоподстройка экспозиции: `AutoExposureTimeAbsLowerLimit` опущен с 100µs до 24µs (hardware min)

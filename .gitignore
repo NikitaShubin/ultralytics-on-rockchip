@@ -17,7 +17,7 @@ __pycache__
 converter/*.onnx
 converter/*.rknn
 converter/*.pt
-converter/*_rknn_model/
+converter/*_rknn_model*/
 converter/model/
 converter/weights/
 converter/check0_*/

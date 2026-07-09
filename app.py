@@ -158,40 +158,59 @@ def create_app(  # noqa: C901
     config: WebcamConfig,
     pipeline: Pipeline,
     loop: VideoLoop | None = None,
+    ws_port: int = 5001,
 ) -> Flask:
     """Create and configure the Flask application."""
     app = Flask(__name__)
     _last_objects: list[dict] = []
     _last_jpeg: bytes | None = None
+    _last_fps: float = 0.0
+    _last_frame_id: int = -1
+    _last_frame_time: float = 0.0
 
     mask_format = config.mask_format.value
     if loop is not None:
 
         def _on_frame(frame: DetectorFrame) -> None:
-            nonlocal _last_objects, _last_jpeg
+            nonlocal _last_objects, _last_jpeg, _last_fps, _last_frame_id, _last_frame_time
             _last_objects = objects_to_api(frame.objects, mask_format)
             _last_jpeg = frame.jpeg
+            _last_fps = frame.fps
+            _last_frame_id = frame.frame_id
+            _last_frame_time = time.time()
 
         loop.register_consumer(_on_frame)
 
     @app.route('/')
     def index() -> tuple[str, int]:
-        return _read_template('index.html') or 'UI not available', 200
+        html = _read_template('index.html') or 'UI not available'
+        html = html.replace('__WS_PORT__', str(ws_port))
+        return html, 200
 
     @app.route('/frame')
     def frame() -> Response:
-        nonlocal _last_jpeg
-        if _last_jpeg is None:
+        nonlocal _last_jpeg, _last_frame_id, _last_frame_time
+        if _last_jpeg is None or time.time() - _last_frame_time > 2.0:
             return Response(_make_no_cam_placeholder(), mimetype='image/jpeg')
         return Response(
             _last_jpeg,
             mimetype='image/jpeg',
-            headers={'Cache-Control': 'no-cache, no-store, must-revalidate'},
+            headers={
+                'Cache-Control': 'no-cache, no-store, must-revalidate',
+                'X-Frame-Id': str(_last_frame_id),
+            },
         )
 
     @app.route('/objects')
     def objects() -> dict:
-        return {'objects': _last_objects, 'count': len(_last_objects)}
+        nonlocal _last_frame_time
+        stale = time.time() - _last_frame_time > 2.0
+        return {
+            'objects': [] if stale else _last_objects,
+            'count': 0 if stale else len(_last_objects),
+            'fps': 0.0 if stale else _last_fps,
+            'frame_id': _last_frame_id,
+        }
 
     @app.route('/reload')
     def reload_pipeline() -> tuple[str, int]:

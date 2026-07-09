@@ -73,6 +73,7 @@ class VideoLoop:
                 frame = self.pipeline._visualize(frame, objects)
             total_ms = (time.monotonic() - process_start) * 1000
             self._update_fps()
+
             _, jpeg = cv2.imencode(
                 '.jpg',
                 frame,

@@ -155,7 +155,9 @@ class GigECamera(CameraSource):
         self._set_auto('ExposureAuto', 'Continuous')
         self._set_auto('GainAuto', 'Continuous')
         self._set_auto('BalanceWhiteAuto', 'Continuous')
-        log.info('gige: auto-exposure/gain/WB enabled')
+        self._set_auto('AutoExposureTimeAbsLowerLimit', 24.0)
+        self._set_auto('AutoTargetValue', 100)
+        log.info('gige: auto-exposure/gain/WB enabled (limit=24µs, target=100)')
 
     def open(self) -> bool:
         from pypylon import pylon
@@ -232,6 +234,7 @@ class CameraManager:
         self._source: CameraSource | None = None
         self._fallback_count = 0
         self._max_fallback = 3
+        self._skip_gige = False
 
     def open(self) -> bool:
         if self.cam_mode == 'file' and self.file_path:
@@ -239,28 +242,35 @@ class CameraManager:
             if self._source.open():
                 return True
 
-        if self.cam_mode in ('auto', 'ip'):
+        if self.cam_mode in ('auto', 'ip') and not self._skip_gige:
             source = GigECamera()
             if source.open():
                 self._source = source
+                self._skip_gige = False
                 return True
             if self.cam_mode == 'ip':
                 return False
+            self._skip_gige = True
 
         if self.cam_mode in ('auto', 'usb'):
             source = USBCamera(self.width, self.height)
             if source.open():
                 self._source = source
+                self._skip_gige = False
                 return True
 
         if self.file_path:
             self._source = FileSource(self.file_path)
+            self._skip_gige = False
             return self._source.open()
 
         return False
 
     def read(self) -> np.ndarray | None:
         if self._source is None:
+            self._fallback_count += 1
+            if self._fallback_count >= self._max_fallback:
+                self._reconnect()
             return None
         frame = self._source.read()
         if frame is not None:

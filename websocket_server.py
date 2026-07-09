@@ -34,6 +34,7 @@ class WebSocketServer:
         self._clients: set[websockets.WebSocketServerProtocol] = set()
         self._last_frame: DetectorFrame | None = None
         self._server: websockets.WebSocketServer | None = None
+        self._broadcast_lock = asyncio.Lock()
 
     def push_frame(self, frame: DetectorFrame) -> None:
         """Called from video loop to broadcast a new frame to all clients."""
@@ -43,24 +44,25 @@ class WebSocketServer:
         asyncio.get_event_loop().create_task(self._broadcast(frame))
 
     async def _broadcast(self, frame: DetectorFrame) -> None:
-        if not self._clients:
-            return
-        safe_objects = objects_to_api(frame.objects, self.mask_format)
-        msg = json.dumps(
-            {
-                'type': 'detections',
-                'frame_id': frame.frame_id,
-                'objects': safe_objects,
-                'fps': frame.fps,
-                'inference_ms': frame.inference_ms,
-                'total_ms': frame.total_ms,
-                'source': frame.source,
-                'ts': time.time(),
-            }
-        )
-        coros = [self._send_detections(ws, msg, frame) for ws in self._clients.copy()]
-        if coros:
-            await asyncio.gather(*coros, return_exceptions=True)
+        async with self._broadcast_lock:
+            if not self._clients:
+                return
+            safe_objects = objects_to_api(frame.objects, self.mask_format)
+            msg = json.dumps(
+                {
+                    'type': 'detections',
+                    'frame_id': frame.frame_id,
+                    'objects': safe_objects,
+                    'fps': frame.fps,
+                    'inference_ms': frame.inference_ms,
+                    'total_ms': frame.total_ms,
+                    'source': frame.source,
+                    'ts': time.time(),
+                }
+            )
+            coros = [self._send_detections(ws, msg, frame) for ws in self._clients.copy()]
+            if coros:
+                await asyncio.gather(*coros, return_exceptions=True)
 
     async def _send_detections(
         self,
@@ -69,10 +71,10 @@ class WebSocketServer:
         frame: DetectorFrame,
     ) -> None:
         try:
-            await ws.send(msg)
             if frame.jpeg:
                 header = struct.pack('!I', frame.frame_id)
                 await ws.send(header + frame.jpeg)
+            await ws.send(msg)
         except websockets.ConnectionClosed:
             self._clients.discard(ws)
 
@@ -89,8 +91,9 @@ class WebSocketServer:
                         and self._last_frame
                         and self._last_frame.jpeg
                     ):
-                        header = struct.pack('!I', self._last_frame.frame_id)
-                        await ws.send(header + self._last_frame.jpeg)
+                        async with self._broadcast_lock:
+                            header = struct.pack('!I', self._last_frame.frame_id)
+                            await ws.send(header + self._last_frame.jpeg)
                 except json.JSONDecodeError:
                     pass
         except websockets.ConnectionClosed:
