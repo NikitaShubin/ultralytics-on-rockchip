@@ -3,3 +3,6 @@ waitress
 opencv-python-headless
 numpy
 onnxruntime
+websockets
+ruff
+mypy

@@ -1,15 +1,16 @@
 # webcam
 
-Real-time YOLO детекция/сегментация/pose/OBB/классификация на NPU (RK3588S) с вебкамеры.
+Real-time YOLO детекция/сегментация/pose/OBB/классификация/семантическая сегментация на NPU (RK3588S)
+с USB/GigE камеры.
 
-**Архитектура**: OpenCV → Pipeline (RKNN inference + postprocess) → `/frame` endpoint → браузер через canvas-pull.
-Низкая задержка (~200-300ms), нет накопления буфера.
+**Архитектура**: `CameraSource` → `VideoLoop` (capture → Pipeline) → Flask HTTP + WebSocket → браузер.
 
 ## Требования
 
 - Docker Engine, пользователь в группе `docker`
 - RK3588S с установленными библиотеками NPU (`librknnrt.so`, `librknn_api.so`)
-- USB камера с поддержкой MJPEG
+- USB камера (MJPEG) или GigE Vision камера (Basler, pypylon)
+- OpenCV 5.x
 
 ## Быстрый старт
 
@@ -17,72 +18,41 @@ Real-time YOLO детекция/сегментация/pose/OBB/классифи
 docker compose up -d --build
 ```
 
-Просмотр: `http://<host>:5000/`  
+Просмотр: `http://<host>:5000/`
 Тестовая страница: `http://<host>:5000/test`
 
-## Переключение между моделями
+## Режимы камеры
 
-Все скомпилированные модели лежат в `converter/model/`:
+Управляются переменной `CAM_MODE`:
 
+| Значение | Приоритет | Описание |
+|----------|-----------|----------|
+| `auto` (default) | GigE → USB → file | Сначала ищет GigE камеру через GVCP broadcast, затем USB, затем файл |
+| `ip` | GigE only | Только GigE камера, без fallback |
+| `usb` | USB only | Только USB камера |
+| `file` | file only | Воспроизведение файла/потока по `CAM_SOURCE` |
+
+Пример с GigE камерой:
 ```bash
-# Посмотреть список доступных моделей
-ls converter/model/
-
-# Развернуть нужную (например yolo11s-pose)
-cp converter/model/yolo11s-pose_rkopt_o19.rknn  model/model.rknn
-cp converter/model/yolo11s-pose_rkopt_o19.onnx   model/model.onnx
-cp converter/model/yolo11s-pose_postprocess.py   model/postprocess.py
-
-# Перезагрузить pipeline
-curl http://localhost:5000/reload
+CAM_MODE=auto docker compose up -d
+# или явно:
+CAM_MODE=ip CAM_SOURCE=192.168.5.1 docker compose up -d
 ```
 
-Либо одной командой через converter (если модель уже скомпилирована):
-```bash
-cd converter
-docker compose run --rm converter convert yolo11s-pose.pt --deploy
-```
+## Управление моделями
 
-Модели YOLO26 (OBB26, Pose26, Segment26) можно переключать по имени:
-```bash
-# Положить .rknn, .onnx, _postprocess.py в converter/model/
-# Затем перезагрузить с указанием имени:
-curl "http://localhost:5000/reload?model=yolo26n-obb"
-# Без ?model= загружается model.rknn / MODEL env / yolo11n по умолчанию
-```
-
-## Конвертация новой модели
-
-Поддерживаются любые Ultralytics-совместимые `.pt` веса (YOLOv5-v11, YOLO26, RT-DETR, официальные или кастомно обученные)
-с задачами `detect`, `segment`, `pose`, `obb`, `classify`.
-
-Скопировать `.pt` файл в `converter/weights/` и запустить:
+Переключение по имени через `/reload` без копирования файлов:
 
 ```bash
-cd converter
-docker compose run --rm converter convert my-model.pt
+curl "http://localhost:5000/reload?model=yolo26n-sem&backend=cpu"
+curl "http://localhost:5000/reload?model=yolo11n-pose"
 ```
 
-Если файл лежит в корне `converter/`, передать путь явно:
+`?model=` ищет `<name>.rknn`, `<name>.onnx`, `<name>_postprocess.py` в `model/`.
+`?backend=cpu` — форсировать ONNX CPU (если RKNN не нужен или не работает).
+Без параметров — загружает `model.rknn` / `model.onnx` / `model/env`.
 
-```bash
-docker compose run --rm converter convert ./my-custom-model.pt
-```
-
-Конвертер сам:
-1. Применяет патчи для совместимости с RKNN (YOLO26, fuse bug workaround, и т.д.)
-2. Экспортирует ONNX (RK-opt) + компилирует RKNN
-3. Генерирует `postprocess.py` под задачу модели (с учетом `reg_max`, anchor offset и т.д.)
-4. Копирует результат в `converter/model/` и `model/`
-
-### Параметры
-
-```bash
-docker compose run --rm converter convert <model> [--test] [--deploy]
-
-# --test   — валидация ONNX vs RKNN на coco8 (только для detect)
-# --deploy — копировать в model/ и вызвать /reload
-```
+Поддерживаются задачи: `detect`, `segment`, `pose`, `obb`, `classify`, `sem`.
 
 ## Доступные модели
 
@@ -99,54 +69,99 @@ docker compose run --rm converter convert <model> [--test] [--deploy]
 | `yolo11m-pose` | pose | 43 MB | 20.2M |
 | `yolo11n-obb` | obb | 6.1 MB | 2.9M |
 | `yolo11n-cls` | classify | 6.5 MB | 1.6M |
+| `yolo12n` | detect | 7.5 MB | 2.6M |
+| `yolo12x` | detect | 127 MB | 59.1M |
 
-YOLO26 (reg_max=1, no DFL, float — не INT8):
+YOLO26 (reg_max=1, float):
+
 | Модель | Задача | Размер RKNN |
 |--------|--------|-------------|
 | `yolo26n-seg` | segment | ~7 MB |
 | `yolo26n-pose` | pose | ~6 MB |
 | `yolo26x-pose` | pose | 116 MB |
 | `yolo26n-obb` | obb | 7.2 MB |
+| `yolo26n-sem` | semantic seg | 6.7 MB |
+
+## Конвертация новой модели
+
+Скопировать `.pt` в `converter/weights/` и запустить:
+
+```bash
+cd converter
+docker compose run --rm converter convert my-model.pt
+```
+
+Конвертер сам:
+1. Применяет патчи для совместимости с RKNN (YOLO26, fuse bug)
+2. Экспортирует ONNX + компилирует RKNN
+3. Генерирует `postprocess.py` под задачу
+4. Копирует результат в `converter/model/` и `../model/`
+
+Параметры:
+
+```bash
+docker compose run --rm converter convert <model> [--test] [--deploy]
+```
+
+## Тестовая страница
+
+`http://<host>:5000/test` — галерея предустановленных изображений:
+
+- Клик по превью → загрузка + обработка (маски/боксы)
+- Drag-and-drop своего изображения → обработка + кнопка "Save to gallery"
+- Кнопка × на превью → удаление из галереи
+- Два режима отображения: оригинал (слева) и результат (справа)
+
+## Эндпоинты
+
+| Route | Метод | Описание |
+|-------|-------|----------|
+| `/` | GET | Просмотр с камеры (WebSocket + HTTP fallback) |
+| `/frame` | GET | Последний обработанный JPEG |
+| `/objects` | GET | JSON с детекциями |
+| `/reload` | GET | Перезагрузка модели (`?model=name&backend=cpu`) |
+| `/test` | GET | Тестовая страница |
+| `/test/images` | GET | JSON список тестовых изображений |
+| `/test/images/<name>` | GET | Отдача тестового изображения |
+| `/test/images/<name>` | DELETE | Удаление из галереи |
+| `/test/upload` | POST | Загрузка изображения в галерею |
+| `/process` | POST | Обработка загруженного файла |
 
 ## Структура
 
 ```
 webcam/
-├── app.py              # Flask-приложение (CameraManager + endpoints)
-├── pipeline.py         # Загрузка модели, pre/post-processing, инференс (RLock, model_name)
-├── docker-compose.yml  # Сервис webcam (MODEL env var)
-├── Dockerfile          # Образ (rknn-toolkit-lite2 + OpenCV)
-├── model/              # Текущая активная модель (model.rknn + postprocess.py)
-├── converter/
-│   ├── converter.py    # Конвертация .pt → ONNX → RKNN + генерация postprocess
-│   ├── templates/      # Шаблоны postprocess (detect/pose/segment/obb/classify/detr)
-│   ├── patches/        # RKNN-патчи для разных голов YOLO (+ YOLO26, fuse bug)
-│   ├── model/          # Скомпилированные .rknn/.onnx всех моделей
-│   ├── weights/        # Исходные .pt файлы
-│   ├── docker-compose.yml
-│   └── Dockerfile      # Образ с rknn-toolkit2 + onnxruntime + ultralytics
+├── app.py              # Flask приложение (create_app, endpoints)
+├── pipeline.py         # Загрузка модели, инференс, постпроцесс (RLock)
+├── main.py             # Точка входа (VideoLoop + HTTP + WebSocket)
+├── config.py           # CLI/env конфигурация (WebcamConfig)
+├── camera_source.py    # Абстракция камеры (USB/GigE/File)
+├── video_loop.py       # Async capture → detect → notify loop
+├── websocket_server.py # WebSocket push для live viewer
+├── detector_frame.py   # DetectorFrame dataclass
+├── utils.py            # letterbox, scale_coords, NMS, DFL
+├── camtest.py          # Диагностика USB камер
+├── validate_npu.py     # Валидация ONNX vs RKNN
+├── docker-compose.yml  # Сервис webcam
+├── Dockerfile          # Образ (rknn-toolkit-lite2 + OpenCV + pypylon)
+├── model/              # Активная модель (.rknn/.onnx + _postprocess.py)
+├── templates/
+│   ├── index.html      # Live viewer (WebSocket + canvas)
+│   └── test.html       # Тестовая страница (галерея + drag-drop)
+├── test/               # Тестовые изображения
+└── converter/          # Конвертация .pt → ONNX → RKNN
+    ├── converter.py
+    ├── templates/      # Шаблоны постпроцесса
+    ├── patches/        # RKNN-патчи
+    ├── model/          # Скомпилированные модели
+    └── weights/        # Исходные .pt
 ```
-
-## Эндпоинты
-
-| Route | Описание |
-|---|---|
-| `/` | Просмотр с камеры (canvas pull, `setTimeout(next, 0)`) |
-| `/frame` | Последний обработанный JPEG (no-cache) |
-| `/test` | Drag-and-drop загрузка изображений |
-| `/test/raw` | Тестовое изображение |
-| `/process` | POST — обработка загруженного файла |
-| `/reload` | Перезагрузить модель (с опцией `?model=name`) |
-
-## Горячее подключение камер
-
-`volumes: /dev:/dev` — камера автоматически обнаруживается при подключении.
-При отключении отображается заглушка "Camera not connected".
 
 ## Известные проблемы
 
 - YOLO-NAS, YOLOWorld не поддерживаются
 - Компиляция RKNN на aarch64 медленная для больших моделей
-- RT-DETR: runtime init падает на NPU (используется CPU), GridSample — CPU fallback
-- OBB постпроцесс поддерживает два формата выхода модели: единый `(1, C, total_grid)` и 9 отдельных (бокс/класс/угол на stride). Определяется автоматически. Для единого выхода применяет Sigmoid к class scores.
-- `quantize=16` (по умолчанию) = float-модель (не INT8). INT8 только с `quantize=8` + calibration dataset.
+- RT-DETR runtime init падает на NPU (используется CPU)
+- OBB постпроцесс: автоматическое определение формата выхода (единый или 9 отдельных)
+- `quantize=16` (default) = float-модель; INT8 только с `quantize=8` + calibration
+- GigE камера: первый захват может быть медленным (GVCP discovery + auto-negotiation packet size)

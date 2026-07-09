@@ -1,0 +1,220 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>test — webcam</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+html, body { width: 100%; min-height: 100vh; background: #111; color: #ddd; font-family: sans-serif; }
+body { display: flex; flex-direction: column; align-items: center; padding: 20px; gap: 16px; }
+#gallery {
+  width: 100%; max-width: 1100px;
+  display: grid; grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
+  gap: 10px;
+}
+.thumb {
+  position: relative; aspect-ratio: 16/9; overflow: hidden;
+  border-radius: 8px; border: 2px solid #333; cursor: pointer;
+  transition: 0.15s; background: #000;
+}
+.thumb:hover { border-color: #4caf50; transform: scale(1.03); }
+.thumb.active { border-color: #4caf50; box-shadow: 0 0 12px #4caf5066; }
+.thumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.thumb .label {
+  position: absolute; bottom: 0; left: 0; right: 0;
+  background: linear-gradient(transparent, #000000cc);
+  color: #eee; font-size: 12px; padding: 20px 6px 5px 6px; text-align: center;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.thumb .del {
+  position: absolute; top: 4px; right: 4px; width: 24px; height: 24px;
+  background: #c62828cc; border: none; border-radius: 50%;
+  color: #fff; font-size: 14px; line-height: 24px; text-align: center;
+  cursor: pointer; opacity: 0; transition: 0.15s; z-index: 2;
+}
+.thumb:hover .del { opacity: 1; }
+.thumb .del:hover { background: #e53935; transform: scale(1.15); }
+#drop-zone {
+  width: 100%; max-width: 900px; min-height: 120px;
+  border: 2px dashed #555; border-radius: 12px;
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
+  cursor: pointer; transition: 0.2s; padding: 20px; gap: 10px;
+  font-size: 16px; color: #888;
+}
+#drop-zone.drag-over { border-color: #4caf50; background: #1a3a1a; color: #4caf50; }
+#drop-zone.loading { pointer-events: none; opacity: 0.5; }
+#drop-zone input { display: none; }
+.panels {
+  width: 100%; max-width: 1200px;
+  display: grid; grid-template-columns: 1fr 1fr; gap: 16px;
+}
+.panel { display: flex; flex-direction: column; gap: 6px; }
+.panel .label { font-size: 13px; color: #888; text-align: center; }
+.panel img { width: 100%; max-height: 70vh; object-fit: contain; background: #000; border-radius: 8px; }
+.action-row { display: flex; gap: 10px; justify-content: center; margin-top: 4px; }
+.btn {
+  background: #333; color: #ddd; border: 1px solid #555;
+  padding: 8px 18px; border-radius: 8px; cursor: pointer; font-size: 13px;
+  transition: 0.15s;
+}
+.btn:hover { background: #444; border-color: #777; }
+.btn.primary { background: #1b5e20; border-color: #4caf50; }
+.btn.primary:hover { background: #2e7d32; }
+.btn.danger { background: #b71c1c; border-color: #e53935; }
+.btn.danger:hover { background: #c62828; }
+@media (max-width: 700px) {
+  .panels { grid-template-columns: 1fr; }
+  #gallery { grid-template-columns: repeat(auto-fill, minmax(120px, 1fr)); }
+  #drop-zone { min-height: 100px; font-size: 14px; }
+}
+.spinner { display: none; width: 28px; height: 28px; border: 3px solid #555; border-top-color: #4caf50; border-radius: 50%; animation: spin 0.8s linear infinite; }
+@keyframes spin { to { transform: rotate(360deg); } }
+</style>
+</head>
+<body>
+<div id="gallery"></div>
+<div id="drop-zone">
+  <div class="spinner" id="spinner"></div>
+  <span id="dz-text">Drop image here or click to select</span>
+  <input type="file" id="file-input" accept="image/*">
+</div>
+<div class="panels" id="panels" style="display:none">
+  <div class="panel">
+    <div class="label">Original</div>
+    <img id="orig-preview">
+  </div>
+  <div class="panel">
+    <div class="label">Detections</div>
+    <img id="result-preview">
+    <div class="action-row" id="save-row" style="display:none">
+      <button class="btn primary" id="btn-save">Save to gallery</button>
+    </div>
+  </div>
+</div>
+<script>
+const gallery = document.getElementById('gallery');
+const dz = document.getElementById('drop-zone');
+const fi = document.getElementById('file-input');
+const dzText = document.getElementById('dz-text');
+const spinner = document.getElementById('spinner');
+const panels = document.getElementById('panels');
+const origPreview = document.getElementById('orig-preview');
+const resultPreview = document.getElementById('result-preview');
+const saveRow = document.getElementById('save-row');
+const btnSave = document.getElementById('btn-save');
+
+let _lastUploadedFile = null;
+
+function setLoading(on) {
+  dz.classList.toggle('loading', on);
+  spinner.style.display = on ? 'block' : 'none';
+  dzText.textContent = on ? 'Processing...' : 'Drop image here or click to select';
+}
+
+function loadGallery() {
+  gallery.innerHTML = '';
+  fetch('/test/images')
+    .then(r => r.json())
+    .then(images => {
+      images.forEach(img => {
+        const div = document.createElement('div');
+        div.className = 'thumb';
+        div.dataset.name = img.name;
+        div.innerHTML = `
+          <button class="del" title="Delete">×</button>
+          <img src="${img.url}" alt="${img.name}" loading="lazy">
+          <div class="label">${img.name}</div>`;
+        div.querySelector('img').addEventListener('click', () => loadTestImage(img.name, img.url));
+        div.querySelector('.del').addEventListener('click', e => {
+          e.stopPropagation();
+          deleteImage(img.name, div);
+        });
+        gallery.appendChild(div);
+      });
+    });
+}
+
+function deleteImage(name, el) {
+  if (!confirm(`Delete "${name}"?`)) return;
+  fetch(`/test/images/${encodeURIComponent(name)}`, { method: 'DELETE' })
+    .then(r => {
+      if (r.ok) { el.remove(); }
+      else { alert('Delete failed'); }
+    });
+}
+
+function processFile(file) {
+  _lastUploadedFile = file;
+  saveRow.style.display = 'none';
+  const url = URL.createObjectURL(file);
+  origPreview.src = url;
+  panels.style.display = 'grid';
+  setLoading(true);
+  const fd = new FormData();
+  fd.append('image', file);
+  fetch('/process', { method: 'POST', body: fd })
+    .then(r => { if (!r.ok) throw new Error(r.statusText); return r.blob(); })
+    .then(blob => { resultPreview.src = URL.createObjectURL(blob); setLoading(false); saveRow.style.display = 'flex'; })
+    .catch(e => { setLoading(false); dzText.textContent = 'Error: ' + e.message; });
+}
+
+function loadTestImage(name, url) {
+  _lastUploadedFile = null;
+  saveRow.style.display = 'none';
+  document.querySelectorAll('.thumb').forEach(t => t.classList.remove('active'));
+  const thumb = document.querySelector(`[data-name="${name}"]`);
+  if (thumb) thumb.classList.add('active');
+  setLoading(true);
+  fetch(url)
+    .then(r => { if (!r.ok) throw new Error(r.statusText); return r.blob(); })
+    .then(blob => {
+      const file = new File([blob], name, { type: blob.type || 'image/jpeg' });
+      const fd = new FormData();
+      fd.append('image', file);
+      origPreview.src = URL.createObjectURL(blob);
+      panels.style.display = 'grid';
+      return fetch('/process', { method: 'POST', body: fd });
+    })
+    .then(r => { if (!r.ok) throw new Error(r.statusText); return r.blob(); })
+    .then(blob => { resultPreview.src = URL.createObjectURL(blob); setLoading(false); })
+    .catch(e => { setLoading(false); dzText.textContent = 'Error: ' + e.message; });
+}
+
+btnSave.addEventListener('click', () => {
+  if (!_lastUploadedFile) return;
+  btnSave.disabled = true;
+  btnSave.textContent = 'Saving...';
+  const fd = new FormData();
+  fd.append('image', _lastUploadedFile);
+  fetch('/test/upload', { method: 'POST', body: fd })
+    .then(r => { if (!r.ok) throw new Error(r.statusText); return r.text(); })
+    .then(name => {
+      btnSave.textContent = 'Saved!';
+      setTimeout(() => { btnSave.textContent = 'Save to gallery'; btnSave.disabled = false; }, 1500);
+      loadGallery();
+    })
+    .catch(e => { btnSave.textContent = 'Error!'; btnSave.disabled = false; });
+});
+
+// Init
+loadGallery();
+
+dz.addEventListener('click', () => { fi.value = ''; fi.click(); });
+fi.addEventListener('change', () => {
+  if (!fi.files[0]) return;
+  const f = fi.files[0];
+  fi.value = '';
+  document.querySelectorAll('.thumb').forEach(t => t.classList.remove('active'));
+  processFile(f);
+});
+dz.addEventListener('dragover', e => { e.preventDefault(); dz.classList.add('drag-over'); });
+dz.addEventListener('dragleave', () => dz.classList.remove('drag-over'));
+dz.addEventListener('drop', e => {
+  e.preventDefault(); dz.classList.remove('drag-over');
+  const f = e.dataTransfer.files[0];
+  if (f && f.type.startsWith('image/')) { document.querySelectorAll('.thumb').forEach(t => t.classList.remove('active')); processFile(f); }
+});
+</script>
+</body>
+</html>

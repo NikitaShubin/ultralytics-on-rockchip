@@ -1,191 +1,211 @@
+"""Pipeline: model loading, inference, and post-processing orchestration."""
+
+from __future__ import annotations
+
 import importlib.util
-import os
+import logging
 import sys
-import threading
+import time
+from contextlib import suppress
+from pathlib import Path
 from threading import RLock
+from typing import Any
 
 import cv2
 import numpy as np
 
-NPU_TEMP_PATH = "/sys/class/thermal/thermal_zone6/temp"
+from config import Backend
+from utils import letterbox
+
+log = logging.getLogger(__name__)
+
+
+def _ndarray_to_list(obj: Any) -> Any:
+    """Recursively convert ndarray values to lists for JSON serialization."""
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    if isinstance(obj, dict):
+        return {k: _ndarray_to_list(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_ndarray_to_list(v) for v in obj]
+    return obj
+
+NPU_TEMP_PATH = Path('/sys/class/thermal/thermal_zone6/temp')
 TEMP_WARN = 85
+TEMP_INTERVAL = 30.0
 
 
 class Pipeline:
-    def __init__(self, model_dir: str = "/app/model", model_name: str = ""):
-        self.model_dir = model_dir
-        self.model_name = model_name or os.environ.get("MODEL", "yolo11n")
-        self.rknn = None
-        self._session = None
+    """Loads a model, runs inference, and returns detection objects."""
+
+    def __init__(
+        self,
+        model_dir: str = '/app/model',
+        model_name: str = '',
+        backend: Backend = Backend.NPU,
+    ) -> None:
+        self.model_dir = Path(model_dir)
+        self.model_name = model_name or 'yolo11n'
+        self.backend = backend
+        self.rknn: Any = None
+        self._session: Any = None
         self._postprocess = None
         self._visualize = None
         self.input_size = 640
         self._temp_warned = False
-        self._infer_lock = threading.RLock()
-        self.backend = os.environ.get("BACKEND", "npu")
+        self._last_temp_check = 0.0
+        self._infer_lock = RLock()
         self._load_model()
         self._load_postprocess()
 
-    def _load_model(self):
-        if self.backend == "cpu":
+    def _load_model(self) -> None:
+        if self.backend == Backend.CPU:
             self._load_model_onnx()
         else:
             self._load_model_rknn()
 
-    def _load_model_rknn(self):
-        from rknnlite.api import RKNNLite
-        model_path = os.path.join(self.model_dir, f"{self.model_name}.rknn")
-        if not os.path.exists(model_path):
-            model_path = os.path.join(self.model_dir, "model.rknn")
+    def _load_model_rknn(self) -> None:
+        from rknnlite.api import RKNNLite  # noqa: PLC0415
+
+        model_path = self.model_dir / f'{self.model_name}.rknn'
+        if not model_path.exists():
+            model_path = self.model_dir / 'model.rknn'
+        if not model_path.exists():
+            msg = f'RKNN model not found: {model_path}'
+            raise RuntimeError(msg)
         self.rknn = RKNNLite()
-        ret = self.rknn.load_rknn(model_path)
+        ret = self.rknn.load_rknn(str(model_path))
         if ret != 0:
-            raise RuntimeError(f"Failed to load RKNN model: {ret}")
+            msg = f'Failed to load RKNN model: {ret}'
+            raise RuntimeError(msg)
         ret = self.rknn.init_runtime(core_mask=RKNNLite.NPU_CORE_0_1_2)
         if ret != 0:
-            raise RuntimeError(f"Failed to init runtime: {ret}")
-        print(f"[[V4]] pipeline started (RKNN) model={self.model_name}", flush=True)
+            msg = f'Failed to init runtime: {ret}'
+            raise RuntimeError(msg)
+        log.info('pipeline started (RKNN) model=%s', self.model_name)
 
-    def _load_model_onnx(self):
-        import onnxruntime as rt
-        model_path = os.path.join(self.model_dir, f"{self.model_name}.onnx")
-        if not os.path.exists(model_path):
-            model_path = os.path.join(self.model_dir, "model.onnx")
-        if not os.path.exists(model_path):
-            raise RuntimeError(f"ONNX model not found at {model_path}")
-        self._session = rt.InferenceSession(model_path, providers=["CPUExecutionProvider"])
+    def _load_model_onnx(self) -> None:
+        import onnxruntime as rt  # noqa: PLC0415
+
+        model_path = self.model_dir / f'{self.model_name}.onnx'
+        if not model_path.exists():
+            model_path = self.model_dir / 'model.onnx'
+        if not model_path.exists():
+            msg = f'ONNX model not found at {model_path}'
+            raise RuntimeError(msg)
+        self._session = rt.InferenceSession(
+            str(model_path),
+            providers=['CPUExecutionProvider'],
+        )
         self._input_name = self._session.get_inputs()[0].name
-        print(f"[[V4]] pipeline started (ONNX CPU) model={self.model_name}", flush=True)
+        log.info('pipeline started (ONNX CPU) model=%s', self.model_name)
 
-    def _load_postprocess(self):
-        post_path = os.path.join(self.model_dir, f"{self.model_name}_postprocess.py")
-        if not os.path.exists(post_path):
-            post_path = os.path.join(self.model_dir, "postprocess.py")
-        if not os.path.exists(post_path):
-            raise RuntimeError(f"postprocess.py not found at {post_path}")
-        spec = importlib.util.spec_from_file_location("postprocess_mod", post_path)
+    def _load_postprocess(self) -> None:
+        post_path = self.model_dir / f'{self.model_name}_postprocess.py'
+        if not post_path.exists():
+            post_path = self.model_dir / 'postprocess.py'
+        if not post_path.exists():
+            msg = f'postprocess.py not found at {post_path}'
+            raise RuntimeError(msg)
+        spec = importlib.util.spec_from_file_location('postprocess_mod', str(post_path))
+        assert spec is not None  # noqa: S101
         mod = importlib.util.module_from_spec(spec)
-        sys.modules["postprocess_mod"] = mod
+        sys.modules['postprocess_mod'] = mod
+        assert spec.loader is not None  # noqa: S101
         spec.loader.exec_module(mod)
-        self._postprocess = getattr(mod, "postprocess", None)
-        self._visualize = getattr(mod, "visualize", None)
-        self._custom_preprocess = getattr(mod, "preprocess", None)
+        self._postprocess = getattr(mod, 'postprocess', None)
+        self._visualize = getattr(mod, 'visualize', None)
+        self._custom_preprocess = getattr(mod, 'preprocess', None)
+        self._semantic_mode = getattr(mod, 'SEMANTIC_MODE', False)
         if self._postprocess is None:
-            raise RuntimeError("postprocess.py must define postprocess()")
-        self.input_size = getattr(mod, "INPUT_SIZE", 640)
-        print(f"[[V4]] postprocess loaded from {post_path} (input_size={self.input_size})", flush=True)
+            msg = 'postprocess.py must define postprocess()'
+            raise RuntimeError(msg)
+        self.input_size = getattr(mod, 'INPUT_SIZE', 640)
+        log.info(
+            'postprocess loaded from %s (input_size=%s)',
+            post_path,
+            self.input_size,
+        )
 
-    def reload(self, model_name: str = ""):
+    def reload(self, model_name: str = '', backend: Backend | None = None) -> None:
+        """Reload model and postprocess (thread-safe)."""
         if model_name:
             self.model_name = model_name
-        print(f"[[V4]] reloading model={self.model_name}...", flush=True)
+        if backend is not None:
+            self.backend = backend
+        log.info('reloading model=%s backend=%s...', self.model_name, self.backend)
         with self._infer_lock:
             if self.rknn:
-                try:
+                with suppress(Exception):
                     self.rknn.release()
-                except Exception:
-                    pass
                 self.rknn = None
             self._session = None
             self._load_model()
-
-            if "postprocess_mod" in sys.modules:
-                del sys.modules["postprocess_mod"]
+            if 'postprocess_mod' in sys.modules:
+                del sys.modules['postprocess_mod']
             self._postprocess = None
             self._visualize = None
             self._load_postprocess()
+        log.info('reload complete (model=%s)', self.model_name)
 
-        print(f"[[V4]] reload complete (model={self.model_name})", flush=True)
-
-    def _infer(self, tensor):
-        if self.backend == "cpu":
+    def _infer(self, tensor: np.ndarray) -> list[np.ndarray]:
+        if self.backend == Backend.CPU:
+            if self._custom_preprocess:
+                tensor = tensor.transpose(0, 3, 1, 2)
+                return self._session.run(None, {self._input_name: tensor})
             return self._session.run(None, {self._input_name: tensor / 255.0})
         if self._custom_preprocess:
             return self.rknn.inference(inputs=[tensor])
         nhwc = tensor.transpose(0, 2, 3, 1)
         return self.rknn.inference(inputs=[nhwc])
 
-    def _npu_temp(self) -> int | None:
-        try:
-            raw = open(NPU_TEMP_PATH).read().strip()
-            return int(raw) // 1000
-        except Exception:
+    def _check_temp(self) -> int | None:
+        """Check NPU temperature (throttled to once per TEMP_INTERVAL)."""
+        now = time.monotonic()
+        if now - self._last_temp_check < TEMP_INTERVAL:
             return None
+        self._last_temp_check = now
+        try:
+            raw = NPU_TEMP_PATH.read_text().strip()
+            temp = int(raw) // 1000
+        except OSError:
+            return None
+        if temp >= TEMP_WARN and not self._temp_warned:
+            log.warning('NPU temp=%s°C (>=%s)', temp, TEMP_WARN)
+            self._temp_warned = True
+        return temp
+
+    def detect(
+        self,
+        frame: np.ndarray,
+    ) -> tuple[list[dict], dict]:
+        """Run inference on a frame and return (objects, metadata)."""
+        self._check_temp()
+        h, w = frame.shape[:2]
+        with self._infer_lock:
+            if self._custom_preprocess:
+                tensor, scale, pad = self._custom_preprocess(frame)
+            else:
+                canvas, scale, pad = letterbox(frame, self.input_size)
+                rgb = cv2.cvtColor(canvas, cv2.COLOR_BGR2RGB).astype(np.float32)
+                tensor = np.expand_dims(rgb.transpose(2, 0, 1), axis=0)
+            try:
+                outputs = self._infer(tensor)
+            except Exception:
+                log.exception('inference failed')
+                return [], {}
+        objects: list[dict] = (
+            self._postprocess(outputs, scale, pad, (h, w)) if self._postprocess else []
+        )
+        metadata: dict = {
+            'orig_size': (h, w),
+            'input_size': self.input_size,
+        }
+        return objects, metadata
 
     def process(self, frame: np.ndarray) -> np.ndarray:
-        temp = self._npu_temp()
-        if temp is not None and temp >= TEMP_WARN and not self._temp_warned:
-            print(f"[[TEMP]] NPU={temp}°C (≥{TEMP_WARN}) — high temp warning", flush=True)
-            self._temp_warned = True
-
-        h, w = frame.shape[:2]
-        with self._infer_lock:
-            tensor, scale, pad = self._preprocess(frame)
-            try:
-                outputs = self._infer(tensor)
-            except Exception as e:
-                print(f"[[ERR]] inference failed: {e}", flush=True)
-                return frame
-
-        if self._postprocess:
-            objects = self._postprocess(outputs, scale, pad, (h, w))
-            if self._visualize:
-                frame = self._visualize(frame, objects)
-
+        """Legacy: run inference + visualize, return annotated image."""
+        objects, _ = self.detect(frame)
+        if self._visualize and (objects or self._semantic_mode):
+            frame = self._visualize(frame, objects)
         return frame
-
-    def process_canvas(self, frame: np.ndarray) -> tuple:
-        h, w = frame.shape[:2]
-        with self._infer_lock:
-            tensor, scale, pad = self._preprocess(frame)
-            canvas = tensor[0].transpose(1, 2, 0).astype(np.uint8)
-            canvas = cv2.cvtColor(canvas, cv2.COLOR_RGB2BGR)
-
-            try:
-                outputs = self._infer(tensor)
-            except Exception as e:
-                print(f"[[ERR]] inference failed (canvas): {e}", flush=True)
-                return canvas, pad, scale
-
-        if self._postprocess:
-            objects = self._postprocess(outputs, scale, pad, (h, w))
-            for obj in objects:
-                x1, y1, x2, y2 = obj["bbox"]
-                score = obj["score"]
-                label = f"{obj['class_name']}: {score:.2f}"
-                cx = (x1 + x2) / 2 * scale + pad[0] / 2
-                cy = (y1 + y2) / 2 * scale + pad[1] / 2
-                cw = (x2 - x1) * scale
-                ch = (y2 - y1) * scale
-                cv2.rectangle(
-                    canvas,
-                    (int(cx - cw / 2), int(cy - ch / 2)),
-                    (int(cx + cw / 2), int(cy + ch / 2)),
-                    (0, 0, 255), 2,
-                )
-                cv2.putText(
-                    canvas, label,
-                    (int(cx - cw / 2), int(cy - ch / 2 - 5)),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1,
-                )
-        return canvas, pad, scale
-
-    def _preprocess(self, frame: np.ndarray):
-        if self._custom_preprocess:
-            return self._custom_preprocess(frame)
-        h, w = frame.shape[:2]
-        scale = min(self.input_size / w, self.input_size / h)
-        new_w, new_h = int(w * scale), int(h * scale)
-        total_pad_w = self.input_size - new_w
-        total_pad_h = self.input_size - new_h
-        pad_left = total_pad_w // 2
-        pad_top = total_pad_h // 2
-        resized = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
-        canvas = cv2.copyMakeBorder(
-            resized, pad_top, total_pad_h - pad_top,
-            pad_left, total_pad_w - pad_left,
-            cv2.BORDER_CONSTANT, value=(114, 114, 114),
-        )
-        tensor = cv2.cvtColor(canvas, cv2.COLOR_BGR2RGB).astype(np.float32)
-        tensor = np.expand_dims(tensor.transpose(2, 0, 1), axis=0)
-        return tensor, scale, (total_pad_w, total_pad_h)

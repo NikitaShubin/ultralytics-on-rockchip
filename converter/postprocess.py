@@ -14,6 +14,11 @@ NUM_CLASSES = 15
 COCO_CLASSES = ["plane", "ship", "storage tank", "baseball diamond", "tennis court", "basketball court", "ground track field", "harbor", "bridge", "large vehicle", "small vehicle", "helicopter", "roundabout", "soccer ball field", "swimming pool"]
 True
 
+_OFFSETS = [gs * gs for gs in GRID_SIZES]
+_TOTAL_GRID = sum(_OFFSETS)
+# OBB output format: 20 channels = 4(box) + NUM_CLASSES(cls) + 1(angle)
+_OBB_NUM_CLS_CH = 15
+
 def dfl_nodfl(position):
     return position
 
@@ -27,6 +32,22 @@ def dfl(position):
     return (y_softmax * weights).sum(axis=2)
 
 _dfl = dfl_nodfl if True else dfl
+
+
+def _split_single_output(feat):
+    """Split single (1, 20, total_grid) output into per-stride box/cls/angle."""
+    n, c, total = feat.shape
+    off = 0
+    splits = []
+    for i, g in enumerate(GRID_SIZES):
+        sz = g * g
+        f = feat[:, :, off:off+sz].reshape(n, c, g, g)
+        box = f[:, 0:4, :, :]
+        cls_raw = f[:, 4:4+_OBB_NUM_CLS_CH, :, :]
+        angle_raw = f[:, 4+_OBB_NUM_CLS_CH:4+_OBB_NUM_CLS_CH+1, :, :]
+        splits.append((box, cls_raw, angle_raw))
+        off += sz
+    return splits
 
 
 def dist2rbox_np(pred_dist, angle, grid_x, grid_y, stride):
@@ -43,14 +64,14 @@ def dist2rbox_np(pred_dist, angle, grid_x, grid_y, stride):
     cx = cx * stride
     cy = cy * stride
     w = (l + r) * stride
-    h = (t + b) * stride
+    h = (b + t) * stride
     return cx, cy, w, h
 
 
 def process_head(box_dist, cls_scores, angle_raw, stride, grid_h, grid_w):
     gh, gw = grid_h, grid_w
 
-    dbox = _dfl(box_dist)  # [n, 4, gh, gw]
+    dbox = _dfl(box_dist)
     dbox = np.nan_to_num(dbox, nan=0.0, posinf=1e6, neginf=-1e6)
     col = np.arange(gw, dtype=np.float32).reshape(1, 1, 1, gw)
     row = np.arange(gh, dtype=np.float32).reshape(1, 1, gh, 1)
@@ -58,7 +79,7 @@ def process_head(box_dist, cls_scores, angle_raw, stride, grid_h, grid_w):
     grid_y = np.broadcast_to(row, (1, 1, gh, gw)) + 0.5
 
     angle_raw_clip = np.clip(angle_raw, -80, 80)
-    ang = (1 / (1 + np.exp(-angle_raw_clip)) - 0.25) * math.pi  # [-pi/4, 3pi/4]
+    ang = (1 / (1 + np.exp(-angle_raw_clip)) - 0.25) * math.pi
 
     boxes = dbox.transpose(0, 2, 3, 1).reshape(-1, 4)
     ang_f = ang.transpose(0, 2, 3, 1).reshape(-1)
@@ -69,7 +90,6 @@ def process_head(box_dist, cls_scores, angle_raw, stride, grid_h, grid_w):
 
     cx, cy, bw, bh = dist2rbox_np(boxes, ang_f, gx, gy, stride)
 
-    # DOTA convention: w >= h, angle in [0, π)
     swap = bh > bw
     if np.any(swap):
         bw[swap], bh[swap] = bh[swap], bw[swap]
@@ -141,12 +161,21 @@ def postprocess(outputs, scale, pad, orig_shape):
     all_cx, all_cy, all_bw, all_bh = [], [], [], []
     all_scores, all_cls, all_angle = [], [], []
 
+    has_single_output = len(outputs) == 1 and outputs[0].shape[1] == 4 + _OBB_NUM_CLS_CH + 1
+
+    if has_single_output:
+        feat = outputs[0]
+        splits = _split_single_output(feat)
+    else:
+        splits = [(outputs[i * 3], outputs[i * 3 + 1], outputs[i * 3 + 2]) for i in range(3)]
+
     for idx in range(3):
-        box_dist = outputs[idx * 3]
-        cls_scores = outputs[idx * 3 + 1]
-        angle_raw = outputs[idx * 3 + 2]
+        box_dist, cls_raw, angle_raw = splits[idx]
         stride = STRIDES[idx]
         gh = gw = GRID_SIZES[idx]
+
+        cls_scores = 1 / (1 + np.exp(-cls_raw)) if has_single_output else cls_raw
+
         cx, cy, bw, bh, ang, scores = process_head(box_dist, cls_scores, angle_raw, stride, gh, gw)
 
         max_cls = scores.max(axis=1)

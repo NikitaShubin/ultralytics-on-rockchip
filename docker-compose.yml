@@ -2,7 +2,7 @@ services:
   webcam:
     build: .
     ports:
-      - "5000:5000"
+      - "${PORT:-5000}:${PORT:-5000}"
     devices:
       - /dev/dri/renderD129:/dev/dri/renderD129
     privileged: true
@@ -13,11 +13,27 @@ services:
       - /usr/lib/librknnrt.so:/usr/lib/librknnrt.so
       - /proc/device-tree/compatible:/proc/device-tree/compatible:ro
       - ./model:/app/model:ro
+      - ./test:/app/test:rw
+      - ./main.py:/app/main.py
       - ./app.py:/app/app.py
       - ./pipeline.py:/app/pipeline.py
+      - ./utils.py:/app/utils.py
+      - ./detector_frame.py:/app/detector_frame.py
+      - ./config.py:/app/config.py
+      - ./camera_source.py:/app/camera_source.py
+      - ./video_loop.py:/app/video_loop.py
+      - ./websocket_server.py:/app/websocket_server.py
+      - ./templates:/app/templates:ro
       - /home/orangepi/work/data/coco8:/app/coco8:ro
     environment:
       - BACKEND=${BACKEND:-npu}
       - MODEL=${MODEL:-yolo11n}
+      - WEB_MODE=${WEB_MODE:-2}
+      - CAM_MODE=${CAM_MODE:-auto}
+      - CAM_W=${CAM_W:-640}
+      - CAM_H=${CAM_H:-480}
       - TEST_MODE=${TEST_MODE:-1}
+      - JPEG_QUALITY=${JPEG_QUALITY:-85}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - MASK_FORMAT=${MASK_FORMAT:-contour}
     restart: unless-stopped

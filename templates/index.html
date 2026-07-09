@@ -1,0 +1,209 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>webcam</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+html, body { width: 100%; height: 100%; overflow: hidden; background: #000; }
+canvas { width: 100vw; height: 100vh; object-fit: contain; display: block; }
+#info {
+  position: fixed; bottom: 8px; left: 8px; color: #0f0;
+  font: 13px/1.4 monospace; pointer-events: none;
+  text-shadow: 0 0 4px #000;
+}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="info"></div>
+<script>
+const COCO_SKELETON = [
+  [0, 1], [0, 2], [1, 3], [2, 4],
+  [5, 6], [5, 7], [7, 9], [6, 8], [8, 10],
+  [5, 11], [6, 12], [11, 12], [11, 13], [13, 15],
+  [12, 14], [14, 16],
+];
+const SKELETON_COLORS = [
+  '#ff0000', '#ff0000', '#ff5500', '#ffaa00',
+  '#ffff00', '#aaff00', '#55ff00', '#00ff00', '#00ff55',
+  '#00ffaa', '#00ffff', '#00aaff', '#0055ff', '#0000ff',
+  '#5500ff', '#aa00ff',
+];
+const KP_COLORS = [
+  '#ff0000', '#ff0000', '#ff5500', '#ffaa00',
+  '#ffff00', '#aaff00', '#55ff00',
+  '#00ff00', '#00ff55', '#ff0000', '#00ffaa',
+  '#00ffff', '#00aaff', '#0055ff',
+  '#0000ff', '#5500ff', '#aa00ff',
+];
+const CLASS_COLORS = [
+  '#e6194b', '#3cb44b', '#ffe119', '#4363d8', '#f58231', '#911eb4',
+  '#42d4f4', '#f032e6', '#bfef45', '#fabed4', '#469990', '#dcbeff',
+  '#9a6324', '#fffac8', '#800000', '#aaffc3', '#808000', '#ffd8b1',
+  '#000075', '#a9a9a9',
+];
+const colorCache = {};
+let colorIdx = 0;
+
+function colorForClass(cls) {
+  if (!colorCache[cls]) { colorCache[cls] = CLASS_COLORS[colorIdx % CLASS_COLORS.length]; colorIdx++; }
+  return colorCache[cls];
+}
+
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+const info = document.getElementById('info');
+
+let currentFrame = { id: -1, blob: null, objects: [] };
+let pendingFrame = null;
+let ws = null;
+let wsConnected = false;
+
+function connectWS() {
+  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  ws = new WebSocket(proto + '//' + location.host + '/ws');
+  ws.binaryType = 'arraybuffer';
+  ws.onopen = () => { wsConnected = true; };
+  ws.onclose = () => { wsConnected = false; ws = null; setTimeout(connectWS, 1000); };
+  ws.onmessage = (e) => {
+    if (e.data instanceof ArrayBuffer) {
+      const dv = new DataView(e.data);
+      pendingFrame = { id: dv.getUint32(0, false), blob: new Blob([e.data.slice(4)], { type: 'image/jpeg' }), objects: [] };
+    } else {
+      const msg = JSON.parse(e.data);
+      if (msg.type === 'detections' && pendingFrame && msg.frame_id === pendingFrame.id) {
+        pendingFrame.objects = msg.objects;
+        currentFrame = pendingFrame;
+        pendingFrame = null;
+        scheduleRender();
+      }
+    }
+  };
+}
+
+function scheduleRender() {
+  requestAnimationFrame(renderFrame);
+}
+
+function renderFrame() {
+  const frame = currentFrame;
+  if (!frame.blob) return;
+  const url = URL.createObjectURL(frame.blob);
+  const img = new Image();
+  img.onload = () => {
+    canvas.width = img.width;
+    canvas.height = img.height;
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    ctx.drawImage(img, 0, 0);
+    URL.revokeObjectURL(url);
+    ctx.globalAlpha = 0.5;
+    for (const obj of frame.objects) drawObject(obj);
+    ctx.globalAlpha = 1.0;
+    const first = frame.objects[0];
+    info.textContent = first
+      ? `frame ${frame.id >= 0 ? frame.id : '?'} | ${frame.objects.length} objects`
+      : 'no detections';
+  };
+  img.src = url;
+}
+
+async function pullFrame() {
+  try {
+    const [frameResp, objResp] = await Promise.all([
+      fetch('/frame?_=' + Date.now()),
+      fetch('/objects?_=' + Date.now()),
+    ]);
+    const [frameBlob, objData] = await Promise.all([frameResp.blob(), objResp.json()]);
+    currentFrame = { id: -1, blob: frameBlob, objects: objData.objects || [] };
+    scheduleRender();
+  } catch {}
+  setTimeout(pullFrame, 50);
+}
+
+function drawObject(obj) {
+  const color = colorForClass(obj.class_name || '');
+  const label = `${obj.class_name || ''} ${(obj.score || 0).toFixed(2)}`;
+
+  if (obj.polygon) {
+    ctx.save();
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    const pts = obj.polygon;
+    ctx.moveTo(pts[0], pts[1]);
+    for (let i = 2; i < pts.length; i += 2) ctx.lineTo(pts[i], pts[i + 1]);
+    ctx.closePath();
+    ctx.fillStyle = color;
+    ctx.globalAlpha = 0.3;
+    ctx.fill();
+    ctx.stroke();
+    ctx.restore();
+    const cx = pts.reduce((s, v, i) => s + (i % 2 === 0 ? v : 0), 0) / (pts.length / 2);
+    const cy = pts.reduce((s, v, i) => s + (i % 2 === 1 ? v : 0), 0) / (pts.length / 2);
+    ctx.font = 'bold 14px sans-serif';
+    ctx.textBaseline = 'bottom';
+    ctx.strokeStyle = '#000';
+    ctx.lineWidth = 3;
+    ctx.lineJoin = 'round';
+    ctx.strokeText(label, cx, cy - 4);
+    ctx.fillStyle = '#fff';
+    ctx.fillText(label, cx, cy - 4);
+  }
+
+  if (obj.bbox) {
+    const [x1, y1, x2, y2] = obj.bbox;
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 2;
+    ctx.strokeRect(x1, y1, x2 - x1, y2 - y1);
+    if (!obj.polygon) {
+      ctx.font = 'bold 14px sans-serif';
+      ctx.textBaseline = 'bottom';
+      ctx.strokeStyle = '#000';
+      ctx.lineWidth = 3;
+      ctx.lineJoin = 'round';
+      ctx.strokeText(label, x1, y1 - 2);
+      ctx.fillStyle = '#fff';
+      ctx.fillText(label, x1, y1 - 2);
+    }
+  }
+
+  if (obj.keypoints && obj.keypoints.length > 0) {
+    for (let k = 0; k < COCO_SKELETON.length; k++) {
+      const [i, j] = COCO_SKELETON[k];
+      if (i < obj.keypoints.length && j < obj.keypoints.length) {
+        const a = obj.keypoints[i];
+        const b = obj.keypoints[j];
+        if (a[2] > 0.5 && b[2] > 0.5) {
+          ctx.strokeStyle = SKELETON_COLORS[k % SKELETON_COLORS.length];
+          ctx.lineWidth = 3;
+          ctx.beginPath();
+          ctx.moveTo(a[0], a[1]);
+          ctx.lineTo(b[0], b[1]);
+          ctx.stroke();
+        }
+      }
+    }
+    for (let i = 0; i < obj.keypoints.length; i++) {
+      const kp = obj.keypoints[i];
+      if (kp[2] > 0.5) {
+        ctx.fillStyle = KP_COLORS[i % KP_COLORS.length];
+        ctx.beginPath();
+        ctx.arc(kp[0], kp[1], 4, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.fillStyle = '#fff';
+        ctx.beginPath();
+        ctx.arc(kp[0], kp[1], 2, 0, Math.PI * 2);
+        ctx.fill();
+      }
+    }
+  }
+
+}
+
+connectWS();
+setTimeout(pullFrame, 100);
+</script>
+</body>
+</html>

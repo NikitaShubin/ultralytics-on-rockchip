@@ -1,10 +1,33 @@
-model/
-.ipynb_checkpoints/
-*.log
 __pycache__/
-*.pyc
-tmp/
-/tmp/
-*.pt
-*.onnx
-*_rknn_model*
+*.py[cod]
+*.so
+.env
+*.egg-info/
+.idea/
+.vscode/
+.ruff_cache/
+.mypy_cache/
+.pytest_cache
+__pycache__
+*.swp
+*.swo
+.DS_Store
+
+# Converter artifacts — large generated files
+converter/*.onnx
+converter/*.rknn
+converter/*.pt
+converter/*_rknn_model/
+converter/model/
+converter/weights/
+converter/check0_*/
+converter/check1_*/
+converter/check2_*/
+converter/core.*
+
+# Active model directory (deployed on device)
+model/
+
+# Test images (user data)
+test/*_pred.jpg
+test/*_preview.jpg
