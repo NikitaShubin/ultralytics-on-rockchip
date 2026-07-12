@@ -164,7 +164,7 @@ def postprocess(outputs, scale, pad, orig_shape):
 
     proto = outputs[-1][0]
 
-    for idx in range(3):
+    for idx in range(len(STRIDES)):
         box_dist = outputs[idx * 3]
         cls_scores = outputs[idx * 3 + 1]
         coeff = outputs[idx * 3 + 2]

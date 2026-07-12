@@ -11,13 +11,14 @@ import cv2
 import numpy as np
 
 MODEL_DIR = Path("/app/converter/model")
-COCO8_DIR = Path("/app/coco8")
+COCO_VAL_IMG_DIR = Path("/app/coco_val2017/images/val2017")
 
 
-def load_coco8_images():
-    if not COCO8_DIR.exists():
+def load_val_images(limit: int = 5):
+    """Load images from COCO val2017 for validation."""
+    if not COCO_VAL_IMG_DIR.exists():
         return []
-    imgs = sorted(COCO8_DIR.glob("*.jpg")) + sorted(COCO8_DIR.glob("*.jpeg")) + sorted(COCO8_DIR.glob("*.png"))
+    imgs = sorted(COCO_VAL_IMG_DIR.glob("*.jpg"))[:limit]
     return [cv2.imread(str(p)) for p in imgs if cv2.imread(str(p)) is not None]
 
 
@@ -85,7 +86,7 @@ def validate_one(model_stem, onnx_path, rknn_path, pp_path):
     input_size = getattr(pp_mod, "INPUT_SIZE", 640)
     postprocess_fn = pp_mod.postprocess
 
-    images = load_coco8_images()
+    images = load_val_images()
     if not images:
         images = [cv2.imread("/app/converter/model/test.jpg") or cv2.imread("/app/converter/model/person_test.jpg")]
     images = [im for im in images if im is not None]

@@ -139,7 +139,7 @@ def postprocess(outputs, scale, pad, orig_shape):
     orig_h, orig_w = orig_shape
     all_boxes, all_scores, all_cls, all_kpts = [], [], [], []
 
-    for idx in range(3):
+    for idx in range(len(STRIDES)):
         box_dist = outputs[idx * 3]
         cls_scores = outputs[idx * 3 + 1]
         kpt_raw = outputs[idx * 3 + 2]

@@ -1,4 +1,4 @@
-"""DetectorFrame data class — the standard container for detection results."""
+"""DetectorFrame — стандартный контейнер результатов детекции."""
 
 from __future__ import annotations
 
@@ -17,7 +17,7 @@ if TYPE_CHECKING:
 
 @dataclass
 class DetectorFrame:
-    """Unified result of one detection cycle: image, objects, and timing."""
+    """Единый результат одного цикла детекции: изображение, объекты и тайминги."""
 
     frame_id: int
     image: np.ndarray | None = None
@@ -32,7 +32,7 @@ class DetectorFrame:
 
     @property
     def elapsed_ms(self) -> float:
-        """Milliseconds since processing started."""
+        """Миллисекунды с момента начала обработки."""
         return (
             (time.monotonic() - self.process_start_ts) * 1000
             if self.process_start_ts
@@ -44,20 +44,20 @@ def objects_to_api(
     objects: list[dict],
     mask_format: str = 'contour',
 ) -> list[dict]:
-    """Convert internal objects to JSON-safe API objects.
+    """Преобразование внутренних объектов в JSON-безопасные API объекты.
 
-    Handles:
-      - ndarray masks → contour / base64 (segmentation models)
-      - OBB (angle) → 4-point polygon polygon
-      - plain detections → pass through
+    Обрабатывает:
+      - ndarray маски → контур / base64 (модели сегментации)
+      - OBB (angle) → 4-точечный полигон
+      - обычные детекции → без изменений
 
-    Args:
-        objects: list of detection dicts as returned by postprocess
-        mask_format: 'none' to strip masks, 'contour' for polygon outlines,
-                     'base64' for PNG-encoded masks
+    Аргументы:
+        objects: список словарей детекций из постпроцесса
+        mask_format: 'none' для удаления масок, 'contour' для полигонов,
+                     'base64' для PNG-кодированных масок
 
-    Returns:
-        list of dicts safe for json.dumps
+    Возвращает:
+        список словарей, безопасных для json.dumps
     """
     result: list[dict] = []
     for obj in objects:
@@ -87,7 +87,7 @@ def _mask_to_contour(
     mask: np.ndarray,
     bbox: list[int] | None = None,
 ) -> list[float] | None:
-    """Extract the largest external contour from a binary mask as flat [x1,y1,x2,y2,...]."""
+    """Извлечь наибольший внешний контур из бинарной маски как плоский [x1,y1,x2,y2,...]."""
     if mask.size <= 1:
         return None
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -106,7 +106,7 @@ def _obb_to_polygon(
     bbox: list[int] | list[float],
     angle: float,
 ) -> list[float] | None:
-    """Convert OBB (cx, cy, w, h, angle) to a 4-point polygon as flat [x1,y1,x2,y2,...]."""
+    """Преобразовать OBB (cx, cy, w, h, angle) в 4-точечный полигон как [x1,y1,x2,y2,...]."""
     if len(bbox) < 4:
         return None
     cx, cy, w, h = float(bbox[0]), float(bbox[1]), float(bbox[2]), float(bbox[3])
@@ -125,7 +125,7 @@ def _obb_to_polygon(
 
 
 def _mask_to_png_base64(mask: np.ndarray) -> str | None:
-    """Encode a binary mask as PNG and return a base64 data URL."""
+    """Кодировать бинарную маску как PNG и вернуть base64 data URL."""
     if mask.size <= 1:
         return None
     ok, buf = cv2.imencode('.png', mask)

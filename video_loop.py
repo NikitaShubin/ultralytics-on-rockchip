@@ -1,4 +1,4 @@
-"""Async video capture + detection loop with consumer notification."""
+"""Async цикл захвата + детекции с уведомлением потребителей."""
 
 from __future__ import annotations
 
@@ -17,7 +17,7 @@ from camera_source import CameraManager
 from detector_frame import DetectorFrame
 
 if TYPE_CHECKING:
-    from config import WebcamConfig
+    from config import Config
     from pipeline import Pipeline
 
 log = logging.getLogger(__name__)
@@ -25,10 +25,10 @@ log = logging.getLogger(__name__)
 
 @dataclass
 class VideoLoop:
-    """Async loop: capture → detect → notify all registered consumers."""
+    """Async цикл: захват → детекция → уведомление всех потребителей."""
 
-    pipeline: Pipeline  # noqa: F821
-    config: WebcamConfig  # noqa: F821
+    pipeline: Pipeline
+    config: Config
     consumers: list[Callable[[DetectorFrame], None]] = field(default_factory=list)
     _cam: CameraManager | None = None
     _running: bool = False
@@ -37,11 +37,11 @@ class VideoLoop:
     _fps: float = 0.0
 
     def register_consumer(self, cb: Callable[[DetectorFrame], None]) -> None:
-        """Register a callback to receive every processed frame."""
+        """Регистрация callback для получения каждого обработанного кадра."""
         self.consumers.append(cb)
 
     async def run(self) -> None:
-        """Main loop: open camera, capture, detect, notify."""
+        """Главный цикл: открыть камеру, захватить, обработать, уведомить."""
         self._cam = CameraManager(
             cam_mode=self.config.cam_mode.value,
             width=self.config.cam_width,
@@ -51,13 +51,14 @@ class VideoLoop:
         self._running = True
         while self._running:
             if not self._cam.open():
-                log.warning('no camera source available, retrying...')
+                log.warning('источник изображения недоступен, повторная попытка...')
                 await asyncio.sleep(1.0)
                 continue
             await self._capture_loop()
         self._cleanup()
 
     async def _capture_loop(self) -> None:
+        """Цикл захвата и обработки кадров."""
         if self._cam is None:
             return
         while self._running:
@@ -94,7 +95,7 @@ class VideoLoop:
             await asyncio.sleep(0)
 
     def _update_fps(self) -> None:
-        """Update rolling FPS estimate (2-second window)."""
+        """Обновление скользящего FPS (окно 2 секунды)."""
         now = time.monotonic()
         self._fps_counter.append(now)
         cutoff = now - 2.0
@@ -102,9 +103,10 @@ class VideoLoop:
         self._fps = len(self._fps_counter) / 2.0 if len(self._fps_counter) > 1 else 0.0
 
     def stop(self) -> None:
-        """Signal the loop to stop."""
+        """Сигнал на остановку цикла."""
         self._running = False
 
     def _cleanup(self) -> None:
+        """Очистка ресурсов (закрытие камеры)."""
         if self._cam is not None:
             self._cam.close()

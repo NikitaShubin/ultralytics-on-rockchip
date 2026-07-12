@@ -11,7 +11,7 @@ IOU_THRESH = {{IOU_THRESH}}
 MIN_WH = {{MIN_WH}}
 NUM_CLASSES = {{NUM_CLASSES}}
 COCO_CLASSES = {{COCO_CLASSES}}
-{{NO_DFL}}
+
 def dfl_nodfl(position):
     return position
 
@@ -102,7 +102,7 @@ def postprocess(outputs, scale, pad, orig_shape):
     orig_h, orig_w = orig_shape
     all_boxes, all_scores, all_cls = [], [], []
 
-    for idx in range(3):
+    for idx in range(len(STRIDES)):
         box_dist = outputs[idx * 3]
         cls_scores = outputs[idx * 3 + 1]
         stride = STRIDES[idx]

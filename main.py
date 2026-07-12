@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Entry point for webcam detection server."""
+"""Точка входа: перцепт — сервер обнаружения объектов на NPU."""
 
 from __future__ import annotations
 
@@ -16,14 +16,14 @@ if TYPE_CHECKING:
     from flask import Flask
 
 from app import create_app
-from config import WebcamConfig, WebMode
+from config import Config, WebMode
 from pipeline import Pipeline
 from video_loop import VideoLoop
 from websocket_server import WebSocketServer
 
 
 def setup_logging(level: str = 'INFO') -> None:
-    """Configure logging to stdout."""
+    """Настройка логирования в stdout."""
     logging.basicConfig(
         level=getattr(logging, level.upper(), logging.INFO),
         format='%(asctime)s [%(levelname)s] %(name)s: %(message)s',
@@ -34,20 +34,20 @@ def setup_logging(level: str = 'INFO') -> None:
 
 
 def _run_http(app: Flask, host: str, port: int) -> None:
-    """Run Flask/Waitress HTTP server (blocking, daemon thread)."""
+    """Запуск Flask/Waitress HTTP сервера (блокирующий, daemon thread)."""
     serve(app, host=host, port=port)
 
 
 async def amain() -> None:
-    """Async entry point: video loop + optional WS + HTTP."""
-    config = WebcamConfig.from_cli()
+    """Async точка входа: video loop + optional WS + HTTP."""
+    config = Config.from_cli()
     setup_logging(config.log_level)
     log = logging.getLogger('main')
 
     pipeline = Pipeline(
         model_dir=config.model_dir,
         model_name=config.model,
-        backend=config.backend,
+        backend=config.backend.value,
     )
 
     video_loop = VideoLoop(pipeline=pipeline, config=config)
@@ -70,12 +70,12 @@ async def amain() -> None:
             daemon=True,
         )
         http_thread.start()
-        log.info('http server started on %s:%s', config.host, config.port)
+        log.info('HTTP сервер запущен на %s:%s', config.host, config.port)
 
     stop_event = asyncio.Event()
 
     def _signal_handler() -> None:
-        log.info('shutting down...')
+        log.info('остановка...')
         video_loop.stop()
         stop_event.set()
 
@@ -95,11 +95,11 @@ async def amain() -> None:
         ws_task.cancel()
     if ws_server is not None:
         await ws_server.stop()
-    log.info('shutdown complete')
+    log.info('остановка завершена')
 
 
 def main() -> None:
-    """Run the application."""
+    """Запуск приложения."""
     asyncio.run(amain())
 
 

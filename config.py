@@ -1,4 +1,4 @@
-"""Configuration: CLI arguments + environment variables."""
+"""Конфигурация: CLI аргументы + переменные окружения."""
 
 from __future__ import annotations
 
@@ -7,12 +7,12 @@ import os
 import sys
 from enum import IntEnum
 
-if sys.version_info >= (3, 11):  # noqa: UP036
+if sys.version_info >= (3, 11):
     from enum import StrEnum
 else:
     from enum import Enum
 
-    class StrEnum(str, Enum):  # noqa: UP042
+    class StrEnum(str, Enum):
         pass
 
 
@@ -40,8 +40,8 @@ class MaskFormat(StrEnum):
     BASE64 = 'base64'
 
 
-class WebcamConfig:
-    """All configuration parameters for the application."""
+class Config:
+    """Все параметры конфигурации приложения."""
 
     def __init__(self) -> None:
         self.model: str = os.environ.get('MODEL', 'yolo11n')
@@ -61,10 +61,10 @@ class WebcamConfig:
         self.mask_format: MaskFormat = MaskFormat(os.environ.get('MASK_FORMAT', 'contour'))
 
     @classmethod
-    def from_cli(cls) -> WebcamConfig:
-        """Create config from CLI args, falling back to env defaults."""
+    def from_cli(cls) -> Config:
+        """Создание конфигурации из CLI аргументов."""
         cfg = cls()
-        parser = argparse.ArgumentParser(description='Webcam detection server')
+        parser = argparse.ArgumentParser(description='Перцепт — сервер обнаружения объектов')
         parser.add_argument('--model', default=cfg.model)
         parser.add_argument(
             '--backend',

@@ -167,9 +167,9 @@ def postprocess(outputs, scale, pad, orig_shape):
         feat = outputs[0]
         splits = _split_single_output(feat)
     else:
-        splits = [(outputs[i * 3], outputs[i * 3 + 1], outputs[i * 3 + 2]) for i in range(3)]
+        splits = [(outputs[i * 3], outputs[i * 3 + 1], outputs[i * 3 + 2]) for i in range(len(STRIDES))]
 
-    for idx in range(3):
+    for idx in range(len(STRIDES)):
         box_dist, cls_raw, angle_raw = splits[idx]
         stride = STRIDES[idx]
         gh = gw = GRID_SIZES[idx]

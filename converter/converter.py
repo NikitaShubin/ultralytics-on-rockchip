@@ -19,7 +19,10 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-COCO8_DIR = Path("/app/coco8")
+COCO_VAL_DIR = Path("/app/coco_val2017")
+COCO_VAL_IMG_DIR = COCO_VAL_DIR / "images" / "val2017"
+COCO_VAL_YAML = COCO_VAL_DIR / "coco_val.yaml"
+COCO_VAL_POSE_YAML = COCO_VAL_DIR / "coco_val_pose.yaml"
 MODEL_DIR = Path("/app/converter/model")
 WEIGHTS_DIR = Path("/app/converter/weights")
 
@@ -51,12 +54,119 @@ def log(msg):
 
 
 def apply_patches():
+    """Применить патчи RKNN к головам ultralytics."""
     from patches import rknn_patch
     rknn_patch.apply()
-    log("RKNN patches applied to ultralytics heads")
+    log("Патчи RKNN применены к головам ultralytics")
+
+
+ASSETS_URL = "https://github.com/ultralytics/assets/releases/download/v8.4.0"
+
+
+def _clean_pt_cache(name):
+    """Очистить кеш .pt файлов ultralytics."""
+    from ultralytics.utils import USER_CONFIG_DIR
+    cache_dirs = [
+        USER_CONFIG_DIR.parent / "cache" / "ultralytics" / "models",
+        Path("/root/.cache/ultralytics/models"),
+        Path.home() / ".cache" / "ultralytics" / "models",
+    ]
+    for d in cache_dirs:
+        for f in d.glob(f"{name}*"):
+            log(f"[ОЧИСТКА] удалён кешированный файл {f}")
+            f.unlink(missing_ok=True)
+
+
+def _ensure_coco_val():
+    """Проверить наличие COCO val 2017 (зашит в Docker-образ)."""
+    if not COCO_VAL_IMG_DIR.exists() or not list(COCO_VAL_IMG_DIR.glob("*.jpg")):
+        raise RuntimeError(
+            f"COCO val 2017 не найдена в {COCO_VAL_IMG_DIR}. "
+            f"Убедитесь, что Docker-образ содержит набор данных."
+        )
+    n = len(list(COCO_VAL_IMG_DIR.glob("*.jpg")))
+    log(f"COCO val 2017 готова: {n} изображений")
+    return COCO_VAL_DIR
+
+
+def _make_calib_yaml(task: str = "detect") -> str:
+    """Генерирует калибровочный YAML на лету из полного val2017.
+
+    Все изображения COCO val2017 (5000 шт.) используются и для калибровки,
+    и для валидации — никаких отдельных папок.
+    """
+    n = len(list(COCO_VAL_IMG_DIR.glob("*.jpg")))
+    log(f"Калибровочный набор данных: {n} изображений из {COCO_VAL_IMG_DIR}")
+
+    lines = [
+        f"path: {COCO_VAL_DIR}",
+        f"train: images/val2017",
+        f"val: images/val2017",
+    ]
+
+    if task == "pose":
+        lines.extend([
+            "kpt_shape: [17, 3]",
+            "flip_idx: [0, 2, 1, 4, 3, 6, 5, 8, 7, 10, 9, 12, 11, 14, 13, 16, 15]",
+            "annotations:",
+            "  train: annotations/person_keypoints_val2017.json",
+            "  val: annotations/person_keypoints_val2017.json",
+            "names:",
+            "  0: person",
+        ])
+    elif task in ("segment", "semantic"):
+        lines.extend([
+            "nc: 80",
+            "names:",
+        ])
+        for i, name in enumerate(COCO_CLASSES):
+            lines.append(f"  {i}: {name}")
+        lines.extend([
+            "annotations:",
+            "  train: annotations/instances_val2017.json",
+            "  val: annotations/instances_val2017.json",
+        ])
+    else:
+        lines.extend([
+            "nc: 80",
+            "names:",
+        ])
+        for i, name in enumerate(COCO_CLASSES):
+            lines.append(f"  {i}: {name}")
+        lines.extend([
+            "annotations:",
+            "  train: annotations/instances_val2017.json",
+            "  val: annotations/instances_val2017.json",
+        ])
+
+    calib_yaml = Path("/tmp/calib.yaml")
+    calib_yaml.write_text("\n".join(lines) + "\n")
+    log(f"Сгенерирован калибровочный YAML: {calib_yaml} (задача={task}, {n} изображений)")
+    return str(calib_yaml)
+
+
+DOWNLOAD_TIMEOUT = 120
+
+
+def _download(url, dst):
+    """Скачать файл по URL с повторными попытками."""
+    import urllib.request
+    log(f"[ЗАГРУЗКА] {url} -> {dst}")
+    for attempt in range(3):
+        try:
+            resp = urllib.request.urlopen(url, timeout=DOWNLOAD_TIMEOUT)
+            with open(dst, "wb") as f:
+                f.write(resp.read())
+            return True
+        except Exception as e:
+            log(f"[ЗАГРУЗКА] попытка {attempt+1}/3 не удалась: {e}")
+            if dst and Path(dst).exists():
+                Path(dst).unlink(missing_ok=True)
+    return False
 
 
 def resolve_pt(name):
+    """Найти или скачать .pt файл модели."""
     if name.endswith(".pt"):
         p = Path(name)
         if p.exists():
@@ -68,27 +178,53 @@ def resolve_pt(name):
         p = d / f"{name}.pt"
         if p.exists():
             return str(p)
+    url = f"{ASSETS_URL}/{name}.pt"
+    dst = Path(f"{name}.pt")
+    _clean_pt_cache(name)
+    log(f"[PT] загрузка {name} из {url}")
+    if _download(url, str(dst)):
+        return str(dst)
     return name
 
 
-def export_and_compile(pt_path, info=None):
-    """Export .pt → ONNX (RK-opt) → RKNN, returns (onnx_path, rknn_path)."""
+def export_and_compile(pt_path, info=None, quantize="none"):
+    """Экспорт .pt → ONNX (RK-opt) → RKNN, возвращает (onnx_path, rknn_path).
+
+    Аргументы:
+        pt_path: путь к весам .pt.
+        info: опциональный dict из _detect_model_info().
+        quantize: "none" (по умолчанию) или "int8" — включить квантизацию INT8
+                  с калибровкой на COCO val 2017.
+    """
     apply_patches()
     from ultralytics import YOLO
     model = YOLO(pt_path)
 
-    # Set custom RKNN mode flag before exporter runs
+    # Установить флаг RKNN перед запуском экспортера
     for m in model.model.modules():
         m._rknn_mode = True
 
-    # RT-DETR uses deformable attention which requires ONNX opset >= 16
+    # RT-DETR использует deformable attention, требующий ONNX opset >= 16
     is_rtdetr = info and info.get("is_rtdetr", False)
     opset = 16 if is_rtdetr else 12
-    log(f"Using ONNX opset {opset} for export")
-    rknn_dir = model.export(format="rknn", opset=opset)
-    log(f"RKNN model directory: {rknn_dir}")
+    log(f"Используется ONNX opset {opset} для экспорта")
 
-    # Find the ONNX file produced during export
+    export_kwargs = {"format": "rknn", "opset": opset}
+    if quantize == "int8":
+        _ensure_coco_val()
+        task = info.get("task", "detect") if info else "detect"
+        data_yaml = _make_calib_yaml(task)
+        export_kwargs["data"] = data_yaml
+        export_kwargs["quantize"] = 8
+        log(f"Квантизация INT8 включена, калибровка: COCO val 2017 (все изображения, задача={task})")
+
+    t0 = time.time()
+    log(f"Запуск model.export() ...")
+    rknn_dir = model.export(**export_kwargs)
+    log(f"model.export() завершён за {time.time() - t0:.0f}с")
+    log(f"Директория RKNN модели: {rknn_dir}")
+
+    # Найти ONNX файл, созданный при экспорте
     rknn_dir_path = Path(rknn_dir)
     model_stem = Path(pt_path).stem
     pt_dir = Path(pt_path).parent
@@ -105,17 +241,185 @@ def export_and_compile(pt_path, info=None):
         onnx_paths = list(Path(".").glob("*.onnx"))
         onnx_path = str(onnx_paths[-1]) if onnx_paths else None
 
-    # Find the RKNN file (prefer the latest .rknn)
+    # Найти RKNN файл (предпочитать самый свежий .rknn)
     rknn_files = sorted(rknn_dir_path.glob("*.rknn"), key=os.path.getmtime, reverse=True)
     rknn_path = str(rknn_files[0]) if rknn_files else rknn_dir
 
     if onnx_path:
         log(f"ONNX (RK-opt): {onnx_path}")
     log(f"RKNN: {rknn_path}")
+
+    # Логирование dataset.txt для проверки списка калибровочных изображений
+    if quantize == "int8":
+        _log_dataset_txt()
+
     return onnx_path, rknn_path
 
 
+def _log_dataset_txt():
+    """Вывести содержимое dataset.txt для проверки списка калибровочных изображений.
+
+    Файл dataset.txt генерируется ultralytics при экспорте RKNN с квантизацией.
+    Содержит пути к изображениям, используемым для калибровки.
+    """
+    dataset_candidates = [
+        Path("/tmp/dataset.txt"),
+        Path("dataset.txt"),
+        Path("calib_dataset.txt"),
+    ]
+
+    # Также поискать в рабочей директории
+    dataset_candidates.extend(Path(".").glob("*dataset*.txt"))
+    dataset_candidates.extend(Path("/tmp").glob("*dataset*.txt"))
+
+    found = False
+    for ds_path in dataset_candidates:
+        if ds_path.exists() and ds_path.stat().st_size > 0:
+            try:
+                lines = ds_path.read_text().strip().splitlines()
+                total = len(lines)
+                log(f"=== DATASET.TXT ({ds_path}): {total} изображений ===")
+                # Вывести первые 10 и последние 5 путей
+                show_lines = lines[:10]
+                if total > 15:
+                    show_lines.append(f"  ... ({total - 15} изображений пропущено) ...")
+                    show_lines.extend(lines[-5:])
+                elif total > 10:
+                    show_lines.extend(lines[10:])
+                for line in show_lines:
+                    log(f"  {line}")
+                log(f"=== КОНЕЦ DATASET.TXT ===")
+                found = True
+                break
+            except Exception as e:
+                log(f"Ошибка чтения {ds_path}: {e}")
+
+    if not found:
+        log("ВНИМАНИЕ: dataset.txt не найден! Файл может быть сгенерирован в нестандартном месте.")
+        log("Поиск всех файлов *dataset* в /tmp и текущей директории:")
+        import glob as glob_mod
+        for pattern in ["/tmp/*dataset*", "*dataset*"]:
+            for f in glob_mod.glob(pattern):
+                log(f"  найден: {f}")
+
+
+def _build_rknn(onnx_path, quantize, calib_dir=None):
+    """Собрать RKNN модель из ONNX файла напрямую через RKNN toolkit.
+
+    Аргументы:
+        onnx_path: путь к файлу ONNX модели.
+        quantize: если True, собрать с квантизацией INT8, калиброванной на calib_dir.
+        calib_dir: директория с калибровочными изображениями (обязательна при quantize=True).
+    Возвращает:
+        путь к собранному .rknn файлу.
+    """
+    from rknn.api import RKNN
+
+    stem = Path(onnx_path).stem
+    suffix = "_int8.rknn" if quantize else "_none.rknn"
+    rknn_path = f"{stem}{suffix}"
+
+    rknn = RKNN(verbose=False)
+    rknn.config(mean_values=[[0, 0, 0]], std_values=[[255, 255, 255]],
+                target_platform="rk3588")
+
+    ret = rknn.load_onnx(model=str(onnx_path))
+    if ret != 0:
+        raise RuntimeError(f"load_onnx не удался: {ret}")
+
+    if quantize:
+        log(f"Сборка RKNN (int8) с калибровкой из {calib_dir}")
+        calib_txt = "/tmp/calib.txt"
+        with open(calib_txt, "w") as f:
+            for img_path in sorted(Path(calib_dir).glob("*.jpg"))[:512]:
+                f.write(str(img_path) + "\n")
+        ret = rknn.build(do_quantization=True, dataset=calib_txt)
+    else:
+        log("Сборка RKNN (none, без квантизации)")
+        ret = rknn.build(do_quantization=False)
+
+    if ret != 0:
+        raise RuntimeError(f"rknn.build не удался: {ret}")
+
+    rknn.export_rknn(rknn_path)
+    rknn.release()
+    log(f"RKNN ({'int8' if quantize else 'none'}): {rknn_path}")
+    return rknn_path
+
+
+def export_and_compile_all(pt_path, info=None):
+    """Экспорт .pt → ONNX → RKNN (none + int8) варианты.
+
+    Возвращает (onnx_path, rknn_none_path, rknn_int8_path).
+    """
+    onnx_path = export_onnx_only(pt_path)
+    if not onnx_path:
+        raise RuntimeError("Экспорт ONNX не удался")
+
+    rknn_none = _build_rknn(onnx_path, quantize=False)
+    _ensure_coco_val()
+    rknn_int8 = _build_rknn(onnx_path, quantize=True, calib_dir=COCO_VAL_IMG_DIR)
+
+    return onnx_path, rknn_none, rknn_int8
+
+
+def eval_coco(model_path, task="detect", data_yaml=COCO_VAL_YAML):
+    """Запустить yolo val на COCO val 2017 и вернуть метрики mAP.
+
+    Возвращает dict с mAP@0.5, mAP@0.5:0.95, точностью, полнотой.
+    """
+    model_path = str(model_path)
+    data_yaml = str(data_yaml)
+    cmd = f"yolo val task={task} model={model_path} data={data_yaml}"
+    log(f"Запуск: {cmd}")
+    t0 = time.time()
+
+    proc = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=7200)
+    elapsed = time.time() - t0
+    log(f"yolo val завершён за {elapsed:.0f}с")
+
+    stdout = proc.stdout
+    stderr = proc.stderr
+    log(f"stdout ({len(stdout)} байт), stderr ({len(stderr)} байт)")
+
+    metrics = {"model": model_path, "task": task, "elapsed_s": round(elapsed, 1)}
+
+    # Разбор вывода yolo val для извлечения метрик
+    for line in stdout.splitlines():
+        line_s = line.strip()
+        # Общие метрики: "all  ...  P  R  mAP50  mAP50-95"
+        if line_s.startswith("all") and len(line_s.split()) >= 6:
+            parts = line_s.split()
+            try:
+                metrics["precision"] = float(parts[2]) if len(parts) > 2 else None
+                metrics["recall"] = float(parts[3]) if len(parts) > 3 else None
+                metrics["map50"] = float(parts[4]) if len(parts) > 4 else None
+                metrics["map50_95"] = float(parts[5]) if len(parts) > 5 else None
+            except (ValueError, IndexError):
+                pass
+        # Попытка разобрать JSON строку от ultralytics
+        if '"map50"' in line_s or '"metrics/mAP50(B)"' in line_s:
+            try:
+                data = json.loads(line_s)
+                if isinstance(data, dict):
+                    for k, v in data.items():
+                        if "map50" in k.lower():
+                            metrics["map50"] = v
+                        if "map50" in k.lower() and "95" in k.lower():
+                            metrics["map50_95"] = v
+                        if k == "precision" or "precision" in k.lower():
+                            metrics["precision"] = v
+                        if k == "recall" or "recall" in k.lower():
+                            metrics["recall"] = v
+            except (json.JSONDecodeError, TypeError):
+                pass
+
+    log(f"Метрики: {json.dumps(metrics)}")
+    return metrics
+
+
 def preprocess(frame, input_size=640):
+    """Предобработка кадра: ресайз, паддинг, нормализация."""
     h, w = frame.shape[:2]
     scale = min(input_size / w, input_size / h)
     new_w, new_h = int(w * scale), int(h * scale)
@@ -132,6 +436,7 @@ def preprocess(frame, input_size=640):
 
 
 def dfl(position):
+    """Distribution Focal Loss — декодирование распределения расстояний до границ бокса."""
     n, c, h, w = position.shape
     mc = c // BIN_COUNT
     y = position.reshape(n, BIN_COUNT, mc, h, w)
@@ -142,6 +447,7 @@ def dfl(position):
 
 
 def process_head(box_dist, cls_scores, stride, grid_h, grid_w):
+    """Обработать выход одного головного слоя: декодировать боксы и оценки классов."""
     col = np.arange(grid_w, dtype=np.float32).reshape(1, 1, 1, grid_w)
     row = np.arange(grid_h, dtype=np.float32).reshape(1, 1, grid_h, 1)
     grid_x = np.broadcast_to(col, (1, 1, grid_h, grid_w))
@@ -159,12 +465,18 @@ def process_head(box_dist, cls_scores, stride, grid_h, grid_w):
     return boxes, scores
 
 
-def postprocess(outputs, scale, pad, orig_wh):
+def postprocess(outputs, scale, pad, orig_wh, strides=None, grid_sizes=None):
+    """Постобработка выходов модели: NMS, декодирование координат."""
     orig_w, orig_h = orig_wh
-    strides = [8, 16, 32]
-    grid_sizes = [80, 40, 20]
+    if strides is None:
+        n_heads = len(outputs) // 3
+        strides = [8, 16, 32][-n_heads:] if n_heads <= 3 else [8, 16, 32]
+    if grid_sizes is None:
+        n_heads = len(strides)
+        input_size = 640
+        grid_sizes = [input_size // s for s in strides]
     all_boxes, all_scores, all_cls = [], [], []
-    for idx in range(3):
+    for idx in range(len(strides)):
         box_dist = outputs[idx * 3]
         cls_scores = outputs[idx * 3 + 1]
         stride = strides[idx]
@@ -203,6 +515,7 @@ def postprocess(outputs, scale, pad, orig_wh):
 
 
 def nms(boxes, scores, iou_thresh):
+    """Non-Maximum Suppression."""
     x1, y1, x2, y2 = boxes.T
     areas = (x2 - x1) * (y2 - y1)
     order = scores.argsort()[::-1]
@@ -221,6 +534,7 @@ def nms(boxes, scores, iou_thresh):
 
 
 def iou_matrix(boxes_a, boxes_b):
+    """Матрица IoU между двумя наборами боксов."""
     xa1, ya1, xa2, ya2 = boxes_a.T
     xb1, yb1, xb2, yb2 = boxes_b.T
     inter_x1 = np.maximum(xa1[:, None], xb1[None, :])
@@ -235,26 +549,25 @@ def iou_matrix(boxes_a, boxes_b):
 
 
 def run_onnx(sess, tensor):
+    """Запуск инференса ONNX модели."""
     input_name = sess.get_inputs()[0].name
     raw = sess.run(None, {input_name: tensor / 255.0})
     return raw
 
 
 def run_rknn(rknn, tensor):
+    """Запуск инференса RKNN модели."""
     nhwc = tensor.transpose(0, 2, 3, 1)
     return rknn.inference(inputs=[nhwc])
 
 
-def load_coco8_images():
+def load_val_images(limit: int = 16):
+    """Загрузить изображения из COCO val2017 для валидации."""
     images = []
-    # coco8.zip extracts to /app/coco8/coco8/
-    img_dir = COCO8_DIR / "coco8" / "images" / "train"
-    if not img_dir.exists():
-        img_dir = COCO8_DIR / "images" / "train"
-    if not img_dir.exists():
-        log(f"coco8 images not found at {img_dir}")
+    if not COCO_VAL_IMG_DIR.exists():
+        log(f"Изображения COCO val2017 не найдены в {COCO_VAL_IMG_DIR}")
         return images
-    for f in sorted(img_dir.glob("*.jpg"))[:10]:
+    for f in sorted(COCO_VAL_IMG_DIR.glob("*.jpg"))[:limit]:
         img = cv2.imread(str(f))
         if img is not None:
             images.append(img)
@@ -262,12 +575,13 @@ def load_coco8_images():
 
 
 def validate(onnx_path, rknn_path):
+    """Валидация ONNX vs RKNN: сравнение тензоров и IoU боксов."""
     import onnxruntime as rt
     from rknn.api import RKNN
 
     sess = rt.InferenceSession(onnx_path)
 
-    # Prefer loading pre-built RKNN; fall back to ONNX rebuild for simulation
+    # Предпочитать загрузку собранного RKNN; при ошибке — пересобрать из ONNX
     rknn = RKNN(verbose=False)
     if rknn_path and os.path.exists(rknn_path):
         rknn.load_rknn(rknn_path)
@@ -279,18 +593,18 @@ def validate(onnx_path, rknn_path):
     try:
         ret = rknn.init_runtime()
         if ret != 0:
-            log(f"Runtime init returned {ret} (expected in simulator for transformer models)")
+            log(f"Инициализация runtime вернула {ret} (ожидаемо в симуляторе для трансформерных моделей)")
             rknn.release()
-            return {"note": "validation skipped - runtime requires NPU hardware"}
+            return {"note": "валидация пропущена — runtime требует аппаратуру NPU"}
     except Exception as e:
-        log(f"Runtime init exception (expected in simulator for transformer models): {e}")
+        log(f"Ошибка инициализации runtime (ожидаемо в симуляторе для трансформерных моделей): {e}")
         rknn.release()
-        return {"note": "validation skipped - runtime requires NPU hardware"}
+        return {"note": "валидация пропущена — runtime требует аппаратуру NPU"}
 
-    images = load_coco8_images()
+    images = load_val_images()
     if not images:
-        log("No coco8 images found, skipping validation")
-        return {"error": "no images"}
+        log("Калибровочные изображения не найдены, валидация пропущена")
+        return {"error": "нет изображений"}
 
     max_diffs = []
     ious = []
@@ -314,7 +628,7 @@ def validate(onnx_path, rknn_path):
             max_diff = max(max_diff, float(diff))
         max_diffs.append(max_diff)
 
-        # Compare box-level results
+        # Сравнение результатов на уровне боксов
         boxes_onnx, scores_onnx, cls_onnx = postprocess(onnx_tensors, scale, pad, (w, h))
         boxes_rknn, scores_rknn, cls_rknn = postprocess(rknn_out, scale, pad, (w, h))
 
@@ -349,7 +663,7 @@ DEPLOY_DIR = Path("/app/converter/model")
 
 
 def _detect_model_info(pt_path):
-    """Load YOLO model and extract parameters for postprocess generation."""
+    """Загрузить модель YOLO и извлечь параметры для генерации постпроцессинга."""
     from ultralytics import YOLO
     from ultralytics.nn.modules.head import RTDETRDecoder
     model = YOLO(pt_path)
@@ -359,7 +673,7 @@ def _detect_model_info(pt_path):
     is_rtdetr = isinstance(head, RTDETRDecoder)
 
     if is_rtdetr:
-        # RT-DETR: single stride, no grid, no DFL
+        # RT-DETR: одна stride, нет сетки, нет DFL
         stride = model.model.stride
         strides = [int(s) for s in stride.tolist()] if hasattr(stride, "tolist") else [32]
     else:
@@ -380,6 +694,10 @@ def _detect_model_info(pt_path):
     nm = getattr(head, "nm", 0)
     reg_max = getattr(head, "reg_max", 16)
 
+    # Семантическая сегментация: task="segment", но нет прототипов масок (nm=0)
+    if task == "segment" and nm == 0 and not num_kpts:
+        task = "semantic"
+
     return {
         "task": task,
         "is_rtdetr": is_rtdetr,
@@ -395,7 +713,7 @@ def _detect_model_info(pt_path):
 
 
 def _generate_postprocess(info, dst_dir):
-    """Generate postprocess.py for the given model info."""
+    """Сгенерировать postprocess.py для заданной информации о модели."""
     task = info["task"]
     is_rtdetr = info.get("is_rtdetr", False)
 
@@ -406,7 +724,7 @@ def _generate_postprocess(info, dst_dir):
     template_path = TEMPLATES_DIR / template_name
 
     if not template_path.exists():
-        log(f"No template found for task '{template_name}' at {template_path}, using detect")
+        log(f"Шаблон для задачи '{template_name}' не найден в {template_path}, используется detect")
         template_path = TEMPLATES_DIR / "detect_postprocess.py"
 
     template = template_path.read_text()
@@ -442,113 +760,118 @@ def _generate_postprocess(info, dst_dir):
     dst.mkdir(parents=True, exist_ok=True)
     out_path = dst / "postprocess.py"
     out_path.write_text(template)
-    log(f"Generated {out_path}")
+    log(f"Сгенерирован {out_path}")
     return str(out_path)
 
 
 def _deploy(onnx_path, rknn_path, postprocess_path):
-    """Copy model + postprocess to DEPLOY_DIR and signal reload."""
+    """Скопировать модель + постпроцесс в DEPLOY_DIR и отправить сигнал перезагрузки."""
     DEPLOY_DIR.mkdir(parents=True, exist_ok=True)
 
     if rknn_path and os.path.exists(rknn_path):
         dst = DEPLOY_DIR / "model.rknn"
         shutil.copy2(rknn_path, str(dst))
-        log(f"Deployed {rknn_path} → {dst}")
+        log(f"Развёрнуто {rknn_path} → {dst}")
 
     if onnx_path and os.path.exists(onnx_path):
         dst = DEPLOY_DIR / "model.onnx"
         shutil.copy2(onnx_path, str(dst))
-        log(f"Deployed {onnx_path} → {dst}")
+        log(f"Развёрнуто {onnx_path} → {dst}")
 
     if postprocess_path and os.path.exists(postprocess_path):
         dst = DEPLOY_DIR / "postprocess.py"
         shutil.copy2(postprocess_path, str(dst))
-        log(f"Deployed {postprocess_path} → {dst}")
+        log(f"Развёрнуто {postprocess_path} → {dst}")
 
     _signal_reload()
 
 
 def _signal_reload():
-    """Send HTTP reload signal to webcam service."""
+    """Отправка HTTP-сигнала перезагрузки сервису percept."""
     import urllib.request
-    urls = ["http://localhost:5000/reload", "http://webcam:5000/reload"]
+    urls = ["http://localhost:5000/reload", "http://percept:5000/reload"]
     ok = False
     for url in urls:
         try:
             resp = urllib.request.urlopen(url, timeout=5)
-            log(f"Reload signal sent to {url}: {resp.status}")
+            log(f"Сигнал перезагрузки отправлен на {url}: {resp.status}")
             ok = True
             break
         except Exception:
             continue
     if not ok:
-        log("Reload signal failed (is webcam running?)")
-        log("Restart manually: docker compose restart webcam")
+        log("Не удалось отправить сигнал перезагрузки (percept запущен?)")
+        log("Перезапустите вручную: docker compose restart percept")
 
 
 def cmd_convert(args):
+    """Конвертация модели: .pt → ONNX → RKNN."""
     pt = resolve_pt(args.model)
-    log(f"Converting {pt}")
+    log(f"Конвертация {pt}")
 
-    log("Step 1: Detect model info")
+    log("Шаг 1: Определение информации о модели")
     info = _detect_model_info(pt)
-    log(f"  task={info['task']} classes={info['num_classes']} strides={info['strides']}")
+    log(f"  задача={info['task']} классы={info['num_classes']} stride={info['strides']}")
 
-    log("Step 2: Export ONNX + compile RKNN")
-    onnx_path, rknn_path = export_and_compile(pt, info)
+    log("Шаг 2: Экспорт ONNX + сборка RKNN")
+    quantize = getattr(args, "quantize", "none")
+    if quantize != "none":
+        log(f"Режим квантизации: {quantize}")
+    onnx_path, rknn_path = export_and_compile(pt, info, quantize=quantize)
 
     if args.test:
-        log("Step 3: Validate")
+        log("Шаг 3: Валидация")
         if info["task"] == "detect":
             if onnx_path and os.path.exists(onnx_path):
                 result = validate(onnx_path, rknn_path)
             else:
-                log("No ONNX found, attempting validation with RKNN only")
+                log("ONNX не найден, попытка валидации только по RKNN")
                 result = validate(None, rknn_path)
             print(json.dumps(result, indent=2))
-            status = "PASS" if result.get("pass") else "FAIL"
-            log(f"Validation: {status}")
+            status = "ПРОЙДЕНО" if result.get("pass") else "ПРОВАЛ"
+            log(f"Валидация: {status}")
             if result.get("pass") is False:
-                log("Validation failed, skipping deploy")
+                log("Валидация не пройдена, развёртывание отменено")
                 return result
         else:
-            log(f"Validation skipped for task '{info['task']}' (detect-only)")
-            result = {"note": f"validation not implemented for task '{info['task']}'"}
+            log(f"Валидация пропущена для задачи '{info['task']}' (только detect)")
+            result = {"note": f"валидация не реализована для задачи '{info['task']}'"}
     else:
-        result = {"note": "validation skipped (use --test to enable)"}
+        result = {"note": "валидация пропущена (включите флагом --test)"}
 
-    log("Step 4: Generate postprocess.py")
+    log("Шаг 4: Генерация postprocess.py")
     postprocess_path = _generate_postprocess(info, ".")
 
     stem = Path(args.model).stem.replace(".pt", "")
     if args.deploy:
-        log("Step 5: Deploy")
+        log("Шаг 5: Развёртывание")
         _deploy(onnx_path, rknn_path, postprocess_path)
     else:
-        # Copy results to model/ directory (versioned)
+        # Копировать результаты в директорию model/ (версионированные)
         for src_ext in [(onnx_path, ".onnx"), (rknn_path, ".rknn")]:
             src, ext = src_ext
             if src and os.path.exists(src):
                 dst = MODEL_DIR / f"{stem}_rkopt_o19{ext}"
                 os.makedirs(MODEL_DIR, exist_ok=True)
                 shutil.copy2(src, str(dst))
-                log(f"Copied to {dst}")
+                log(f"Скопировано в {dst}")
 
-    # Always copy versioned postprocess
+    # Всегда копировать версионированный постпроцесс
     if postprocess_path and os.path.exists(postprocess_path):
         dst = MODEL_DIR / f"{stem}_postprocess.py"
         os.makedirs(MODEL_DIR, exist_ok=True)
         shutil.copy2(postprocess_path, str(dst))
-        log(f"Copied postprocess to {dst}")
+        log(f"Постпроцесс скопирован в {dst}")
 
     return result
 
 
 def cmd_validate(args):
+    """Валидация существующего .rknn файла на COCO val2017."""
     rknn_path = args.model
     if not rknn_path.endswith(".rknn"):
         rknn_path = str(MODEL_DIR / f"{rknn_path}.rknn")
-    log(f"Validating {rknn_path}")
+    log(f"Валидация {rknn_path}")
 
     onnx_path = rknn_path.replace(".rknn", ".onnx")
     if not os.path.exists(onnx_path):
@@ -557,17 +880,18 @@ def cmd_validate(args):
             onnx_path = str(stems[0])
 
     if not os.path.exists(onnx_path):
-        log(f"No matching ONNX found for {rknn_path}, skipping validation")
-        return {"error": "no onnx"}
+        log(f"Соответствующий ONNX не найден для {rknn_path}, валидация пропущена")
+        return {"error": "нет onnx"}
 
     result = validate(onnx_path, rknn_path)
     print(json.dumps(result, indent=2))
-    status = "PASS" if result.get("pass") else "FAIL"
-    log(f"Validation: {status}")
+    status = "ПРОЙДЕНО" if result.get("pass") else "ПРОВАЛ"
+    log(f"Валидация: {status}")
     return result
 
 
 def load_model_list(path):
+    """Загрузить список моделей из файла."""
     if os.path.exists(path):
         names = [l.strip() for l in open(path) if l.strip() and not l.startswith("#")]
         return names
@@ -584,9 +908,10 @@ def load_model_list(path):
 
 
 def cmd_test_all_detect(args):
+    """Тестирование всех моделей детекции."""
     models = load_model_list(args.model_list)
     if not models:
-        log("No model list found, using default detection models")
+        log("Список моделей не найден, используются модели детекции по умолчанию")
         models = [
             "yolov8n", "yolov8s", "yolov8m", "yolov8l", "yolov8x",
             "yolov5nu", "yolov5su", "yolov5mu", "yolov5lu", "yolov5xu",
@@ -598,20 +923,20 @@ def cmd_test_all_detect(args):
     results = {}
     for name in models:
         log(f"{'='*60}")
-        log(f"Testing {name}...")
+        log(f"Тестирование {name}...")
         try:
             pt = resolve_pt(name)
             res = cmd_convert(argparse.Namespace(model=name, **vars(args)))
-            results[name] = {"status": "PASS" if res.get("pass") else "FAIL", **res}
+            results[name] = {"status": "ПРОЙДЕНО" if res.get("pass") else "ПРОВАЛ", **res}
         except Exception as e:
-            log(f"FAILED: {e}")
-            results[name] = {"status": "FAIL", "error": str(e)}
+            log(f"ОШИБКА: {e}")
+            results[name] = {"status": "ПРОВАЛ", "error": str(e)}
         print()
 
     print(f"\n{'='*60}")
-    print("SUMMARY")
+    print("ИТОГИ")
     print(f"{'='*60}")
-    print(f"{'Model':<20} {'Status':<8} {'max_diff':<10} {'iou_avg':<10}")
+    print(f"{'Модель':<20} {'Статус':<8} {'max_diff':<10} {'iou_avg':<10}")
     print("-" * 50)
     for name, res in results.items():
         md = res.get("max_diff_avg", "-")
@@ -622,7 +947,7 @@ def cmd_test_all_detect(args):
 
 
 def export_onnx_only(pt_path):
-    """Export .pt → ONNX (RK-opt) only, no RKNN compile. Returns onnx_path."""
+    """Экспорт .pt → ONNX (RK-opt) только, без сборки RKNN. Возвращает onnx_path."""
     apply_patches()
     from ultralytics import YOLO
     from ultralytics.nn.modules.head import RTDETRDecoder
@@ -647,20 +972,21 @@ def export_onnx_only(pt_path):
 
 
 def cmd_batch_onnx(args):
+    """Пакетный экспорт ONNX (RK-opt) для всех моделей из списка."""
     models = load_model_list(args.model_list)
     if not models:
-        log("No models to process")
+        log("Нет моделей для обработки")
         return
 
     results = {}
     for name in models:
         log(f"{'='*60}")
-        log(f"Testing {name}...")
+        log(f"Тестирование {name}...")
         pt = resolve_pt(name)
         try:
             onnx_path = export_onnx_only(pt)
             if not onnx_path:
-                raise RuntimeError("ONNX export produced no file")
+                raise RuntimeError("Экспорт ONNX не создал файл")
 
             result = validate(onnx_path, None)
 
@@ -668,22 +994,22 @@ def cmd_batch_onnx(args):
             dst = MODEL_DIR / f"{stem}_rkopt_o19.onnx"
             os.makedirs(MODEL_DIR, exist_ok=True)
             shutil.copy2(onnx_path, str(dst))
-            log(f"Copied to {dst}")
+            log(f"Скопировано в {dst}")
             os.remove(onnx_path)
 
-            results[name] = {"status": "PASS" if result.get("pass") else "FAIL", **result}
-            status = "PASS" if result.get("pass") else "FAIL"
+            results[name] = {"status": "ПРОЙДЕНО" if result.get("pass") else "ПРОВАЛ", **result}
+            status = "ПРОЙДЕНО" if result.get("pass") else "ПРОВАЛ"
             log(f"{name}: {status}")
         except Exception as e:
-            log(f"FAILED: {e}")
-            results[name] = {"status": "FAIL", "error": str(e)}
+            log(f"ОШИБКА: {e}")
+            results[name] = {"status": "ПРОВАЛ", "error": str(e)}
         print()
 
-    # Summary
+    # Итоги
     print(f"\n{'='*60}")
-    print("SUMMARY")
+    print("ИТОГИ")
     print(f"{'='*60}")
-    print(f"{'Model':<20} {'Status':<8} {'iou_avg':<10} {'max_diff':<10}")
+    print(f"{'Модель':<20} {'Статус':<8} {'iou_avg':<10} {'max_diff':<10}")
     print("-" * 50)
     for name, res in results.items():
         iou = res.get("iou_avg", "-")
@@ -693,17 +1019,20 @@ def cmd_batch_onnx(args):
 
 
 def main():
+    """Точка входа: парсинг аргументов и запуск команд."""
     parser = argparse.ArgumentParser(description="RKNN Model Converter & Validator")
     sub = parser.add_subparsers(dest="command")
 
     p_convert = sub.add_parser("convert", help="Convert .pt → ONNX (RK-opt) → RKNN → validate")
     p_convert.add_argument("model", help="Model name or path (e.g. yolov8m.pt)")
+    p_convert.add_argument("--quantize", choices=["none", "int8"], default="none",
+                           help="INT8 quantization mode (default: none, no quantization)")
     p_convert.add_argument("--test", action="store_true",
-                           help="Validate ONNX vs RKNN on coco8 before deploy")
+                           help="Validate ONNX vs RKNN before deploy")
     p_convert.add_argument("--deploy", action="store_true",
-                           help="Copy model.rknn + postprocess.py to model/ and reload webcam")
+                           help="Скопировать model.rknn + postprocess.py в model/ и перезагрузить percept")
 
-    p_validate = sub.add_parser("validate", help="Validate existing .rknn against coco8")
+    p_validate = sub.add_parser("validate", help="Validate existing .rknn against COCO val2017")
     p_validate.add_argument("model", help="Path or name of .rknn file")
 
     p_test = sub.add_parser("test-all-detect", help="Test all detection models")
@@ -714,6 +1043,19 @@ def main():
     p_batch_onnx.add_argument("--model-list", default="models_detect.txt",
                               help="Path to model list file")
 
+    p_convert_all = sub.add_parser("convert-all",
+                                   help="Export ONNX + both RKNN variants (none + int8)")
+    p_convert_all.add_argument("model", help="Model name or path (e.g. yolo11n.pt)")
+
+    p_eval = sub.add_parser("eval-coco",
+                            help="Run yolo val on COCO val 2017 and report mAP")
+    p_eval.add_argument("model", help="Path to .pt/.onnx/.rknn model")
+    p_eval.add_argument("--task", default="detect",
+                        choices=["detect", "segment", "pose", "obb", "classify"],
+                        help="Task type")
+    p_eval.add_argument("--data", default=str(COCO_VAL_YAML),
+                        help="Dataset YAML path")
+
     args = parser.parse_args()
     if args.command == "convert":
         cmd_convert(args)
@@ -723,8 +1065,64 @@ def main():
         cmd_test_all_detect(args)
     elif args.command == "batch-onnx":
         cmd_batch_onnx(args)
+    elif args.command == "convert-all":
+        cmd_convert_all(args)
+    elif args.command == "eval-coco":
+        cmd_eval_coco(args)
     else:
         parser.print_help()
+
+
+def cmd_convert_all(args):
+    """Экспорт ONNX + оба варианта RKNN (none + int8), копирование в model/."""
+    pt = resolve_pt(args.model)
+    log(f"Конвертация {pt} (все варианты)")
+    info = _detect_model_info(pt)
+    log(f"  задача={info['task']} классы={info['num_classes']} stride={info['strides']}")
+
+    onnx_path, rknn_none, rknn_int8 = export_and_compile_all(pt, info)
+
+    stem = Path(args.model).stem.replace(".pt", "")
+    os.makedirs(MODEL_DIR, exist_ok=True)
+
+    # Копировать ONNX
+    dst_onnx = MODEL_DIR / f"{stem}_rkopt_o19.onnx"
+    shutil.copy2(onnx_path, str(dst_onnx))
+    log(f"ONNX -> {dst_onnx}")
+
+    # Копировать RKNN none
+    dst_none = MODEL_DIR / f"{stem}_none.rknn"
+    shutil.copy2(rknn_none, str(dst_none))
+    log(f"RKNN none -> {dst_none}")
+
+    # Копировать RKNN int8
+    dst_int8 = MODEL_DIR / f"{stem}_int8.rknn"
+    shutil.copy2(rknn_int8, str(dst_int8))
+    log(f"RKNN int8 -> {dst_int8}")
+
+    # Копировать постпроцесс
+    postprocess_path = _generate_postprocess(info, ".")
+    if postprocess_path and os.path.exists(postprocess_path):
+        dst = MODEL_DIR / f"{stem}_postprocess.py"
+        shutil.copy2(postprocess_path, str(dst))
+        log(f"Постпроцесс -> {dst}")
+
+    log("Готово")
+    print(json.dumps({
+        "model": stem,
+        "task": info["task"],
+        "onnx": str(dst_onnx),
+        "rknn_none": str(dst_none),
+        "rknn_int8": str(dst_int8),
+        "postprocess": str(MODEL_DIR / f"{stem}_postprocess.py"),
+    }))
+
+
+def cmd_eval_coco(args):
+    """Запустить yolo val на COCO val 2017 и вывести метрики."""
+    model_path = resolve_pt(args.model) if args.model.endswith(".pt") else args.model
+    result = eval_coco(model_path, task=args.task, data_yaml=args.data)
+    print(json.dumps(result, indent=2))
 
 
 if __name__ == "__main__":

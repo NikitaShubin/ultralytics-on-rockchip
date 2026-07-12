@@ -1,4 +1,4 @@
-"""Async WebSocket server for streaming detections to clients."""
+"""Async WebSocket сервер для трансляции детекций клиентам."""
 
 from __future__ import annotations
 
@@ -20,7 +20,7 @@ log = logging.getLogger(__name__)
 
 
 class WebSocketServer:
-    """Broadcasts DetectorFrames to all connected WebSocket clients."""
+    """Трансляция DetectorFrames всем подключённым WebSocket клиентам."""
 
     def __init__(
         self,
@@ -37,13 +37,14 @@ class WebSocketServer:
         self._broadcast_lock = asyncio.Lock()
 
     def push_frame(self, frame: DetectorFrame) -> None:
-        """Called from video loop to broadcast a new frame to all clients."""
+        """Вызывается из video loop для трансляции нового кадра всем клиентам."""
         self._last_frame = frame
         if not self._clients:
             return
         asyncio.get_event_loop().create_task(self._broadcast(frame))
 
     async def _broadcast(self, frame: DetectorFrame) -> None:
+        """Отправка кадра всем подключённым клиентам."""
         async with self._broadcast_lock:
             if not self._clients:
                 return
@@ -70,6 +71,7 @@ class WebSocketServer:
         msg: str,
         frame: DetectorFrame,
     ) -> None:
+        """Отправка JPEG + JSON одному клиенту."""
         try:
             if frame.jpeg:
                 header = struct.pack('!I', frame.frame_id)
@@ -79,9 +81,9 @@ class WebSocketServer:
             self._clients.discard(ws)
 
     async def handle(self, ws: websockets.WebSocketServerProtocol) -> None:
-        """Handle a single WebSocket connection."""
+        """Обработка одного WebSocket подключения."""
         self._clients.add(ws)
-        log.info('ws client connected (%d total)', len(self._clients))
+        log.info('WS клиент подключён (всего %d)', len(self._clients))
         try:
             async for raw in ws:
                 try:
@@ -100,20 +102,20 @@ class WebSocketServer:
             pass
         finally:
             self._clients.discard(ws)
-            log.info('ws client disconnected (%d left)', len(self._clients))
+            log.info('WS клиент отключён (осталось %d)', len(self._clients))
 
     async def start(self) -> None:
-        """Start the WebSocket server."""
+        """Запуск WebSocket сервера."""
         self._server = await websockets.serve(
             self.handle,
             self.host,
             self.port,
         )
-        log.info('ws server started on %s:%s', self.host, self.port)
+        log.info('WS сервер запущен на %s:%s', self.host, self.port)
 
     async def stop(self) -> None:
-        """Stop the WebSocket server."""
+        """Остановка WebSocket сервера."""
         if self._server is not None:
             self._server.close()
             await self._server.wait_closed()
-            log.info('ws server stopped')
+            log.info('WS сервер остановлен')

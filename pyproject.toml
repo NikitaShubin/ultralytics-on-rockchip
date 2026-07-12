@@ -1,6 +1,6 @@
 [project]
-name = 'webcam'
-version = '0.2.0'
+name = 'percept'
+version = '0.3.0'
 
 [tool.ruff]
 line-length = 88

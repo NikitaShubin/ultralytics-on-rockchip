@@ -3,6 +3,7 @@ import torch.nn as nn
 
 
 def apply():
+    """Применить все патчи RKNN к головам ultralytics."""
     import ultralytics.nn.modules.head as H
 
     _patch_detect(H.Detect)
@@ -17,11 +18,11 @@ def apply():
 
 
 def _patch_rknn_config_fuse_bug():
-    """Workaround for rknn-toolkit2 MatMul fuse bug with GELU activations.
+    """Обход ошибки схождения MatMul в rknn-toolkit2 при GELU активациях.
 
-    Disables the fuse_mul_into_gemm rule which causes:
+    Отключает правило fuse_mul_into_gemm, которое вызывает:
         ValueError: operands could not be broadcast together
-    when the model contains GEMM followed by element-wise Mul (common in GELU).
+    когда модель содержит GEMM, за которым следует поэлементное Mul (типично для GELU).
     """
     try:
         from rknn.api import RKNN
@@ -40,18 +41,18 @@ def _patch_rknn_config_fuse_bug():
 
 
 def _patch_fold_constant():
-    """Workaround for rknn-toolkit2 fold_constant failure on transformer models.
+    """Обход ошибки fold_constant в rknn-toolkit2 для трансформерных моделей.
 
-    RT-DETR's deformable attention produces ONNX graphs with dynamic shapes that
-    cause rknn-toolkit2's GraphOptimizer.fold_constant to fail during onnxruntime
-    evaluation. Skipping this step allows the build to succeed (GridSample ops
-    fall back to CPU at runtime).
+    Deformable attention RT-DETR создаёт ONNX графы с динамическими формами,
+    которые вызывают сбой GraphOptimizer.fold_constant во время onnxruntime.
+    Пропуск этого шага позволяет сборке завершиться (операции GridSample
+    используют CPU в runtime).
     """
     try:
         from rknn.api.graph_optimizer import GraphOptimizer
 
         def _patched_fold_constant(self, *args, **kwargs):
-            print("[PATCH] SKIPPING fold_constant (transformer model)")
+            print("[PATCH] пропуск fold_constant (трансформерная модель)")
             return
 
         GraphOptimizer.fold_constant = _patched_fold_constant
@@ -60,6 +61,7 @@ def _patch_fold_constant():
 
 
 def _patch_detect(cls):
+    """Патч головы Detect для совместимости с RKNN."""
     original = cls.forward
 
     def patched(self, x):
@@ -71,6 +73,7 @@ def _patch_detect(cls):
 
 
 def _rknn_detect(self, x):
+    """RKNN совместимый forward для Detect."""
     nl = self.nl
     out = []
     for i in range(nl):
@@ -82,6 +85,7 @@ def _rknn_detect(self, x):
 
 
 def _patch_obb(cls):
+    """Патч головы OBB для совместимости с RKNN."""
     original = cls.forward
 
     def patched(self, x):
@@ -93,6 +97,7 @@ def _patch_obb(cls):
 
 
 def _rknn_obb(self, x):
+    """RKNN совместимый forward для OBB."""
     nl = self.nl
     out = []
     for i in range(nl):
@@ -104,6 +109,7 @@ def _rknn_obb(self, x):
 
 
 def _rknn_pose(self, x):
+    """RKNN совместимый forward для Pose."""
     nl = self.nl
     out = []
     has_kpts_head = hasattr(self, 'cv4_kpts') and self.cv4_kpts is not None
@@ -120,6 +126,7 @@ def _rknn_pose(self, x):
 
 
 def _patch_pose(cls):
+    """Патч головы Pose для совместимости с RKNN."""
     original = cls.forward
 
     def patched(self, x):
@@ -131,6 +138,7 @@ def _patch_pose(cls):
 
 
 def _patch_segment(cls):
+    """Патч головы Segment для совместимости с RKNN."""
     original = cls.forward
 
     def patched(self, x):
@@ -142,6 +150,7 @@ def _patch_segment(cls):
 
 
 def _rknn_segment(self, x):
+    """RKNN совместимый forward для Segment."""
     nl = self.nl
     out = []
     p = self.proto(x[0])
@@ -155,9 +164,10 @@ def _rknn_segment(self, x):
 
 
 def _rknn_segment26(self, x):
+    """RKNN совместимый forward для Segment26."""
     nl = self.nl
     out = []
-    p = self.proto(x)  # Proto26 expects the full list of backbone features
+    p = self.proto(x)  # Proto26 ожидает полный список признаков backbone
     for i in range(nl):
         box = self.cv2[i](x[i])
         cls = self.cv3[i](x[i]).sigmoid()
@@ -168,6 +178,7 @@ def _rknn_segment26(self, x):
 
 
 def _patch_segment26(cls):
+    """Патч головы Segment26 для совместимости с RKNN."""
     original = cls.forward
 
     def patched(self, x):
@@ -179,6 +190,7 @@ def _patch_segment26(cls):
 
 
 def _patch_pose26(cls):
+    """Патч головы Pose26 для совместимости с RKNN."""
     original = cls.forward
 
     def patched(self, x):
@@ -190,6 +202,7 @@ def _patch_pose26(cls):
 
 
 def _patch_obb26(cls):
+    """Патч головы OBB26 для совместимости с RKNN."""
     original = cls.forward
 
     def patched(self, x):

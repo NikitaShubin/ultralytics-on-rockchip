@@ -1,0 +1,30 @@
+.git
+__pycache__
+*.pyc
+*.pyo
+*.so
+*.egg-info/
+
+# Large generated files
+*.onnx
+*.rknn
+*.pt
+*_rknn_model*/
+model/
+weights/
+check0_*/
+check1_*/
+check2_*/
+core.*
+
+# Benchmark and test data
+../benchmark/
+../test/
+../datasets/
+
+# IDE and tooling
+.idea/
+.vscode/
+.ruff_cache/
+.mypy_cache/
+.pytest_cache/

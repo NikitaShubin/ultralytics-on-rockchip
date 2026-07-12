@@ -1,7 +1,7 @@
 services:
   converter:
     build: .
-    image: webcam-converter:latest
+    image: percept-converter:latest
     network_mode: host
     devices:
       - /dev/dri:/dev/dri
@@ -9,3 +9,4 @@ services:
       - ../model:/app/converter/model
       - ./weights:/app/converter/weights
       - .:/app/converter
+      - ../datasets/coco_val2017:/app/coco_val2017:ro

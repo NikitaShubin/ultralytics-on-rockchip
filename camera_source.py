@@ -1,4 +1,4 @@
-"""Camera source abstraction: USB, file, and auto-detection."""
+"""Абстракция источника изображения: USB, файл и авто-определение."""
 
 from __future__ import annotations
 
@@ -16,6 +16,7 @@ _NO_CAM_CACHE: dict[int, bytes] = {}
 
 
 def _make_no_cam_placeholder(w: int = 640, h: int = 480) -> bytes:
+    """Создать заглушку при отсутствии камеры."""
     key = (w << 16) | h
     if key not in _NO_CAM_CACHE:
         img = np.full((h, w, 3), (114, 114, 114), dtype=np.uint8)
@@ -34,6 +35,8 @@ def _make_no_cam_placeholder(w: int = 640, h: int = 480) -> bytes:
 
 
 class CameraSource(ABC):
+    """Абстрактный базовый класс источника изображения."""
+
     @abstractmethod
     def open(self) -> bool: ...
 
@@ -49,6 +52,8 @@ class CameraSource(ABC):
 
 
 class USBCamera(CameraSource):
+    """USB камера через OpenCV VideoCapture."""
+
     def __init__(self, width: int = 640, height: int = 480) -> None:
         self.width = width
         self.height = height
@@ -56,15 +61,17 @@ class USBCamera(CameraSource):
         self._device: str = ''
 
     def open(self) -> bool:
+        """Поиск и открытие доступной USB камеры."""
         for dev in sorted(Path('/dev').glob('video[0-9]*')):
             dev_str = str(dev)
             if self._try_device(dev_str):
                 self._device = dev_str
-                log.info('connected to %s', dev_str)
+                log.info('подключено к %s', dev_str)
                 return True
         return False
 
     def _try_device(self, dev: str) -> bool:
+        """Попытка открыть устройство и считать кадр."""
         try:
             cap = cv2.VideoCapture(dev)
             cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
@@ -77,10 +84,11 @@ class USBCamera(CameraSource):
                 return True
             cap.release()
         except OSError as e:
-            log.debug('failed to open %s: %s', dev, e)
+            log.debug('не удалось открыть %s: %s', dev, e)
         return False
 
     def read(self) -> np.ndarray | None:
+        """Считать один кадр."""
         if self._cap is None:
             return None
         if self._device and not Path(self._device).exists():
@@ -90,6 +98,7 @@ class USBCamera(CameraSource):
         return frame if ret else None
 
     def close(self) -> None:
+        """Закрыть камеру."""
         cap, self._cap = self._cap, None
         if cap is not None:
             cap.release()
@@ -101,18 +110,22 @@ class USBCamera(CameraSource):
 
 
 class FileSource(CameraSource):
+    """Источник изображения из видеофайла."""
+
     def __init__(self, path: str) -> None:
         self.path = path
         self._cap: cv2.VideoCapture | None = None
 
     def open(self) -> bool:
+        """Открыть видеофайл."""
         self._cap = cv2.VideoCapture(self.path)
         if not self._cap.isOpened():
             return False
-        log.info('opened file %s', self.path)
+        log.info('открыт файл %s', self.path)
         return True
 
     def read(self) -> np.ndarray | None:
+        """Считать кадр (с зацикливанием)."""
         if self._cap is None:
             return None
         ret, frame = self._cap.read()
@@ -122,6 +135,7 @@ class FileSource(CameraSource):
         return frame if ret else None
 
     def close(self) -> None:
+        """Закрыть файл."""
         cap, self._cap = self._cap, None
         if cap is not None:
             cap.release()
@@ -132,24 +146,24 @@ class FileSource(CameraSource):
 
 
 class GigECamera(CameraSource):
-    """Basler GigE Vision camera via pypylon."""
+    """Basler GigE Vision камера через pypylon."""
 
     def __init__(self, ip: str = '') -> None:
         self.ip = ip
-        self._camera = None  # pylon.InstantCamera
-        self._converter = None  # pylon.ImageFormatConverter
+        self._camera = None
+        self._converter = None
         self._device = ''
 
     def _set_auto(self, feature: str, value: str) -> None:
-        """Set a pylon feature safely if the camera supports it."""
+        """Безопасная установка параметра pylon, если камера поддерживает."""
         try:
             getattr(self._camera, feature).SetValue(value)
             log.debug('gige: %s = %s', feature, value)
         except Exception:
-            log.debug('gige: %s not available, skipped', feature)
+            log.debug('gige: %s недоступен, пропущено', feature)
 
     def _configure_auto(self) -> None:
-        """Enable auto-exposure, auto-gain, and auto-white-balance."""
+        """Включение авто-экспозиции, авто-усиления и авто-баланса белого."""
         if self._camera is None:
             return
         self._set_auto('ExposureAuto', 'Continuous')
@@ -157,19 +171,20 @@ class GigECamera(CameraSource):
         self._set_auto('BalanceWhiteAuto', 'Continuous')
         self._set_auto('AutoExposureTimeAbsLowerLimit', 24.0)
         self._set_auto('AutoTargetValue', 100)
-        log.info('gige: auto-exposure/gain/WB enabled (limit=24µs, target=100)')
+        log.info('gige: авто-экспозиция/усиление/ББ включены (limit=24µs, target=100)')
 
     def open(self) -> bool:
+        """Найти и открыть GigE камеру."""
         from pypylon import pylon
         try:
             tl = pylon.TlFactory.GetInstance()
             devices = tl.EnumerateDevices()
             if not devices:
-                log.warning('no GigE devices found')
+                log.warning('GigE устройства не найдены')
                 return False
             info = devices[0]
             self._device = f'{info.GetFriendlyName()} ({info.GetIpAddress()})'
-            log.info('found GigE camera: %s', self._device)
+            log.info('найдена GigE камера: %s', self._device)
             dev = tl.CreateDevice(info)
             self._camera = pylon.InstantCamera(dev)
             self._camera.Open()
@@ -177,14 +192,15 @@ class GigECamera(CameraSource):
             self._camera.StartGrabbing(pylon.GrabStrategy_LatestImageOnly)
             self._converter = pylon.ImageFormatConverter()
             self._converter.OutputPixelFormat = pylon.PixelType_BGR8packed
-            log.info('connected to GigE camera: %s', self._device)
+            log.info('подключено к GigE камере: %s', self._device)
             return True
         except Exception as e:
-            log.error('failed to open GigE camera: %s', e)
+            log.error('не удалось открыть GigE камеру: %s', e)
             self.close()
             return False
 
     def read(self) -> np.ndarray | None:
+        """Считать кадр с GigE камеры."""
         if self._camera is None or not self._camera.IsGrabbing():
             return None
         try:
@@ -198,11 +214,12 @@ class GigECamera(CameraSource):
                 return frame
             result.Release()
         except Exception as e:
-            log.error('GigE read error: %s', e)
+            log.error('ошибка чтения GigE: %s', e)
             self.close()
         return None
 
     def close(self) -> None:
+        """Закрыть GigE камеру."""
         if self._camera is not None:
             try:
                 if self._camera.IsGrabbing():
@@ -220,6 +237,8 @@ class GigECamera(CameraSource):
 
 
 class CameraManager:
+    """Менеджер камер: авто-определение и переподключение."""
+
     def __init__(
         self,
         cam_mode: str = 'auto',
@@ -237,6 +256,7 @@ class CameraManager:
         self._skip_gige = False
 
     def open(self) -> bool:
+        """Открыть источник изображения по выбранному режиму."""
         if self.cam_mode == 'file' and self.file_path:
             self._source = FileSource(self.file_path)
             if self._source.open():
@@ -267,6 +287,7 @@ class CameraManager:
         return False
 
     def read(self) -> np.ndarray | None:
+        """Считать кадр с повторным подключением при ошибках."""
         if self._source is None:
             self._fallback_count += 1
             if self._fallback_count >= self._max_fallback:
@@ -282,11 +303,13 @@ class CameraManager:
         return None
 
     def _reconnect(self) -> None:
+        """Переподключение к источнику изображения."""
         self.close()
         time.sleep(0.5)
         self.open()
 
     def close(self) -> None:
+        """Закрыть источник изображения."""
         if self._source is not None:
             self._source.close()
             self._source = None

@@ -31,3 +31,6 @@ model/
 # Test images (user data)
 test/*_pred.jpg
 test/*_preview.jpg
+
+# Datasets (large, downloaded on demand)
+datasets/coco_val2017/

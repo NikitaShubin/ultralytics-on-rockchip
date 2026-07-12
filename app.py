@@ -1,4 +1,4 @@
-"""Flask HTTP server for /frame, /objects, /reload, /test endpoints."""
+"""Flask HTTP сервер: /frame, /objects, /reload, /test эндпоинты."""
 
 from __future__ import annotations
 
@@ -15,7 +15,7 @@ from camera_source import _make_no_cam_placeholder
 from detector_frame import objects_to_api
 
 if TYPE_CHECKING:
-    from config import WebcamConfig
+    from config import Config
     from detector_frame import DetectorFrame
     from pipeline import Pipeline
     from video_loop import VideoLoop
@@ -41,7 +41,7 @@ def _is_image(name: str) -> bool:
 
 
 def _make_filename(stem: str, ext: str) -> str:
-    """Generate a unique filename in TEST_DIR."""
+    """Генерация уникального имени файла в TEST_DIR."""
     name = f'{stem}{ext}'
     if not (TEST_DIR / name).exists():
         return name
@@ -76,8 +76,8 @@ def _serve_image(path: Path, mimetype: str | None = None, quality: int = 90) -> 
     )
 
 
-def _register_test_routes(app: Flask, config: WebcamConfig, pipeline: Pipeline) -> None:
-    """Register test-mode routes (/test, /test/images, /test/images/<name>, /process)."""
+def _register_test_routes(app: Flask, config: Config, pipeline: Pipeline) -> None:
+    """Регистрация тестовых маршрутов (/test, /test/images, /process)."""
 
     @app.route('/test')
     def test_page() -> str:
@@ -154,13 +154,13 @@ def _register_test_routes(app: Flask, config: WebcamConfig, pipeline: Pipeline) 
         )
 
 
-def create_app(  # noqa: C901
-    config: WebcamConfig,
+def create_app(
+    config: Config,
     pipeline: Pipeline,
     loop: VideoLoop | None = None,
     ws_port: int = 5001,
 ) -> Flask:
-    """Create and configure the Flask application."""
+    """Создание и настройка Flask приложения."""
     app = Flask(__name__)
     _last_objects: list[dict] = []
     _last_jpeg: bytes | None = None
@@ -219,7 +219,7 @@ def create_app(  # noqa: C901
             model_name = request.args.get('model', '')
             backend_str = request.args.get('backend', '')
             backend = Backend(backend_str) if backend_str else None
-            pipeline.reload(model_name=model_name, backend=backend)
+            pipeline.reload(model_name=model_name, backend=backend.value if backend else None)
         except Exception as e:
             log.exception('reload failed')
             return f'FAIL: {e}', 500

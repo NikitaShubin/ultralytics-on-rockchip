@@ -10,6 +10,7 @@ COPY requirements.txt .
 RUN uv pip install --system --no-cache -r requirements.txt
 RUN uv pip install --system --no-cache rknn-toolkit-lite2
 
+COPY percept/ percept/
 COPY main.py app.py pipeline.py utils.py detector_frame.py config.py \
     camera_source.py video_loop.py websocket_server.py ./
 COPY templates/ templates/
