@@ -85,10 +85,12 @@ CAM_MODE=ip CAM_SOURCE=192.168.5.1 docker compose up -d
 ```bash
 curl "http://localhost:5000/reload?model=yolo26n-sem&backend=cpu"
 curl "http://localhost:5000/reload?model=yolo11n-pose"
+curl "http://localhost:5000/reload?model=yolo11n-pose&rknn_suffix=_int8"
 ```
 
 - `?model=` ищет `<name>.rknn`, `<name>.onnx`, `<name>_postprocess.py` в `model/`
 - `?backend=cpu` — форсировать ONNX CPU (если RKNN не нужен)
+- `?rknn_suffix=_int8` — выбрать INT8 RKNN модель (по умолчанию `_none` или без суффикса)
 - Без параметров — загружает `model.rknn` / `model.onnx`
 
 ## Конвертация новой модели
@@ -114,16 +116,59 @@ python setup_datasets.py
 
 Загружает COCO val2017 (5000 изображений + аннотации) для калибровки и валидации.
 
-## Бенчмарк
+## Бенчмарк (3 фазы)
 
-### FPS бенчмарк (все 111 моделей)
+Три независимые фазы, можно запускать по отдельности:
 
 ```bash
 cd benchmark
-python benchmark.py
+
+# Фаза 1: конвертация .pt → .onnx + _none.rknn + _int8.rknn (x86 ПК)
+python benchmark.py --phase convert
+
+# Фаза 2: валидация ONNX vs RKNN FP32+INT8 (x86 ПК, RKNN simulator)
+python benchmark.py --phase validate
+
+# Фаза 3: FPS + нагрузка CPU/NPU (ARM железо)
+python benchmark.py --phase bench
 ```
 
-Измеряет: CPU FPS, NPU FPS, pixel-diff, NPU load. Результаты: `benchmark/results/summary.tsv`
+### Мульти-фазы
+
+```bash
+# Конвертация + валидация на ПК
+python benchmark.py --phase convert validate
+
+# Всё сразу (convert → validate → bench)
+python benchmark.py --phase all
+
+# Только FPS, только INT8
+python benchmark.py --phase bench --quantize int8
+
+# Одна модель
+python benchmark.py --phase convert --model yolo26x-seg
+
+# С авто-очисткой temp_models
+python benchmark.py --phase convert validate --clean
+```
+
+### Квантизация
+
+| `--quantize` | Описание |
+|-------------|----------|
+| `none` | Только FP32 RKNN |
+| `int8` | Только INT8 RKNN |
+| `both` | Оба варианта (по умолчанию) |
+
+### Resume
+
+Результаты пишутся в `benchmark/results/results.json` по модели. При повторном запуске уже пройденные модели пропускаются.
+
+### Результаты
+
+- `benchmark/results/results.json` — полные результаты по каждой модели
+- `benchmark/results/summary.tsv` — TSV-сводка для просмотра
+- `benchmark/results/benchmark.log` — лог со всеми stdout/stderr
 
 ### COCO mAP валидация
 
@@ -200,11 +245,13 @@ stop.sh                      # Остановка сервера
 deploy.sh                    # Деплой модели (конвертация + тест + запуск)
 setup_datasets.py            # Загрузка датасетов (COCO val2017)
 benchmark/
-├── benchmark.py             # Оркестратор (конвертация + FPS)
-├── convert_bench.py         # Конвертация + pixel-diff валидация
-├── fps_bench.py             # FPS бенчмарк (CPU + NPU)
+├── benchmark.py             # Оркестратор: --phase convert|validate|bench|all
+├── convert_bench.py         # Фаза 1: экспорт + компиляция (4 файла на модель)
+├── validate_bench.py        # Фаза 2: ONNX vs RKNN FP32+INT8 валидация
+├── fps_bench.py             # Фаза 3: FPS + CPU/NPU нагрузка
 ├── models.py                # Списки моделей (FULL: 111, PILOT: 10)
-└── results/                 # Результаты (summary.tsv, eval logs)
+├── temp_models/             # Временные файлы конвертации (перенос на ПК)
+└── results/                 # Результаты (results.json, summary.tsv, benchmark.log)
 converter/
 ├── converter.py             # Конвертер YOLO → ONNX → RKNN
 ├── postprocess.py           # Постпроцесс (NMS, scale, decode)

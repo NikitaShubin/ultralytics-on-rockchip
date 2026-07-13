@@ -1,13 +1,20 @@
 #!/usr/bin/env python3
 """Оркестратор бенчмарка — запускается на HOST.
 
-Итерирует модели из models.py, вызывает конвертер для конвертации+валидации,
-затем percept для FPS-теста, собирает результаты, генерирует TSV-отчёт.
+Три фазы:
+  convert  — конвертация .pt → .onnx + _none.rknn + _int8.rknn (x86 ПК)
+  validate — валидация ONNX vs RKNN (x86 ПК)
+  bench    — FPS + нагрузка на CPU/NPU (ARM железо)
 
 Использование:
-    python3 benchmark.py                          # полный бенчмарк
-    python3 benchmark.py --model yolo26x-seg      # одна модель
-    python3 benchmark.py --model yolo26x-seg --quantize int8
+    python3 benchmark.py --phase convert                    # конвертация (ПК)
+    python3 benchmark.py --phase validate                   # валидация (ПК)
+    python3 benchmark.py --phase bench                      # FPS (ARM)
+    python3 benchmark.py --phase convert validate           # конвертация + валидация (ПК)
+    python3 benchmark.py --phase all                        # всё (convert → validate → bench)
+    python3 benchmark.py --phase all --clean                # всё с авто-очисткой temp_models
+    python3 benchmark.py --phase bench --quantize int8      # только INT8 FPS
+    python3 benchmark.py --phase bench --clean --model yolo11n
 """
 
 from __future__ import annotations
@@ -41,7 +48,6 @@ COCO_VAL_CONTAINER = '/app/coco_val2017'
 WARMUP_S = int(os.environ.get('BENCH_WARMUP', '10'))
 MEASURE_S = int(os.environ.get('BENCH_MEASURE', '20'))
 CONVERT_TIMEOUT = int(os.environ.get('BENCH_CONVERT_TIMEOUT', '7200'))
-PARALLEL = os.environ.get('BENCH_PARALLEL', '0') == '1'
 QUANTIZE = os.environ.get('BENCH_QUANTIZE', 'none')
 
 
@@ -60,16 +66,19 @@ def _container_data_path(data_dir: Path) -> str:
     return f'/app/benchmark/data/{data_dir.name}'
 
 
+# ---------------------------------------------------------------------------
+# Фаза: convert
+# ---------------------------------------------------------------------------
+
 def run_converter(model_name: str, task: str, output_dir: Path, data_dir: Path) -> dict | None:
     output_dir.mkdir(parents=True, exist_ok=True)
     data_path = _container_data_path(data_dir)
-    keep = os.environ.get('KEEP_MODELS', '0')
     cmd = [
         'docker', 'compose', '-f', str(CONVERTER_COMPOSE), 'run', '--rm',
         '-v', f'{BENCHMARK_DIR}:/app/benchmark',
         '-v', f'{COCO_VAL_DIR}:{COCO_VAL_CONTAINER}:ro',
         '-e', f'CONVERT_QUANTIZE={QUANTIZE}',
-        '-e', f'KEEP_MODELS={keep}',
+        '-e', 'KEEP_MODELS=1',
         '--entrypoint', 'python',
         'converter',
         '/app/benchmark/convert_bench.py',
@@ -81,7 +90,7 @@ def run_converter(model_name: str, task: str, output_dir: Path, data_dir: Path) 
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=CONVERT_TIMEOUT)
         elapsed = time.time() - t0
-        log(f'[ТАЙМИНГ] run_converter завершён за {elapsed:.0f}с')
+        log(f'[ТАЙМИНГ] convert завершён за {elapsed:.0f}с')
     except subprocess.TimeoutExpired:
         log(f'[ОШИБКА] конвертер превысил таймаут {CONVERT_TIMEOUT}с')
         return None
@@ -107,7 +116,59 @@ def run_converter(model_name: str, task: str, output_dir: Path, data_dir: Path) 
     return None
 
 
-def run_fps(model_name: str, task: str, temp_dir: Path, data_dir: Path) -> dict | None:
+# ---------------------------------------------------------------------------
+# Фаза: validate
+# ---------------------------------------------------------------------------
+
+def run_validate(model_name: str, task: str, temp_dir: Path, data_dir: Path) -> dict | None:
+    data_path = _container_data_path(data_dir)
+    cmd = [
+        'docker', 'compose', '-f', str(CONVERTER_COMPOSE), 'run', '--rm',
+        '-v', f'{BENCHMARK_DIR}:/app/benchmark',
+        '-v', f'{COCO_VAL_DIR}:{COCO_VAL_CONTAINER}:ro',
+        '--entrypoint', 'python',
+        'converter',
+        '/app/benchmark/validate_bench.py',
+        model_name, task, f'/app/benchmark/temp_models/{model_name}',
+        data_path,
+    ]
+    log(f'ЗАПУСК: {" ".join(cmd[:-6])} ...')
+    t0 = time.time()
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
+        elapsed = time.time() - t0
+        log(f'[ТАЙМИНГ] validate завершён за {elapsed:.0f}с')
+    except subprocess.TimeoutExpired:
+        log(f'[ОШИБКА] валидация превысила таймаут 1800с')
+        return None
+
+    if result.stdout:
+        for line in result.stdout.strip().split('\n'):
+            log(f'[validate stdout] {line}')
+    if result.stderr:
+        for line in result.stderr.strip().split('\n'):
+            log(f'[validate stderr] {line}')
+
+    if result.returncode != 0:
+        log(f'[ОШИБКА] валидация завершилась с кодом {result.returncode}')
+        return None
+
+    for line in reversed(result.stdout.strip().split('\n')):
+        line = line.strip()
+        if line.startswith('{'):
+            try:
+                return json.loads(line)
+            except json.JSONDecodeError:
+                continue
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Фаза: bench
+# ---------------------------------------------------------------------------
+
+def run_fps(model_name: str, task: str, temp_dir: Path, data_dir: Path,
+            quantize: str = 'both') -> dict | None:
     data_path = _container_data_path(data_dir)
     cmd = [
         'docker', 'compose', '-f', str(WEB_COMPOSE), 'run', '--rm',
@@ -125,6 +186,7 @@ def run_fps(model_name: str, task: str, temp_dir: Path, data_dir: Path) -> dict 
         '--data-dir', data_path,
         '--warmup', str(WARMUP_S),
         '--measure', str(MEASURE_S),
+        '--quantize', quantize,
     ]
     log(f'ЗАПУСК: {" ".join(cmd[:-8])} ...')
     try:
@@ -153,6 +215,10 @@ def run_fps(model_name: str, task: str, temp_dir: Path, data_dir: Path) -> dict 
                 continue
     return None
 
+
+# ---------------------------------------------------------------------------
+# Утилиты
+# ---------------------------------------------------------------------------
 
 def cleanup_temp(model_name: str) -> None:
     model_dir = f'/app/benchmark/temp_models/{model_name}'
@@ -192,9 +258,10 @@ def write_tsv(results: list[dict]) -> None:
         writer = csv.writer(f, delimiter='\t')
         writer.writerow([
             'Модель', 'Задача', 'Разрешение',
-            'CPU_fps', 'CPU_fps_std', 'NPU_fps', 'NPU_fps_std',
+            'CPU_fps', 'CPU_fps_std',
+            'NPU_FP32_fps', 'NPU_FP32_fps_std', 'NPU_FP32_load', 'CPU_load_fp32',
+            'NPU_INT8_fps', 'NPU_INT8_fps_std', 'NPU_INT8_load', 'CPU_load_int8',
             'max_diff_avg', 'max_diff_max',
-            'NPU_load_avg',
             'Статус',
         ])
         for r in results:
@@ -202,35 +269,58 @@ def write_tsv(results: list[dict]) -> None:
             task = r.get('task', '?')
             isz = r.get('input_size', 640)
             input_size = f'{isz}x{isz}' if isinstance(isz, int) else str(isz)
-            v = r.get('validation', {})
+
             cpu = (r.get('fps', {}) or {}).get('cpu', {}) or {}
-            npu = (r.get('fps', {}) or {}).get('npu', {}) or {}
-            cpu_fps = cpu.get('fps', -1)
-            cpu_fps_std = cpu.get('fps_std', 0)
-            npu_fps = npu.get('fps', -1)
-            npu_fps_std = npu.get('fps_std', 0)
-            md_avg = v.get('max_diff_avg', -1)
-            md_max = v.get('max_diff_max', -1)
-            npu_load = (r.get('fps', {}) or {}).get('npu', {}) or {}
-            npu_load_val = npu_load.get('npu_load_avg', '')
-            status = r.get('status', '?')
-            if cpu_fps == -1 and npu_fps == -1 and 'error' in r:
-                status = 'ПРОВАЛ:' + r['error'][:60]
-            writer.writerow([model, task, input_size, cpu_fps, cpu_fps_std, npu_fps, npu_fps_std, md_avg, md_max, npu_load_val, status])
+            npu_fp32 = (r.get('fps', {}) or {}).get('npu_none', {}) or {}
+            npu_int8 = (r.get('fps', {}) or {}).get('npu_int8', {}) or {}
+
+            v = r.get('validation', {})
+            v_fp32 = v.get('fp32', {}) or {}
+            v_int8 = v.get('int8', {}) or {}
+            max_diff = v_fp32.get('max_diff_avg', v_int8.get('max_diff_avg', -1))
+            max_diff_max = v_fp32.get('max_diff_max', v_int8.get('max_diff_max', -1))
+
+            writer.writerow([
+                model, task, input_size,
+                cpu.get('fps', -1), cpu.get('fps_std', 0),
+                npu_fp32.get('fps', -1), npu_fp32.get('fps_std', 0),
+                npu_fp32.get('npu_load_avg', ''), npu_fp32.get('cpu_load_avg', ''),
+                npu_int8.get('fps', -1), npu_int8.get('fps_std', 0),
+                npu_int8.get('npu_load_avg', ''), npu_int8.get('cpu_load_avg', ''),
+                max_diff, max_diff_max,
+                r.get('status', '?'),
+            ])
     log(f'[ГОТОВО] TSV-сводка записана в {SUMMARY_TSV}')
+
+
+# ---------------------------------------------------------------------------
+# Основной цикл
+# ---------------------------------------------------------------------------
+
+def phase_is(phases: list[str], name: str) -> bool:
+    """Проверить, входит ли фаза в список запрошенных."""
+    return 'all' in phases or name in phases
 
 
 def main() -> None:
     import argparse
     parser = argparse.ArgumentParser(description="Оркестратор YOLO бенчмарка")
-    parser.add_argument("--quantize", choices=["none", "int8"], default=None,
-                        help="Режим INT8 квантизации для конвертера")
+    parser.add_argument("--phase", nargs='+', default=['convert', 'validate'],
+                        choices=['convert', 'validate', 'bench', 'all'],
+                        help="Фазы бенчмарка (можно перечислить несколько)")
+    parser.add_argument("--quantize", choices=["none", "int8", "both"], default="both",
+                        help="Какие варианты RKNN тестировать (по умолчанию: оба)")
     parser.add_argument("--model", default=None,
-                        help="Запуск бенчмарка для одной модели (напр. yolo26x-seg)")
+                        help="Запуск для одной модели (напр. yolo26x-seg)")
+    parser.add_argument("--clean", action="store_true",
+                        help="Удалить temp_models после завершения")
     cli_args, _ = parser.parse_known_args()
-    if cli_args.quantize is not None:
-        global QUANTIZE
-        QUANTIZE = cli_args.quantize
+
+    global QUANTIZE
+    QUANTIZE = cli_args.quantize
+
+    phases = cli_args.phase
+    log(f'Фазы: {phases}, квантизация: {QUANTIZE}, clean: {cli_args.clean}')
 
     # Фильтрация моделей
     models = MODELS
@@ -242,108 +332,144 @@ def main() -> None:
 
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     log(f'Бенчмарк начат: {datetime.now().isoformat()}')
-    log(f'Warmup={WARMUP_S}с, Measure={MEASURE_S}с, Моделей={len(models)}')
+    log(f'Mоделей={len(models)}, Warmup={WARMUP_S}с, Measure={MEASURE_S}с')
 
     existing = load_results()
-    passed = {r['model'] for r in existing if r.get('status', '').startswith('ПРОЙДЕНО')}
 
     for i, model in enumerate(models):
         log(f'\n{"="*60}')
         log(f'[{i+1}/{len(models)}] {model.name} ({model.task})')
 
-        if model.name in passed:
-            log(f'[ПРОПУСК] уже пройдена, удалите {RESULTS_FILE} для перезапуска')
-            continue
-
-        if model.name in {r['model'] for r in existing}:
-            log(f'[ПОВТОР] предыдущий результат — ПРОВАЛ/прерывание')
-
-        model_temp_dir = TEMP_DIR / model.name
         if model.dataset == 'coco_val2017':
             model_data_dir = COCO_VAL_DIR
         else:
             model_data_dir = DATA_DIR / model.dataset
 
-        conv_result = run_converter(model.name, model.task, model_temp_dir, model_data_dir)
-        if conv_result is None:
-            log(f'[ПРОВАЛ] конвертация не удалась для {model.name}')
-            result_entry = {
-                'model': model.name,
-                'task': model.task,
-                'status': 'ПРОВАЛ',
-                'error': 'конвертация не удалась',
-                'validation': {},
-                'fps': {},
-                'input_size': model.input_size,
-            }
-            upsert_result(existing, result_entry)
+        model_temp_dir = TEMP_DIR / model.name
+
+        # --- Фаза: convert ---
+        if phase_is(phases, 'convert'):
+            # Resume: пропускаем если уже сконвертировано (есть _none.rknn)
+            if (model_temp_dir / f'{model.name}_none.rknn').exists():
+                log(f'[ПРОПУСК] convert: уже сконвертировано')
+            elif model.name in {r['model'] for r in existing if r.get('conversion_status') == 'OK'}:
+                log(f'[ПРОПУСК] convert: уже сконвертировано (results.json)')
+            else:
+                conv_result = run_converter(model.name, model.task, model_temp_dir, model_data_dir)
+                if conv_result is None or conv_result.get('status') != 'OK':
+                    log(f'[ПРОВАЛ] конвертация не удалась для {model.name}')
+                    result_entry = {
+                        'model': model.name,
+                        'task': model.task,
+                        'conversion_status': 'ПРОВАЛ',
+                        'conversion_error': conv_result.get('error', '') if conv_result else '',
+                        'validation': {},
+                        'fps': {},
+                        'input_size': model.input_size,
+                        'status': 'ПРОВАЛ',
+                    }
+                    upsert_result(existing, result_entry)
+                    save_results(existing)
+                    continue
+                # Обновляем conversion_status
+                for j, r in enumerate(existing):
+                    if r['model'] == model.name:
+                        existing[j]['conversion_status'] = 'OK'
+                        existing[j]['input_size'] = conv_result.get('input_size', model.input_size)
+                        break
+                else:
+                    result_entry = {
+                        'model': model.name,
+                        'task': model.task,
+                        'conversion_status': 'OK',
+                        'input_size': conv_result.get('input_size', model.input_size),
+                        'validation': {},
+                        'fps': {},
+                        'status': 'ОЖИДАНИЕ',
+                    }
+                    existing.append(result_entry)
+                save_results(existing)
+
+        # --- Фаза: validate ---
+        if phase_is(phases, 'validate'):
+            # Resume: пропускаем если уже валидировано
+            if model.name in {r['model'] for r in existing
+                              if r.get('validation', {}).get('fp32', {}).get('max_diff_avg', -1) >= 0
+                              or r.get('validation', {}).get('int8', {}).get('max_diff_avg', -1) >= 0}:
+                log(f'[ПРОПУСК] validate: уже валидировано')
+            elif not (model_temp_dir / f'{model.name}_none.rknn').exists():
+                log(f'[ПРОПУСК] validate: нет сконвертированных моделей')
+            else:
+                val_result = run_validate(model.name, model.task, model_temp_dir, model_data_dir)
+                if val_result is None:
+                    log(f'[ПРОВАЛ] валидация не удалась для {model.name}')
+                else:
+                    validations = val_result.get('validations', {})
+                    # Обновляем results.json
+                    for j, r in enumerate(existing):
+                        if r['model'] == model.name:
+                            existing[j]['validation'] = validations
+                            # Определяем статус по max_diff
+                            max_diffs = []
+                            for vk, vv in validations.items():
+                                md = vv.get('max_diff_avg', -1)
+                                if md >= 0:
+                                    max_diffs.append(md)
+                            if max_diffs:
+                                worst = max(max_diffs)
+                                existing[j]['status'] = 'ПРОЙДЕНО' if worst < 0.5 else 'ПРОВАЛ'
+                            break
+                    save_results(existing)
+
+        # --- Фаза: bench ---
+        if phase_is(phases, 'bench'):
+            if not (model_temp_dir / f'{model.name}.onnx').exists() and \
+               not (model_temp_dir / f'{model.name}_none.rknn').exists():
+                log(f'[ПРОПУСК] bench: нет моделей в temp_models/')
+                continue
+
+            fps_result = run_fps(model.name, model.task, model_temp_dir, model_data_dir,
+                                 quantize=QUANTIZE)
+            if fps_result is None:
+                log(f'[ПРОВАЛ] FPS-тест не удалась для {model.name}')
+                fps = {}
+            else:
+                fps = {}
+                for key in ['cpu', 'npu_none', 'npu_int8']:
+                    b = fps_result.get(key, {}) or {}
+                    fps[key] = {
+                        'fps': b.get('fps', -1),
+                        'fps_std': b.get('fps_std', 0),
+                        'n_frames': b.get('n_frames', 0),
+                        'npu_load_avg': b.get('npu_load_avg'),
+                        'cpu_load_avg': b.get('cpu_load_avg'),
+                        'error': b.get('error'),
+                    }
+
+            # Обновляем results.json
+            for j, r in enumerate(existing):
+                if r['model'] == model.name:
+                    existing[j]['fps'] = fps
+                    # Пересчитываем статус
+                    has_data = any(
+                        fps.get(k, {}).get('fps', -1) > 0
+                        for k in ['cpu', 'npu_none', 'npu_int8']
+                    )
+                    if has_data:
+                        existing[j]['status'] = 'ПРОЙДЕНО'
+                    elif fps:
+                        existing[j]['status'] = 'ПРОВАЛ'
+                    break
             save_results(existing)
+
+            cpu_fps = fps.get('cpu', {}).get('fps', -1)
+            npu_fp32_fps = fps.get('npu_none', {}).get('fps', -1)
+            npu_int8_fps = fps.get('npu_int8', {}).get('fps', -1)
+            log(f'[ГОТОВО] {model.name}: CPU={cpu_fps} FP32={npu_fp32_fps} INT8={npu_int8_fps}')
+
+        # --- Очистка ---
+        if cli_args.clean and (phase_is(phases, 'bench') or phase_is(phases, 'all')):
             cleanup_temp(model.name)
-            continue
-
-        conv_ok = conv_result.get('status') == 'OK'
-        if not conv_ok:
-            log(f'[ПРОВАЛ] конвертация не удалась для {model.name}')
-            result_entry = {
-                'model': model.name,
-                'task': model.task,
-                'status': 'ПРОВАЛ',
-                'error': 'конвертация не удалась',
-                'validation': {},
-                'fps': {},
-                'input_size': model.input_size,
-            }
-            upsert_result(existing, result_entry)
-            save_results(existing)
-            cleanup_temp(model.name)
-            continue
-
-        fps_result = run_fps(model.name, model.task, model_temp_dir, model_data_dir)
-        if fps_result is None:
-            log(f'[ПРОВАЛ] FPS-тест не удался для {model.name}')
-            fps = {'cpu': {'fps': -1, 'error': 'FPS-тест не удался'}, 'npu': {'fps': -1, 'error': 'FPS-тест не удался'}}
-            validation = {}
-        else:
-            fps = {}
-            for backend in ['cpu', 'npu']:
-                b = fps_result.get(backend, {}) or {}
-                fps[backend] = {
-                    'fps': b.get('fps', -1),
-                    'fps_std': b.get('fps_std', 0),
-                    'n_frames': b.get('n_frames', 0),
-                    'npu_load_avg': b.get('npu_load_avg'),
-                    'error': b.get('error'),
-                }
-            validation = fps_result.get('validation', {})
-
-        v = validation or {}
-        max_diff = v.get('max_diff_avg', -1)
-        threshold = 0.5
-        if max_diff >= 0:
-            status = 'ПРОЙДЕНО' if max_diff < threshold else 'ПРОВАЛ'
-        else:
-            status = 'ПРОЙДЕНО' if conv_ok else 'ПРОВАЛ'
-        if fps.get('cpu', {}).get('fps', -1) == -1 and fps.get('npu', {}).get('fps', -1) == -1:
-            if fps.get('cpu', {}).get('error') or fps.get('npu', {}).get('error'):
-                status = 'ПРОВАЛ'
-
-        result_entry = {
-            'model': model.name,
-            'task': model.task,
-            'status': status,
-            'validation': validation,
-            'fps': fps,
-            'input_size': conv_result.get('input_size', model.input_size),
-        }
-        upsert_result(existing, result_entry)
-        save_results(existing)
-        cleanup_temp(model.name)
-
-        cpu_fps = fps.get('cpu', {}).get('fps', -1)
-        npu_fps = fps.get('npu', {}).get('fps', -1)
-        md_avg = validation.get('max_diff_avg', -1)
-        log(f'[ГОТОВО] {model.name}: статус={status} '
-            f'CPU={cpu_fps} NPU={npu_fps} max_diff={md_avg}')
 
     write_tsv(existing)
 

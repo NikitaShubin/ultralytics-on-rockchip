@@ -34,16 +34,18 @@ class Pipeline:
         model_dir: str = '/app/model',
         model_name: str = '',
         backend: str = 'npu',
+        rknn_suffix: str = '',
     ) -> None:
         self.model_dir = Path(model_dir)
         self.model_name = model_name or 'yolo11n'
         self.backend = backend
+        self.rknn_suffix = rknn_suffix
         self._postprocess = None
         self._visualize = None
         self._custom_preprocess = None
         self._semantic_mode = False
         self.input_size = 640
-        self._backend = ModelBackend(model_dir, model_name, backend)
+        self._backend = ModelBackend(model_dir, model_name, backend, rknn_suffix=rknn_suffix)
         self._load_postprocess()
 
     def _load_postprocess(self) -> None:
@@ -74,13 +76,16 @@ class Pipeline:
             self.input_size,
         )
 
-    def reload(self, model_name: str = '', backend: str | None = None) -> None:
+    def reload(self, model_name: str = '', backend: str | None = None,
+               rknn_suffix: str | None = None) -> None:
         """Перезагрузка модели и постпроцесса (потокобезопасно)."""
         if model_name:
             self.model_name = model_name
         if backend is not None:
             self.backend = backend
-        self._backend.reload(model_name, backend)
+        if rknn_suffix is not None:
+            self.rknn_suffix = rknn_suffix
+        self._backend.reload(model_name, backend, rknn_suffix=rknn_suffix)
         if 'postprocess_mod' in sys.modules:
             del sys.modules['postprocess_mod']
         self._postprocess = None

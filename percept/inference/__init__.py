@@ -26,10 +26,12 @@ TEMP_INTERVAL = 30.0
 class ModelBackend:
     """Абстракция бэкенда: RKNN или ONNX CPU."""
 
-    def __init__(self, model_dir: str, model_name: str, backend: str = 'npu') -> None:
+    def __init__(self, model_dir: str, model_name: str, backend: str = 'npu',
+                 rknn_suffix: str = '') -> None:
         self.model_dir = Path(model_dir)
         self.model_name = model_name or 'yolo11n'
         self.backend = backend
+        self.rknn_suffix = rknn_suffix
         self.rknn: Any = None
         self._session: Any = None
         self._input_name: str = ''
@@ -50,11 +52,13 @@ class ModelBackend:
         """Загрузка RKNN модели."""
         from rknnlite.api import RKNNLite
 
-        model_path = self.model_dir / f'{self.model_name}.rknn'
+        model_path = self.model_dir / f'{self.model_name}{self.rknn_suffix}.rknn'
+        if not model_path.exists():
+            model_path = self.model_dir / f'{self.model_name}.rknn'
         if not model_path.exists():
             model_path = self.model_dir / 'model.rknn'
         if not model_path.exists():
-            raise RuntimeError(f'Mодель RKNN не найдена: {model_path}')
+            raise RuntimeError(f'Модель RKNN не найдена: {model_path}')
         self.rknn = RKNNLite()
         ret = self.rknn.load_rknn(str(model_path))
         if ret != 0:
@@ -62,7 +66,7 @@ class ModelBackend:
         ret = self.rknn.init_runtime(core_mask=RKNNLite.NPU_CORE_0_1_2)
         if ret != 0:
             raise RuntimeError(f'Не удалось инициализировать runtime: {ret}')
-        log.info('модель загружена (RKNN) модель=%s', self.model_name)
+        log.info('модель загружена (RKNN) модель=%s суффикс=%s', self.model_name, self.rknn_suffix)
 
     def _load_onnx(self) -> None:
         """Загрузка ONNX модели (CPU)."""
@@ -87,13 +91,17 @@ class ModelBackend:
         nhwc = tensor.transpose(0, 2, 3, 1)
         return self.rknn.inference(inputs=[nhwc])
 
-    def reload(self, model_name: str = '', backend: str | None = None) -> None:
+    def reload(self, model_name: str = '', backend: str | None = None,
+               rknn_suffix: str | None = None) -> None:
         """Перезагрузка модели."""
         if model_name:
             self.model_name = model_name
         if backend is not None:
             self.backend = backend
-        log.info('перезагрузка модель=%s бэкенд=%s...', self.model_name, self.backend)
+        if rknn_suffix is not None:
+            self.rknn_suffix = rknn_suffix
+        log.info('перезагрузка модель=%s бэкенд=%s суффикс=%s...',
+                 self.model_name, self.backend, self.rknn_suffix)
         with self._infer_lock:
             if self.rknn:
                 with suppress(Exception):
