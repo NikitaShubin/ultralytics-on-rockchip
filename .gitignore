@@ -25,6 +25,9 @@ converter/check1_*/
 converter/check2_*/
 converter/core.*
 
+# Benchmark temp files (large RKNN conversion artifacts)
+benchmark/temp_models/
+
 # Active model directory (deployed on device)
 model/
 
