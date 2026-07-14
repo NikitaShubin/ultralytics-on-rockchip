@@ -26,6 +26,7 @@
 | Камеры: WebRTC | Нестабильно |
 | Камеры: GStreamer | Нестабильно |
 | Полная русификация кода | ✅ Завершена |
+| Стресс-тест NPU/CPU/RAM | ✅ bash + python |
 | INT8 калибровка (5000 COCO) | В процессе (yolo26x-seg) |
 
 ## Требования
@@ -91,6 +92,7 @@ curl "http://localhost:5000/reload?model=yolo11n-pose&rknn_suffix=_int8"
 - `?model=` ищет `<name>.rknn`, `<name>.onnx`, `<name>_postprocess.py` в `model/`
 - `?backend=cpu` — форсировать ONNX CPU (если RKNN не нужен)
 - `?rknn_suffix=_int8` — выбрать INT8 RKNN модель (по умолчанию `_none` или без суффикса)
+- `?rknn_suffix=` — пустое значение, использовать модель без суффикса
 - Без параметров — загружает `model.rknn` / `model.onnx`
 
 ## Конвертация новой модели
@@ -102,7 +104,7 @@ cd converter
 docker compose run --rm converter convert my-model.pt
 ```
 
-Конвертер автоматически:
+Конвертер (мультиарх образ `python:3.11-slim`, работает на x86 и ARM):
 1. Применяет RKNN-патчи (YOLO26, fuse bug)
 2. Экспортирует ONNX + компилирует RKNN
 3. Генерирует `postprocess.py` под задачу
@@ -179,6 +181,40 @@ docker compose run --rm converter python eval_coco.py
 
 Валидация на 5000 изображений COCO val2017 для задач det/seg/pose.
 
+## Стресс-тест
+
+Нагрузочный тест CPU + NPU + RAM с мониторингом температур и загрузки.
+Полезно для валидации эффективности охлаждения и стабильности NPU под нагрузкой.
+
+```bash
+# Всё (CPU + NPU + RAM), до Ctrl+C
+./stress_test.sh
+
+# Только NPU, 10 минут
+./stress_test.sh --npu-only -d 600
+
+# 3 ядра × 8 потоков, конкретная модель
+./stress_test.sh -c 0,1,2 -s 8 -m model/yolo26x-seg.rknn
+
+# С логом в CSV
+./stress_test.sh -d 3600 -l stress_results.csv
+```
+
+| Опция | По умолчанию | Описание |
+|-------|-------------|----------|
+| `-d, --duration SEC` | `0` (до Ctrl+C) | Длительность |
+| `-c, --npu-cores` | `0,1,2` | NPU ядра |
+| `-s, --npu-streams` | `8` | Потоков инференса на ядро |
+| `-m, --model` | `model/yolo26x-seg.rknn` | RKNN модель |
+| `-i, --interval SEC` | `2` | Интервал мониторинга |
+| `-l, --log FILE` | — | CSV лог |
+| `--npu-only` | — | Только NPU |
+| `--cpu-only` | — | Только CPU + RAM |
+
+Ctrl+C корректно останавливает все процессы и выводит финальные температуры.
+
+Также доступен Python-аналог: `python3 stress_test.py` (опции аналогичны).
+
 ## Результаты
 
 ### FPS (yolov8n-pose, 640×640)
@@ -244,6 +280,8 @@ start.sh                     # Запуск сервера
 stop.sh                      # Остановка сервера
 deploy.sh                    # Деплой модели (конвертация + тест + запуск)
 setup_datasets.py            # Загрузка датасетов (COCO val2017)
+stress_test.sh               # Стресс-тест NPU/CPU/RAM (bash, Ctrl+C)
+stress_test.py               # Стресс-тест NPU/CPU/RAM (python)
 benchmark/
 ├── benchmark.py             # Оркестратор: --phase convert|validate|bench|all
 ├── convert_bench.py         # Фаза 1: экспорт + компиляция (4 файла на модель)
@@ -344,6 +382,7 @@ watch -n 1 'cat /sys/kernel/debug/rknpu/load'
 
 ### Docker
 - Образ конвертера: `percept-converter:latest` (был `webcam-converter`)
+- Конвертер: мультиарх `python:3.11-slim` (работает на x86 и ARM)
 - Образ прод: `webcam-percept` (имя в docker-compose.yml оставлено для совместимости)
 - `docker-compose.yml`: сервис `percept`, переменные `MODEL`, `WEB_MODE`
 - `converter/docker-compose.yml`: `image: percept-converter:latest`
@@ -383,6 +422,14 @@ watch -n 1 'cat /sys/kernel/debug/rknpu/load'
 ./deploy.sh                   # только запуск (использует .rknn из /models)
 ```
 Переменные окружения: `MODEL`, `WEB_MODE`, `QUANTIZE`. Авто-переименование `.rknn` файлов под `MODEL`.
+
+### Стресс-тест
+- `stress_test.sh` — bash-скрипт: NPU (через Python rknnlite) + CPU/RAM (stress), мониторинг температур, NPU load, CPU load
+- `stress_test.py` — python-аналог с теми же возможностями
+- Ctrl+C корректно останавливает все процессы
+- Легенда столбцов выводится в шапке таблицы
+- CPU%: расчёт через дельту `/proc/stat` (файл-состояние для обхода subshell)
+- NPU: до 100% загрузки (3 ядра × 8 потоков, yolo26x-seg 66 МБ)
 
 ### Удалённые файлы
 - `run.sh` (legacy) — удалён
