@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # Стресс-тест Orange Pi (RK3588S): CPU + NPU + RAM + температура.
-# Ctrl+C корректно останавливает всю нагрузку.
+# Ctrl+C корректно останавливает всю нагрузку и завершает скрипт.
 #
 # Использование:
-#   ./stress_test.sh                          # всё, 5 минут
-#   ./stress_test.sh -d 600                   # 10 минут
+#   ./stress_test.sh                          # всё, до Ctrl+C
+#   ./stress_test.sh -d 600                   # всё, 10 минут
 #   ./stress_test.sh --npu-only               # только NPU
 #   ./stress_test.sh --cpu-only               # только CPU+RAM
 #   ./stress_test.sh -c 0,1 -s 4              # 2 ядра × 4 потока NPU
@@ -15,7 +15,7 @@ set -uo pipefail
 
 # ─── Аргументы ─────────────────────────────────────────────────────────────
 
-DURATION=300
+DURATION=0
 NPU_ONLY=0
 CPU_ONLY=0
 NO_RAM=0
@@ -31,7 +31,7 @@ usage() {
 Использование: $(basename "$0") [опции]
 
 Опции:
-  -d, --duration SEC     Длительность (по умолчанию: 300)
+  -d, --duration SEC     Длительность в секундах (0 = до Ctrl+C, по умолчанию)
   -c, --npu-cores LIST   NPU ядра через запятую (по умолчанию: 0,1,2)
   -s, --npu-streams N    Потоков инференса на ядро (по умолчанию: 8)
   -m, --model FILE       RKNN модель (по умолчанию: model/yolo26x-seg.rknn)
@@ -95,20 +95,6 @@ get_temps() {
     echo "$result"
 }
 
-get_temp() {
-    # get_temp "npu-thermal" → число °C
-    local target="$1"
-    for i in "${!THERMAL_NAMES[@]}"; do
-        if [[ "${THERMAL_NAMES[$i]}" == "$target" ]]; then
-            local raw
-            raw=$(cat "${THERMAL_FILES[$i]}" 2>/dev/null || echo "0")
-            echo $((raw / 1000))
-            return
-        fi
-    done
-    echo "?"
-}
-
 # ─── CPU load ───────────────────────────────────────────────────────────────
 
 PREV_IDLE=0
@@ -152,7 +138,6 @@ read_cpu_load() {
 # ─── NPU load ───────────────────────────────────────────────────────────────
 
 read_npu_load_cores() {
-    # Возвращает "C0=X% C1=Y% C2=Z%" (компактно)
     local raw
     raw=$(cat /sys/kernel/debug/rknpu/load 2>/dev/null || echo "")
     if [[ -z "$raw" ]]; then
@@ -163,7 +148,6 @@ read_npu_load_cores() {
 }
 
 npu_load_avg() {
-    # Среднее арифметическое по ядрам из "C0=98% C1=99% C2=99% "
     local raw
     raw=$(read_npu_load_cores)
     if [[ -z "$raw" ]]; then
@@ -192,12 +176,18 @@ read_ram() {
     awk '/^MemTotal:/{total=$2} /^MemAvailable:/{avail=$2} END{printf "%d %d", total/1024, (total-avail)/1024}' /proc/meminfo
 }
 
-# ─── PID трекинг и cleanup ─────────────────────────────────────────────────
+# ─── Управление процессами ─────────────────────────────────────────────────
 
 STRESS_PIDS=()
 NPU_PID=""
+NPU_SCRIPT=""
+STOP=0
+CLEANUP_DONE=0
 
 cleanup() {
+    [[ $CLEANUP_DONE -eq 1 ]] && return
+    CLEANUP_DONE=1
+
     echo ""
     echo "[ОСТАНОВКА] Завершаю все процессы..."
 
@@ -208,26 +198,31 @@ cleanup() {
     pkill -f 'stress --cpu' 2>/dev/null || true
     pkill -f 'stress --vm' 2>/dev/null || true
 
-    # Остановить NPU Python процесс (SIGTERM → SIGKILL через 3с)
+    # Остановить NPU Python процесс (SIGTERM → 3с → SIGKILL)
     if [[ -n "$NPU_PID" ]] && kill -0 "$NPU_PID" 2>/dev/null; then
         kill -TERM "$NPU_PID" 2>/dev/null || true
-        local wait_count=0
-        while kill -0 "$NPU_PID" 2>/dev/null && [[ $wait_count -lt 3 ]]; do
+        local waited=0
+        while kill -0 "$NPU_PID" 2>/dev/null && [[ $waited -lt 3 ]]; do
             sleep 1
-            wait_count=$((wait_count + 1))
+            waited=$((waited + 1))
         done
         kill -9 "$NPU_PID" 2>/dev/null || true
     fi
 
     wait 2>/dev/null || true
-
-    # Убить tmp скрипт
-    [[ -n "${NPU_SCRIPT:-}" ]] && rm -f "$NPU_SCRIPT"
+    [[ -n "$NPU_SCRIPT" ]] && rm -f "$NPU_SCRIPT"
 
     echo "[ГОТОВО] Нагрузка снята"
 }
 
-trap cleanup EXIT INT TERM
+on_signal() {
+    STOP=1
+    # Передать сигнал NPU Python процессу, чтобы он остановил потоки
+    [[ -n "$NPU_PID" ]] && kill -INT "$NPU_PID" 2>/dev/null || true
+}
+
+trap on_signal INT TERM
+trap 'cleanup; exit 0' EXIT
 
 # ─── CPU/RAM stress ────────────────────────────────────────────────────────
 
@@ -305,38 +300,32 @@ PYEOF
 
 monitor() {
     local elapsed=0
-    local interval=${INTERVAL}
 
-    # CSV заголовок
-    [[ -n "$LOG_FILE" ]] && echo "time,elapsed,cpu%,npu%,npu_load_cores,ram_used_mb,temps" > "$LOG_FILE"
+    [[ -n "$LOG_FILE" ]] && echo "time,elapsed,cpu%,npu%,npu_cores,ram_used_mb,temps" > "$LOG_FILE"
 
-    # Шапка таблицы
-    printf "%-9s %5s %5s  %-30s %7s  %s\n" "ВРЕМЯ" "CPU%" "NPU%" "NPU_LOAD" "RAM_МБ" "ТЕМПЕРАТУРЫ"
-    printf '%0.s─' {1..110}
-    echo
+    printf "%-9s %5s %5s  %-24s %7s  %s\n" "ВРЕМЯ" "CPU%" "NPU%" "NPU_LOAD" "RAM_МБ" "ТЕМПЕРАТУРЫ"
+    echo "         ----  ----  ------------------------  ------  ------------------------------"
 
-    while [[ $elapsed -lt $DURATION ]]; do
-        sleep "$interval"
-        elapsed=$((elapsed + interval))
+    while true; do
+        sleep "$INTERVAL"
+        [[ $STOP -eq 1 ]] && break
+
+        elapsed=$((elapsed + INTERVAL))
+
+        # Проверка таймаута
+        if [[ $DURATION -gt 0 && $elapsed -ge $DURATION ]]; then
+            break
+        fi
 
         local ts
         ts=$(date +%H:%M:%S)
-
-        local cpu_pct
-        cpu_pct=$(read_cpu_load)
-
-        local npu_pct
-        npu_pct=$(npu_load_avg)
-
-        local npu_cores
-        npu_cores=$(read_npu_load_cores)
-
+        local cpu_pct; cpu_pct=$(read_cpu_load)
+        local npu_pct; npu_pct=$(npu_load_avg)
+        local npu_cores; npu_cores=$(read_npu_load_cores)
         read -r _ ram_used <<< "$(read_ram)"
+        local temps; temps=$(get_temps)
 
-        local temps
-        temps=$(get_temps)
-
-        printf "%-9s %4s%% %4s%%  %-30s %6s  %s\n" \
+        printf "%-9s %4s%% %4s%%  %-24s %6s  %s\n" \
             "$ts" "$cpu_pct" "$npu_pct" "$npu_cores" "$ram_used" "$temps"
 
         [[ -n "$LOG_FILE" ]] && \
@@ -352,17 +341,14 @@ print_results() {
     echo "  РЕЗУЛЬТАТЫ"
     echo "════════════════════════════════════════════════════════"
     echo ""
-    echo "Температуры:"
     for i in "${!THERMAL_NAMES[@]}"; do
         local raw
         raw=$(cat "${THERMAL_FILES[$i]}" 2>/dev/null || echo "0")
         printf "  %-25s %3d°C\n" "${THERMAL_NAMES[$i]}" $((raw / 1000))
     done
-    local npu_cores
-    npu_cores=$(read_npu_load_cores)
+    local npu_cores; npu_cores=$(read_npu_load_cores)
     [[ -n "$npu_cores" ]] && echo -e "\nNPU load: $npu_cores"
-    local rt ru
-    read -r rt ru <<< "$(read_ram)"
+    local rt ru; read -r rt ru <<< "$(read_ram)"
     echo "RAM: ${ru}/${rt} МБ"
     [[ -n "$LOG_FILE" ]] && echo "Лог: $LOG_FILE"
 }
@@ -372,10 +358,28 @@ print_results() {
 init_thermal
 
 echo "════════════════════════════════════════════════════════"
-echo "  СТРЕСС-ТЕСТ: ${DURATION}с"
+if [[ $DURATION -gt 0 ]]; then
+    echo "  СТРЕСС-ТЕСТ: ${DURATION}с"
+else
+    echo "  СТРЕСС-ТЕСТ: до Ctrl+C"
+fi
 [[ $NPU_ONLY -eq 0 ]] && echo "  CPU: $(nproc) ядер (stress, nice=19)"
 [[ $CPU_ONLY -eq 0 ]] && echo "  NPU: $NPU_CORES × $NPU_STREAMS потоков"
 echo "  Модель: $MODEL"
+echo "════════════════════════════════════════════════════════"
+echo ""
+echo "  Столбцы:"
+echo "    CPU%     — загрузка CPU (средняя, /proc/stat)"
+echo "    NPU%     — загрузка NPU (средняя, /sys/kernel/debug/rknpu/load)"
+echo "    NPU_LOAD — загрузка каждого NPU ядра: C0=XX% C1=XX% C2=XX%"
+echo "    RAM_МБ   — используемая оперативная память"
+echo "    Температуры:"
+echo "      bigcore0/1  — большие ядра CPU (Cortex-A76)"
+echo "      littlecore  — малые ядра CPU (Cortex-A55)"
+echo "      npu         — нейропроцессор"
+echo "      soc         — системный чип"
+echo "      gpu         — графический ускоритель (Mali-G610)"
+echo "      center      — центр чипа"
 echo "════════════════════════════════════════════════════════"
 echo ""
 
@@ -386,7 +390,7 @@ fi
 
 if [[ $CPU_ONLY -eq 0 ]]; then
     start_npu_stress
-    sleep 5  # дать потокам запуститься
+    sleep 5
 fi
 
 monitor
