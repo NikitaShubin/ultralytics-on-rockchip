@@ -163,7 +163,7 @@ read_npu_load_cores() {
 }
 
 npu_load_avg() {
-    # Среднее арифметическое по ядрам
+    # Среднее арифметическое по ядрам из "C0=98% C1=99% C2=99% "
     local raw
     raw=$(read_npu_load_cores)
     if [[ -z "$raw" ]]; then
@@ -171,11 +171,14 @@ npu_load_avg() {
         return
     fi
     local sum=0 cnt=0
-    while IFS='=' read -r _ v; do
-        v=${v%%%}
-        sum=$((sum + v))
-        cnt=$((cnt + 1))
-    done <<< "$raw"
+    for token in $raw; do
+        local v="${token#*=}"
+        v="${v%%%}"
+        if [[ "$v" =~ ^[0-9]+$ ]]; then
+            sum=$((sum + v))
+            cnt=$((cnt + 1))
+        fi
+    done
     if [[ $cnt -gt 0 ]]; then
         echo $((sum / cnt))
     else
