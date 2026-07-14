@@ -97,10 +97,11 @@ get_temps() {
 
 # ─── CPU load ───────────────────────────────────────────────────────────────
 
-PREV_IDLE=0
-PREV_TOTAL=0
+CPU_STATE_FILE="/tmp/.stress_cpu_state"
 
 read_cpu_load() {
+    # Читает /proc/stat, считает дельту между вызовами.
+    # Состояние хранится в файле (обход subshell-проблемы bash $(...))
     local vals
     read -ra vals < <(head -1 /proc/stat)
     local user=${vals[1]:-0}
@@ -115,17 +116,18 @@ read_cpu_load() {
     local cur_idle=$((idle + iowait))
     local cur_total=$((user + nice + system + idle + iowait + irq + softirq + steal))
 
-    if [[ $PREV_TOTAL -eq 0 ]]; then
-        PREV_IDLE=$cur_idle
-        PREV_TOTAL=$cur_total
+    if [[ ! -f "$CPU_STATE_FILE" ]]; then
+        echo "${cur_idle} ${cur_total}" > "$CPU_STATE_FILE"
         echo 0
         return
     fi
 
-    local d_idle=$((cur_idle - PREV_IDLE))
-    local d_total=$((cur_total - PREV_TOTAL))
-    PREV_IDLE=$cur_idle
-    PREV_TOTAL=$cur_total
+    local prev_idle prev_total
+    read -r prev_idle prev_total < "$CPU_STATE_FILE"
+    echo "${cur_idle} ${cur_total}" > "$CPU_STATE_FILE"
+
+    local d_idle=$((cur_idle - prev_idle))
+    local d_total=$((cur_total - prev_total))
 
     if [[ $d_total -eq 0 ]]; then
         echo 0
@@ -211,6 +213,7 @@ cleanup() {
 
     wait 2>/dev/null || true
     [[ -n "$NPU_SCRIPT" ]] && rm -f "$NPU_SCRIPT"
+    rm -f "$CPU_STATE_FILE"
 
     echo "[ГОТОВО] Нагрузка снята"
 }
@@ -303,8 +306,11 @@ monitor() {
 
     [[ -n "$LOG_FILE" ]] && echo "time,elapsed,cpu%,npu%,npu_cores,ram_used_mb,temps" > "$LOG_FILE"
 
-    printf "%-9s %5s %5s  %-24s %7s  %s\n" "ВРЕМЯ" "CPU%" "NPU%" "NPU_LOAD" "RAM_МБ" "ТЕМПЕРАТУРЫ"
-    echo "         ----  ----  ------------------------  ------  ------------------------------"
+    printf "%-9s %5s %5s  %-24s %7s  %s\n" \
+        "ВРЕМЯ" "CPU%" "NPU%" "NPU_LOAD" "RAM_МБ" "ТЕМПЕРАТУРЫ"
+    printf "%-9s %5s %5s  %-24s %7s  %s\n" \
+        "" "/proc" "/sys" "(C0=XX% C1=XX% C2=XX%)" "(used)" "(big/little/npu/soc)"
+    echo "──────────────────────────────────────────────────────────────────────────────────────"
 
     while true; do
         sleep "$INTERVAL"
@@ -367,19 +373,6 @@ fi
 [[ $CPU_ONLY -eq 0 ]] && echo "  NPU: $NPU_CORES × $NPU_STREAMS потоков"
 echo "  Модель: $MODEL"
 echo "════════════════════════════════════════════════════════"
-echo ""
-echo "  Столбцы:"
-echo "    CPU%     — загрузка CPU (средняя, /proc/stat)"
-echo "    NPU%     — загрузка NPU (средняя, /sys/kernel/debug/rknpu/load)"
-echo "    NPU_LOAD — загрузка каждого NPU ядра: C0=XX% C1=XX% C2=XX%"
-echo "    RAM_МБ   — используемая оперативная память"
-echo "    Температуры:"
-echo "      bigcore0/1  — большие ядра CPU (Cortex-A76)"
-echo "      littlecore  — малые ядра CPU (Cortex-A55)"
-echo "      npu         — нейропроцессор"
-echo "      soc         — системный чип"
-echo "      gpu         — графический ускоритель (Mali-G610)"
-echo "      center      — центр чипа"
 echo "════════════════════════════════════════════════════════"
 echo ""
 
