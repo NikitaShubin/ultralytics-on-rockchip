@@ -22,7 +22,7 @@ def _make_no_cam_placeholder(w: int = 640, h: int = 480) -> bytes:
         img = np.full((h, w, 3), (114, 114, 114), dtype=np.uint8)
         cv2.putText(
             img,
-            'Camera not connected',
+            'Камера не подключена',
             (130, 240),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.8,

@@ -1,0 +1,101 @@
+/dts-v1/;
+/plugin/;
+
+/*
+ * RK3588S Orange Pi 5 Pro — Overclock overlay
+ *
+ * CPU A76:  снять opp-supported-hw фильтр для 2352/2400 МГц
+ * NPU:      добавить OPP 1050 МГц (900 мВ) и 1100 МГц (950 мВ)
+ * GPU:      добавить OPP 1050 МГц (900 мВ) и 1100 МГц (950 мВ)
+ *
+ * Установка:
+ *   Скопировать rk3588-opi5pro-oc.dtbo в /boot/dtb/rockchip/overlay/
+ *   Добавить "rk3588-opi5pro-oc" в overlays= в /boot/orangepiEnv.txt
+ *   Перезагрузить
+ */
+
+/ {
+
+	/* ── CPU cluster1 (cpu4-5, A76 mid) ─────────────────────── */
+
+	/* opp-2352 МГц: снять фильтр opp-supported-hw */
+	fragment@0 {
+		target-path = "/cluster1-opp-table/opp-2352000000";
+		__overlay__ {
+			opp-supported-hw = <0xffffffff 0xffffffff>;
+		};
+	};
+
+	/* opp-2400 МГц: снять фильтр opp-supported-hw */
+	fragment@1 {
+		target-path = "/cluster1-opp-table/opp-2400000000";
+		__overlay__ {
+			opp-supported-hw = <0xffffffff 0xffffffff>;
+		};
+	};
+
+	/* ── CPU cluster2 (cpu6-7, A76 big) ────────────────────── */
+
+	/* opp-2352 МГц: снять фильтр opp-supported-hw */
+	fragment@2 {
+		target-path = "/cluster2-opp-table/opp-2352000000";
+		__overlay__ {
+			opp-supported-hw = <0xffffffff 0xffffffff>;
+		};
+	};
+
+	/* opp-2400 МГц: снять фильтр opp-supported-hw */
+	fragment@3 {
+		target-path = "/cluster2-opp-table/opp-2400000000";
+		__overlay__ {
+			opp-supported-hw = <0xffffffff 0xffffffff>;
+		};
+	};
+
+	/* ── NPU: добавить OPP 1050 и 1100 МГц ─────────────────── */
+
+	fragment@4 {
+		target = "/npu-opp-table";
+		__overlay__ {
+
+			opp-1050000000 {
+				opp-hz = <0x00 0x3e919e40>;
+				opp-microvolt = <0xdbba0 0xdbba0 0xdbba0 0xdbba0 0xdbba0 0xdbba0>;
+				opp-supported-hw = <0x000000f9 0xffffffff>;
+				clock-latency-ns = <0x00 0x9c40>;
+			};
+
+			opp-1100000000 {
+				opp-hz = <0x00 0x4190ce80>;
+				opp-microvolt = <0xe7ef0 0xe7ef0 0xe7ef0 0xe7ef0 0xe7ef0 0xe7ef0>;
+				opp-supported-hw = <0x000000f9 0xffffffff>;
+				clock-latency-ns = <0x00 0x9c40>;
+			};
+
+		};
+	};
+
+	/* ── GPU: добавить OPP 1050 и 1100 МГц ─────────────────── */
+
+	fragment@5 {
+		target = "/gpu-opp-table";
+		__overlay__ {
+
+			opp-1050000000 {
+				opp-hz = <0x00 0x3e919e40>;
+				opp-microvolt = <0xdbba0 0xdbba0 0xdbba0 0xdbba0 0xdbba0 0xdbba0>;
+				opp-supported-hw = <0x000000f9 0xffffffff>;
+				clock-latency-ns = <0x00 0x9c40>;
+			};
+
+			opp-1100000000 {
+				opp-hz = <0x00 0x4190ce80>;
+				opp-microvolt = <0xe7ef0 0xe7ef0 0xe7ef0 0xe7ef0 0xe7ef0 0xe7ef0>;
+				opp-supported-hw = <0x000000f9 0xffffffff>;
+				clock-latency-ns = <0x00 0x9c40>;
+			};
+
+		};
+	};
+
+};

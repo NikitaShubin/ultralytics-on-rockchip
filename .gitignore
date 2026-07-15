@@ -31,6 +31,14 @@ benchmark/temp_models/
 # Active model directory (deployed on device)
 model/
 
+# Virtual environments
+.venv/
+
+# Temporary benchmark files
+fps_before.txt
+fps_after.txt
+oc_results.csv
+
 # Test images (user data)
 test/*_pred.jpg
 test/*_preview.jpg
