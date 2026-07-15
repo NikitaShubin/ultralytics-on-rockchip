@@ -45,3 +45,6 @@ test/*_preview.jpg
 
 # Datasets (large, downloaded on demand)
 datasets/coco_val2017/
+
+# Overclock binaries
+overclock/*.dtbo
