@@ -25,32 +25,42 @@ def setup_coco_val2017() -> None:
     coco_dir = DATASETS_DIR / 'coco_val2017'
     coco_dir.mkdir(parents=True, exist_ok=True)
 
-    images_dir = coco_dir / 'images'
-    if images_dir.exists() and any(images_dir.iterdir()):
-        print('COCO val2017 уже загружен')
+    images_dir = coco_dir / 'images' / 'val2017'
+    ann_dir = coco_dir / 'annotations'
+
+    # Проверка: всё уже на месте
+    if (images_dir.exists() and any(images_dir.glob('*.jpg'))
+            and ann_dir.exists() and any(ann_dir.glob('*.json'))):
+        print('COCO val2017 уже загружена')
         return
 
-    # Загрузка аннотаций
-    ann_url = 'http://images.cocodataset.org/annotations/annotations_trainval2017.zip'
-    ann_zip = DATASETS_DIR / 'annotations_trainval2017.zip'
-    if not ann_zip.exists():
-        download_file(ann_url, ann_zip)
+    # Аннотации
+    if not (ann_dir.exists() and any(ann_dir.glob('*.json'))):
+        ann_url = 'http://images.cocodataset.org/annotations/annotations_trainval2017.zip'
+        ann_zip = DATASETS_DIR / 'annotations_trainval2017.zip'
+        if not ann_zip.exists():
+            download_file(ann_url, ann_zip)
 
-    print('Распаковка аннотаций...')
-    with zipfile.ZipFile(ann_zip, 'r') as z:
-        z.extractall(DATASETS_DIR)
+        print('Распаковка аннотаций...')
+        with zipfile.ZipFile(ann_zip, 'r') as z:
+            z.extractall(coco_dir)
 
-    # Загрузка изображений
-    img_url = 'http://images.cocodataset.org/zips/val2017.zip'
-    img_zip = DATASETS_DIR / 'val2017.zip'
-    if not img_zip.exists():
-        download_file(img_url, img_zip)
+        ann_zip.unlink(missing_ok=True)
 
-    print('Распаковка изображений (это может занять время)...')
-    with zipfile.ZipFile(img_zip, 'r') as z:
-        z.extractall(coco_dir)
+    # Изображения
+    if not (images_dir.exists() and any(images_dir.glob('*.jpg'))):
+        img_url = 'http://images.cocodataset.org/zips/val2017.zip'
+        img_zip = DATASETS_DIR / 'val2017.zip'
+        if not img_zip.exists():
+            download_file(img_url, img_zip)
 
-    print(f'COCO val2017 готов: {coco_dir}')
+        print('Распаковка изображений (это может занять время)...')
+        with zipfile.ZipFile(img_zip, 'r') as z:
+            z.extractall(coco_dir / 'images')
+
+        img_zip.unlink(missing_ok=True)
+
+    print(f'COCO val2017 готова: {coco_dir}')
 
 
 def main() -> None:
