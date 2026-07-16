@@ -17,6 +17,13 @@ if [ "$2" = "--full-test" ]; then
     FULL_TEST=true
 fi
 
+# Проверка датасета для калибровки (автозагрузка при необходимости)
+COCO_DIR="datasets/coco_val2017/images/val2017"
+if [ ! -d "$COCO_DIR" ] || [ -z "$(ls "$COCO_DIR"/*.jpg 2>/dev/null)" ]; then
+    echo "=== Загрузка COCO val2017 (~19 GB) ==="
+    python3 setup_datasets.py
+fi
+
 # Конвертация INT8 (если указана модель)
 if [ -n "$MODEL" ]; then
     echo "=== Конвертация $MODEL (INT8 калибровка) ==="

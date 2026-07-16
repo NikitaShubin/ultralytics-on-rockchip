@@ -27,7 +27,7 @@
 | Камеры: GStreamer | Нестабильно |
 | Полная русификация кода | ✅ Завершена |
 | Стресс-тест NPU/CPU/RAM | ✅ bash + python |
-| INT8 калибровка (5000 COCO) | В процессе (yolo26x-seg) |
+| INT8 калибровка (5000 COCO) | Автозагрузка датасета при деплое |
 
 ## Требования
 
@@ -58,12 +58,14 @@ docker compose up -d --build
 # Деплой текущей модели из model/
 ./deploy.sh
 
-# Конвертация + деплой конкретной модели
-./deploy.sh yolov8n-pose
+# Конвертация + деплой конкретной модели (INT8)
+./deploy.sh yolo26n-pose
 
 # Полный тест (конвертация + FPS бенчмарк + запуск)
-./deploy.sh yolov8n-pose --full-test
+./deploy.sh yolo26n-pose --full-test
 ```
+
+При первом запуске автоматически скачивается COCO val2017 (~19 GB) для калибровки INT8.
 
 ## Режимы камеры
 
@@ -112,11 +114,14 @@ docker compose run --rm converter convert my-model.pt
 
 ## Подготовка датасетов
 
+Датасет **скачивается автоматически** при первом запуске `./deploy.sh` (если отсутствует).
+Можно загрузить вручную:
+
 ```bash
-python setup_datasets.py
+python3 setup_datasets.py
 ```
 
-Загружает COCO val2017 (5000 изображений + аннотации) для калибровки и валидации.
+Загружает COCO val2017 (~19 GB, 5000 изображений + аннотации) для калибровки и валидации.
 
 ## Бенчмарк (3 фазы)
 
@@ -278,7 +283,7 @@ templates/
 test/                        # Тестовые изображения
 start.sh                     # Запуск сервера
 stop.sh                      # Остановка сервера
-deploy.sh                    # Деплой модели (конвертация + тест + запуск)
+deploy.sh                    # Деплой модели (конвертация + тест + запуск, автозагрузка датасета)
 setup_datasets.py            # Загрузка датасетов (COCO val2017)
 stress_test.sh               # Стресс-тест NPU/CPU/RAM (bash, Ctrl+C)
 stress_test.py               # Стресс-тест NPU/CPU/RAM (python)
@@ -418,10 +423,12 @@ watch -n 1 'cat /sys/kernel/debug/rknpu/load'
 ### deploy.sh
 Переписан в однокомандный деплой:
 ```bash
-./deploy.sh --quantize int8   # конвертация + запуск
-./deploy.sh                   # только запуск (использует .rknn из /models)
+./deploy.sh yolo26n-pose       # конвертация INT8 + запуск
+./deploy.sh                    # только запуск (использует .rknn из /model)
+./deploy.sh yolo26n-pose --full-test  # конвертация + FPS тест
 ```
-Переменные окружения: `MODEL`, `WEB_MODE`, `QUANTIZE`. Авто-переименование `.rknn` файлов под `MODEL`.
+Автозагрузка COCO val2017 при первом запуске (если датасет отсутствует).
+Переменные окружения: `MODEL`, `WEB_MODE`. Авто-переименование `.rknn` файлов под `MODEL`.
 
 ### Стресс-тест
 - `stress_test.sh` — bash-скрипт: NPU (через Python rknnlite) + CPU/RAM (stress), мониторинг температур, NPU load, CPU load
