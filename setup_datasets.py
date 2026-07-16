@@ -41,7 +41,7 @@ def setup_coco_val2017() -> None:
         z.extractall(DATASETS_DIR)
 
     # Загрузка изображений
-    img_url = 'http://images.cocodataset.org/val2017/val2017.zip'
+    img_url = 'http://images.cocodataset.org/zips/val2017.zip'
     img_zip = DATASETS_DIR / 'val2017.zip'
     if not img_zip.exists():
         download_file(img_url, img_zip)
