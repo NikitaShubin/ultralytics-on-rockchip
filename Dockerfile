@@ -14,6 +14,5 @@ COPY percept/ percept/
 COPY main.py app.py pipeline.py utils.py detector_frame.py config.py \
     camera_source.py video_loop.py websocket_server.py ./
 COPY templates/ templates/
-COPY model/model.rknn model/postprocess.py /app/model/
 
 CMD ["python3", "main.py"]

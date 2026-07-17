@@ -35,6 +35,36 @@
 - RK3588S с библиотеками NPU: `librknnrt.so`, `librknn_api.so`
 - USB камера (MJPEG) или GigE Vision камера (Basler)
 
+### Предустановка: RKNN Runtime (версия >= 2.3.2)
+
+Конвертер использует `rknn-toolkit2` v2.3.2 — хостовой runtime должен совпадать.
+Проверка текущей версии:
+
+```bash
+strings /usr/lib/librknnrt.so | grep "librknnrt version"
+```
+
+Обновление (требуется root):
+
+```bash
+# Бэкап + замена runtime (librknnrt.so + rknn_server)
+kill $(pgrep rknn_server)
+sudo cp /usr/lib/librknnrt.so /usr/lib/librknnrt.so.bak
+curl -sL -o /tmp/librknnrt.so "https://raw.githubusercontent.com/airockchip/rknn-toolkit2/master/rknpu2/runtime/Linux/librknn_api/aarch64/librknnrt.so"
+curl -sL -o /tmp/rknn_server "https://raw.githubusercontent.com/airockchip/rknn-toolkit2/master/rknpu2/runtime/Linux/rknn_server/aarch64/usr/bin/rknn_server"
+sudo cp /tmp/librknnrt.so /usr/lib/librknnrt.so
+sudo cp /tmp/rknn_server /usr/bin/rknn_server
+sudo chmod +x /usr/bin/rknn_server
+rknn_server &
+```
+
+Откат:
+```bash
+kill $(pgrep rknn_server)
+sudo cp /usr/lib/librknnrt.so.bak /usr/lib/librknnrt.so
+rknn_server &
+```
+
 ## Быстрый старт
 
 ```bash

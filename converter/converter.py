@@ -842,23 +842,19 @@ def cmd_convert(args):
     log("Шаг 4: Генерация postprocess.py")
     postprocess_path = _generate_postprocess(info, ".")
 
-    stem = Path(args.model).stem.replace(".pt", "")
     if args.deploy:
         log("Шаг 5: Развёртывание")
         _deploy(onnx_path, rknn_path, postprocess_path)
     else:
-        # Копировать результаты в директорию model/ (версионированные)
-        for src_ext in [(onnx_path, ".onnx"), (rknn_path, ".rknn")]:
-            src, ext = src_ext
+        for src, name in [(onnx_path, "model.onnx"), (rknn_path, "model.rknn")]:
             if src and os.path.exists(src):
-                dst = MODEL_DIR / f"{stem}_rkopt_o19{ext}"
+                dst = MODEL_DIR / name
                 os.makedirs(MODEL_DIR, exist_ok=True)
                 shutil.copy2(src, str(dst))
                 log(f"Скопировано в {dst}")
 
-    # Всегда копировать версионированный постпроцесс
     if postprocess_path and os.path.exists(postprocess_path):
-        dst = MODEL_DIR / f"{stem}_postprocess.py"
+        dst = MODEL_DIR / "postprocess.py"
         os.makedirs(MODEL_DIR, exist_ok=True)
         shutil.copy2(postprocess_path, str(dst))
         log(f"Постпроцесс скопирован в {dst}")
