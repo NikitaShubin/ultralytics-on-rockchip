@@ -28,6 +28,12 @@ converter/core.*
 # Benchmark temp files (large RKNN conversion artifacts)
 benchmark/temp_models/
 
+# Benchmark data (auto-downloaded by setup_datasets.py)
+benchmark/data/
+
+# Benchmark results and logs
+benchmark/results/
+
 # Active model directory (deployed on device)
 model/
 
@@ -48,3 +54,6 @@ datasets/coco_val2017/
 
 # Overclock binaries
 overclock/*.dtbo
+
+# OpenCode internal
+.opencode/
