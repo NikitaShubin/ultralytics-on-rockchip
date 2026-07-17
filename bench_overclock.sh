@@ -3,22 +3,21 @@
 # Цикл: FPS до (stock) → разгон → FPS после → сравнение.
 #
 # Использование:
-#   ./bench_overclock.sh                          # yolo11n, все бэкенды
+#   ./bench_overclock.sh                          # текущая модель, все бэкенды
 #   ./bench_overclock.sh --model yolo11x-pose     # конкретная модель
 #   ./bench_overclock.sh --model yolo11x-pose --measure 30  # дольше измерение
-#   ./bench_overclock.sh --skip-convert            # без конвертации
+#   ./bench_overclock.sh --revert                 # откат к стоковым частотам
 set -uo pipefail
 cd "$(dirname "$0")"
 
 # ─── Аргументы ─────────────────────────────────────────────────────────────
 
 CONTAINER="percept"
-MODEL="yolo11n"
 TASK="detect"
 WARMUP=10
 MEASURE=20
 QUANTIZE="both"
-SKIP_CONVERT=0
+REVERT=0
 
 OC_DIR="$(dirname "$0")/overclock"
 RESULTS_DIR="$(dirname "$0")/results"
@@ -32,7 +31,21 @@ OC_GPU_STEPS=(400000000 500000000 600000000 700000000 800000000 900000000 100000
 
 FPS_DROP_THRESHOLD=5
 
-SETUP=0
+# Модель: аргумент → env var → yolo11n
+detect_model() {
+    local name_file="${MODEL_DIR:-model}/model_name.txt"
+    if [[ -f "$name_file" ]]; then
+        cat "$name_file" | tr -d '[:space:]'
+        return
+    fi
+    if [[ -n "${MODEL:-}" ]]; then
+        echo "$MODEL"
+        return
+    fi
+    echo "yolo11n"
+}
+
+MODEL=""
 
 for arg in "$@"; do
     case "$arg" in
@@ -41,22 +54,24 @@ for arg in "$@"; do
         --warmup=*)     WARMUP="${arg#--warmup=}" ;;
         --measure=*)    MEASURE="${arg#--measure=}" ;;
         --quantize=*)   QUANTIZE="${arg#--quantize=}" ;;
-        --skip-convert) SKIP_CONVERT=1 ;;
+        --revert)       REVERT=1 ;;
         --setup)        SETUP=1 ;;
         -h|--help)
             echo "Использование: $(basename "$0") [опции]"
             echo ""
-            echo "  --model=NAME      Модель (по умолчанию: yolo11n)"
+            echo "  --model=NAME      Модель (по умолчанию: текущая развёрнутая)"
             echo "  --task=TASK       Задача (detect, pose, seg)"
             echo "  --warmup=SEC      Прогрев (по умолчанию: 10)"
             echo "  --measure=SEC     Измерение (по умолчанию: 20)"
             echo "  --quantize=MODE   none/int8/both (по умолчанию: both)"
-            echo "  --skip-convert    Без конвертации"
+            echo "  --revert          Откат к стоковым частотам"
             echo "  --setup           Установить DTB overlay для разгона + reboot"
             exit 0
             ;;
     esac
 done
+
+MODEL="${MODEL:-$(detect_model)}"
 
 # ─── Утилиты ────────────────────────────────────────────────────────────────
 
@@ -72,32 +87,29 @@ require_docker() {
     docker ps --format '{{.Names}}' | grep -q "^${CONTAINER}$" || die "Контейнер $CONTAINER не запущен"
 }
 
+service_pause() {
+    docker pause "$CONTAINER" 2>/dev/null || true
+}
+
+service_unpause() {
+    docker unpause "$CONTAINER" 2>/dev/null || true
+}
+
 do_setup() {
-    # Проверить, установлен ли уже разгон
     if cat /sys/devices/system/cpu/cpufreq/policy6/scaling_available_frequencies 2>/dev/null | grep -q "2352000"; then
         log "Overclock уже установлен (2352 МГц доступен)"
         return 0
     fi
 
     local env_file="/boot/orangepiEnv.txt"
-    if [[ ! -f "$env_file" ]]; then
-        die "Файл $env_file не найден"
-    fi
-
-    # Проверить, что overlay существует
-    if [[ ! -f "/boot/dtb/rockchip/overlay/rk3588-opi5pro-oc.dtbo" ]]; then
-        die "Overlay /boot/dtb/rockchip/overlay/rk3588-opi5pro-oc.dtbo не найден"
-    fi
+    [[ -f "$env_file" ]] || die "Файл $env_file не найден"
+    [[ -f "/boot/dtb/rockchip/overlay/rk3588-opi5pro-oc.dtbo" ]] || die "Overlay не найден"
 
     log "Установка DTB overlay для разгона..."
-
-    # Добавить overlay в конфиг (через sudo)
     echo 'orangepi' | sudo -S sed -i 's/^overlays=.*/overlays=rk3588-opi5pro-oc/' "$env_file" 2>/dev/null
     if ! grep -q "rk3588-opi5pro-oc" "$env_file" 2>/dev/null; then
         echo 'orangepi' | sudo -S bash -c "echo 'overlays=rk3588-opi5pro-oc' >> $env_file" 2>/dev/null
     fi
-    log "Overlay добавлен в $env_file"
-
     log "Reboot через 3 секунды..."
     sleep 3
     echo 'orangepi' | sudo -S reboot 2>/dev/null
@@ -122,18 +134,6 @@ get_max_temp() {
         [[ $t -gt $max ]] && max=$t
     done
     echo $((max / 1000))
-}
-
-get_cpu_cur_freq() {
-    cat /sys/devices/system/cpu/cpufreq/policy6/scaling_cur_freq 2>/dev/null || echo 0
-}
-
-get_npu_cur_freq() {
-    cat /sys/class/devfreq/fdab0000.npu/cur_freq 2>/dev/null || echo 0
-}
-
-get_gpu_cur_freq() {
-    cat /sys/class/devfreq/fb000000.gpu/cur_freq 2>/dev/null || echo 0
 }
 
 # ─── Управление частотами ───────────────────────────────────────────────────
@@ -178,10 +178,10 @@ restore_governors() {
 
 # ─── Замер FPS ──────────────────────────────────────────────────────────────
 
+# Замер FPS инференса (файлы с диска, воспроизводимо) — через pause/unpause
 FPS_CMD="python3 /app/benchmark/fps_bench.py $MODEL $TASK --temp-dir /app/benchmark/temp_models/$MODEL --data-dir /app/coco_val2017/images/val2017 --warmup $WARMUP --measure $MEASURE"
 
-measure_fps_all() {
-    # Возвращает JSON с FPS для всех бэкендов
+measure_fps_inference() {
     local quantize_flag=""
     case "$QUANTIZE" in
         none) quantize_flag="--quantize none" ;;
@@ -189,8 +189,11 @@ measure_fps_all() {
         both) quantize_flag="--quantize both" ;;
     esac
 
+    service_pause
     local result
     result=$(docker exec "$CONTAINER" $FPS_CMD $quantize_flag 2>/dev/null | grep -E '^\{' | tail -1)
+    service_unpause
+
     if [[ -z "$result" ]]; then
         echo '{"cpu":{"fps":0},"npu_none":{"fps":0},"npu_int8":{"fps":0}}'
         return
@@ -198,8 +201,18 @@ measure_fps_all() {
     echo "$result"
 }
 
+# Замер FPS камеры (реальная работа сервиса) — через curl
+measure_fps_camera() {
+    local result
+    result=$(curl -s --max-time 5 http://localhost:5000/objects 2>/dev/null)
+    if [[ -z "$result" ]]; then
+        echo "0"
+        return
+    fi
+    echo "$result" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('fps',0))" 2>/dev/null || echo "0"
+}
+
 parse_fps() {
-    # $1 = JSON, $2 = ключ (cpu, npu_none, npu_int8)
     echo "$1" | python3 -c "
 import sys,json
 d=json.load(sys.stdin)
@@ -252,24 +265,19 @@ filter_freqs() {
 
 write_csv_header() {
     mkdir -p "$RESULTS_DIR"
-    echo "phase,component,freq_mhz,fps_cpu,fps_npu_fp32,fps_npu_int8,temp_c,timestamp" > "$CSV_FILE"
+    echo "phase,component,freq_mhz,camera_fps,fps_cpu,fps_npu_fp32,fps_npu_int8,temp_c,timestamp" > "$CSV_FILE"
 }
 
 write_csv_row() {
-    local phase=$1 component=$2 freq=$3 fps_cpu=$4 fps_fp32=$5 fps_int8=$6 temp=$7
+    local phase=$1 component=$2 freq=$3 cam_fps=$4 fps_cpu=$5 fps_fp32=$6 fps_int8=$7 temp=$8
     local mhz
     mhz=$(freq_to_mhz "$freq")
-    echo "$phase,$component,$mhz,$fps_cpu,$fps_fp32,$fps_int8,$temp,$(date '+%H:%M:%S')" >> "$CSV_FILE"
+    echo "$phase,$component,$mhz,$cam_fps,$fps_cpu,$fps_fp32,$fps_int8,$temp,$(date '+%H:%M:%S')" >> "$CSV_FILE"
 }
 
 # ─── Конвертация ────────────────────────────────────────────────────────────
 
 do_convert() {
-    if [[ $SKIP_CONVERT -eq 1 ]]; then
-        log "Пропуск конвертации (--skip-convert)"
-        return 0
-    fi
-
     local temp_dir="benchmark/temp_models/$MODEL"
     local rknn_none="$temp_dir/${MODEL}_none.rknn"
     local rknn_int8="$temp_dir/${MODEL}_int8.rknn"
@@ -289,14 +297,14 @@ do_convert() {
     log "Конвертация завершена"
 }
 
-# ─── Замер всех FPS ─────────────────────────────────────────────────────────
+# ─── Замер всех FPS (инференс, воспроизводимо) ──────────────────────────────
 
-benchmark_all() {
+benchmark_inference() {
     local label=$1
-    log "Бенчмарк FPS ($label)..."
+    log "Инференс FPS ($label)..."
 
     local json
-    json=$(measure_fps_all)
+    json=$(measure_fps_inference)
 
     local fps_cpu fps_fp32 fps_int8
     fps_cpu=$(parse_fps "$json" "cpu")
@@ -330,7 +338,7 @@ test_freq() {
     sleep 2
 
     local json
-    json=$(measure_fps_all)
+    json=$(measure_fps_inference)
 
     local fps_cpu fps_fp32 fps_int8 temp
     fps_cpu=$(parse_fps "$json" "cpu")
@@ -347,18 +355,38 @@ test_freq() {
         echo "PASS $fps_cpu $fps_fp32 $fps_int8"
         printf "  %5s МГц: FP32=%s FPS (%s) CPU=%s INT8=%s  %3d°C  ✓\n" \
             "$mhz" "$fps_fp32" "$gain" "$fps_cpu" "$fps_int8" "$temp" >&2
-        write_csv_row "test" "$component" "$freq" "$fps_cpu" "$fps_fp32" "$fps_int8" "$temp"
+        write_csv_row "test" "$component" "$freq" "-" "$fps_cpu" "$fps_fp32" "$fps_int8" "$temp"
     else
         local drop
         drop=$(python3 -c "b=$baseline_fp32; c=$fps_fp32; print(f'{(c-b)/b*100:+.1f}%' if b>0 else '?')" 2>/dev/null)
         echo "FAIL $fps_cpu $fps_fp32 $fps_int8"
         printf "  %5s МГц: FP32=%s FPS (%s) CPU=%s INT8=%s  %3d°C  ✗ НЕСТАБИЛЬНО\n" \
             "$mhz" "$fps_fp32" "$drop" "$fps_cpu" "$fps_int8" "$temp" >&2
-        write_csv_row "test_fail" "$component" "$freq" "$fps_cpu" "$fps_fp32" "$fps_int8" "$temp"
+        write_csv_row "test_fail" "$component" "$freq" "-" "$fps_cpu" "$fps_fp32" "$fps_int8" "$temp"
     fi
 }
 
+# ─── ОТКАТ ──────────────────────────────────────────────────────────────────
+
+cmd_revert() {
+    echo "══════════════════════════════════════════════════════════════"
+    echo "  ОТКАТ К СТОКОВЫМ ЧАСТОТАМ"
+    echo "══════════════════════════════════════════════════════════════"
+    restore_governors
+    log "Governors восстановлены (ondemand)"
+    echo "  CPU6: $(cat /sys/devices/system/cpu/cpufreq/policy6/scaling_cur_freq) kHz"
+    echo "  NPU:  $(cat /sys/class/devfreq/fdab0000.npu/cur_freq) Hz"
+    echo "  GPU:  $(cat /sys/class/devfreq/fb000000.gpu/cur_freq) Hz"
+    echo "══════════════════════════════════════════════════════════════"
+}
+
 # ─── ОСНОВНАЯ ПРОГРАММА ─────────────────────────────────────────────────────
+
+# Откат по флагу
+if [[ $REVERT -eq 1 ]]; then
+    cmd_revert
+    exit 0
+fi
 
 echo "══════════════════════════════════════════════════════════════"
 echo "  БЕНЧМАРК С РАЗГОНОМ: $MODEL ($TASK)"
@@ -369,7 +397,7 @@ echo ""
 require_docker
 
 # Setup
-if [[ $SETUP -eq 1 ]]; then
+if [[ ${SETUP:-0} -eq 1 ]]; then
     do_setup
     exit 0
 fi
@@ -399,9 +427,14 @@ echo "── FPS ДО (stock ondemand) ──"
 restore_governors
 sleep 2
 
-BEFORE=$(benchmark_all "STOCK")
+# Камерный FPS (реальная работа сервиса)
+CAMERA_BEFORE=$(measure_fps_camera)
+log "  Камерный FPS: $CAMERA_BEFORE"
+
+# Инференс FPS (воспроизводимо, pause/unpause)
+BEFORE=$(benchmark_inference "STOCK")
 read -r BEFORE_CPU BEFORE_FP32 BEFORE_INT8 BEFORE_TEMP <<< "$BEFORE"
-write_csv_row "before" "stock" "0" "$BEFORE_CPU" "$BEFORE_FP32" "$BEFORE_INT8" "$BEFORE_TEMP"
+write_csv_row "before" "stock" "0" "$CAMERA_BEFORE" "$BEFORE_CPU" "$BEFORE_FP32" "$BEFORE_INT8" "$BEFORE_TEMP"
 echo ""
 
 # ═══════════════════════════════════════════════════════════════════
@@ -422,8 +455,6 @@ if [[ ${#AVAIL_CPU[@]} -gt 0 ]]; then
             break
         fi
     done
-    restore_governors
-    sleep 1
     echo ""
 fi
 
@@ -451,8 +482,6 @@ if [[ ${#AVAIL_NPU[@]} -gt 0 ]]; then
             break
         fi
     done
-    restore_governors
-    sleep 1
     echo ""
 fi
 
@@ -469,16 +498,14 @@ if [[ ${#AVAIL_GPU[@]} -gt 0 ]]; then
         temp=$(get_max_temp)
         mhz=$(freq_to_mhz "$freq")
         printf "  %5s МГц:  %3d°C  (GPU не влияет на FPS YOLO)\n" "$mhz" "$temp"
-        write_csv_row "test_gpu" "gpu" "$freq" "-" "-" "-" "$temp"
+        write_csv_row "test_gpu" "gpu" "$freq" "-" "-" "-" "-" "$temp"
         BEST_GPU_FREQ=$freq
     done
-    restore_governors
-    sleep 1
     echo ""
 fi
 
 # ═══════════════════════════════════════════════════════════════════
-# ЭТАП 5: FPS ПОСЛЕ (разгон)
+# ЭТАП 5: FPS ПОСЛЕ (разгон) — разгон оставлен включённым
 # ═══════════════════════════════════════════════════════════════════
 echo "── Установка разогнанных частот ──"
 if [[ $BEST_CPU_FREQ -gt 0 ]]; then
@@ -497,19 +524,19 @@ sleep 3
 
 echo ""
 echo "── FPS ПОСЛЕ (разгон) ──"
-AFTER=$(benchmark_all "OVERCLOCK")
+
+# Камерный FPS (реальная работа сервиса с разогнанным железом)
+CAMERA_AFTER=$(measure_fps_camera)
+log "  Камерный FPS: $CAMERA_AFTER"
+
+# Инференс FPS (воспроизводимо, pause/unpause)
+AFTER=$(benchmark_inference "OVERCLOCK")
 read -r AFTER_CPU AFTER_FP32 AFTER_INT8 AFTER_TEMP <<< "$AFTER"
-write_csv_row "after" "oc" "0" "$AFTER_CPU" "$AFTER_FP32" "$AFTER_INT8" "$AFTER_TEMP"
+write_csv_row "after" "oc" "0" "$CAMERA_AFTER" "$AFTER_CPU" "$AFTER_FP32" "$AFTER_INT8" "$AFTER_TEMP"
 echo ""
 
 # ═══════════════════════════════════════════════════════════════════
-# ЭТАП 6: Восстановление
-# ═══════════════════════════════════════════════════════════════════
-restore_governors
-log "Governors восстановлены (ondemand)"
-
-# ═══════════════════════════════════════════════════════════════════
-# ЭТАП 7: Итоговая таблица
+# ЭТАП 6: Итоговая таблица
 # ═══════════════════════════════════════════════════════════════════
 echo ""
 echo "══════════════════════════════════════════════════════════════"
@@ -521,11 +548,19 @@ echo "  Разгон:"
 [[ $BEST_NPU_FREQ -gt 0 ]] && echo "    NPU: $(freq_to_mhz "$BEST_NPU_FREQ") МГц" || echo "    NPU: сток"
 [[ $BEST_GPU_FREQ -gt 0 ]] && echo "    GPU: $(freq_to_mhz "$BEST_GPU_FREQ") МГц" || echo "    GPU: сток"
 echo ""
+
+# Камерный FPS
+gain_cam=$(python3 -c "
+b=$CAMERA_BEFORE; a=$CAMERA_AFTER
+if b > 0: print(f'{(a-b)/b*100:+.1f}%')
+else: print('—')
+" 2>/dev/null)
 echo "  ┌─────────────┬──────────┬──────────┬──────────┐"
-echo "  │ Бэкенд      │ ДО       │ ПОСЛЕ    │ Прирост  │"
+printf "  │ Камера      │ %7s  │ %7s  │ %7s  │\n" "$CAMERA_BEFORE" "$CAMERA_AFTER" "$gain_cam"
+
+# Инференс FPS
 echo "  ├─────────────┼──────────┼──────────┼──────────┤"
 
-# CPU
 gain_cpu=$(python3 -c "
 b=$BEFORE_CPU; a=$AFTER_CPU
 if b > 0: print(f'{(a-b)/b*100:+.1f}%')
@@ -533,7 +568,6 @@ else: print('—')
 " 2>/dev/null)
 printf "  │ CPU ONNX    │ %7s  │ %7s  │ %7s  │\n" "$BEFORE_CPU" "$AFTER_CPU" "$gain_cpu"
 
-# NPU FP32
 gain_fp32=$(python3 -c "
 b=$BEFORE_FP32; a=$AFTER_FP32
 if b > 0: print(f'{(a-b)/b*100:+.1f}%')
@@ -541,7 +575,6 @@ else: print('—')
 " 2>/dev/null)
 printf "  │ NPU FP32    │ %7s  │ %7s  │ %7s  │\n" "$BEFORE_FP32" "$AFTER_FP32" "$gain_fp32"
 
-# NPU INT8
 gain_int8=$(python3 -c "
 b=$BEFORE_INT8; a=$AFTER_INT8
 if b > 0: print(f'{(a-b)/b*100:+.1f}%')
@@ -553,4 +586,7 @@ echo "  └─────────────┴─────────
 echo ""
 echo "  Температура: ${BEFORE_TEMP}°C → ${AFTER_TEMP}°C"
 echo "  CSV: $CSV_FILE"
+echo ""
+echo "  Разгон ОСТАВЛЁН включённым."
+echo "  Для отката: ./bench_overclock.sh --revert"
 echo "══════════════════════════════════════════════════════════════"

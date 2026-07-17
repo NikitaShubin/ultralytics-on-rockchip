@@ -11,11 +11,25 @@ set -uo pipefail
 cd "$(dirname "$0")"
 
 CONTAINER="percept"
-MODEL="yolo11n"
 TASK="detect"
 OC_DTB="/boot/dtb/rockchip/rk3588s-orangepi-5-pro.dtb"
 OC_DTB_BAK="/boot/dtb/rockchip/rk3588s-orangepi-5-pro.dtb.bak"
 OC_DTS="/tmp/oc_base.dts"
+
+# Модель: аргумент → env var → текущая развёрнутая → yolo11n
+detect_model() {
+    local name_file="${MODEL_DIR:-model}/model_name.txt"
+    if [[ -f "$name_file" ]]; then
+        cat "$name_file" | tr -d '[:space:]'
+        return
+    fi
+    if [[ -n "${MODEL:-}" ]]; then
+        echo "$MODEL"
+        return
+    fi
+    echo "yolo11n"
+}
+MODEL="${MODEL:-$(detect_model)}"
 
 FPS_CMD="python3 /app/benchmark/fps_bench.py $MODEL $TASK --temp-dir /app/model --data-dir /app/coco_val2017/images/val2017 --warmup 10 --measure 20 --quantize none"
 
@@ -41,7 +55,11 @@ is_oc_installed() {
 }
 
 measure_fps() {
-    docker exec "$CONTAINER" $FPS_CMD 2>/dev/null | grep '^\{' | python3 -c "import sys,json; d=json.load(sys.stdin); print(f'{d.get(\"npu_none\",{}).get(\"fps\",0):.2f}')" 2>/dev/null || echo "0"
+    docker pause "$CONTAINER" 2>/dev/null || true
+    local result
+    result=$(docker exec "$CONTAINER" $FPS_CMD 2>/dev/null | grep '^\{')
+    docker unpause "$CONTAINER" 2>/dev/null || true
+    echo "$result" | python3 -c "import sys,json; d=json.load(sys.stdin); print(f'{d.get(\"npu_none\",{}).get(\"fps\",0):.2f}')" 2>/dev/null || echo "0"
 }
 
 freq_to_mhz() {
