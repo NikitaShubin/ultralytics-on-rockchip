@@ -520,33 +520,49 @@ watch -n 1 'cat /sys/kernel/debug/rknpu/load'
 - CPU%: расчёт через дельту `/proc/stat` (файл-состояние для обхода subshell)
 - NPU: до 100% загрузки (3 ядра × 8 потоков, yolo26x-seg 66 МБ)
 
-### Разгон (`oc_manager.sh`, `oc_test.sh`)
-Менеджер разгона с проверкой стабильности по FPS. Автоматически определяет нестабильность и откатывает.
+### Разгон (`bench_overclock.sh`, `oc_manager.sh`, `oc_test.sh`)
+
+Менеджер разгона с проверкой стабильности по FPS. Автоматически определяет нестабильность.
+
+#### Первый запуск (установка OC DTB overlay, разблокировка 2352/2400 МГц):
 
 ```bash
-# Состояние разгона
-./oc_manager.sh status
+./bench_overclock.sh --setup          # модификация DTB + reboot (однократно)
+```
 
-# FPS на разных частотах (сравнение)
-./oc_test.sh --compare
+#### Бенчмарк с разгоном:
 
-# Тест всех частот + поиск макс. стабильной
-./oc_manager.sh test
+```bash
+./bench_overclock.sh                              # текущая модель
+./bench_overclock.sh --model yolo11x-pose         # конкретная модель
+./bench_overclock.sh --measure 30                 # дольше измерение (по умолчанию 20с)
+./bench_overclock.sh --quantize int8              # только INT8
+```
 
-# Быстрый тест (остановка на первом FAIL)
-./oc_manager.sh test --quick
+#### Откат к стоковым частотам:
 
-# Применить сохранённую конфигурацию
-./oc_manager.sh apply
+```bash
+./bench_overclock.sh --revert
+```
 
-# Откат к стоковым частотам
-./oc_manager.sh revert
+#### Два типа FPS-замеров:
 
-# Установить конкретные частоты
-./oc_manager.sh set cpu=2400000 npu=1000000000 gpu=800000000
+- **Camera FPS** — реальная работа сервиса с камеры ( замер до и после разгона)
+- **Inference FPS** — воспроизводимый замер с файлами с диска ( замеры между частотами, `pause/unpause` сервиса)
 
-# Мониторинг + автооткат при нестабильности
-./oc_manager.sh monitor
+Сервис НЕ останавливается — на время inference-замеров делается `docker pause/unpause`.
+
+#### Управление разгоном:
+
+```bash
+./oc_manager.sh status              # текущее состояние
+./oc_manager.sh test                # тест всех частот + поиск макс. стабильной
+./oc_manager.sh test --quick        # быстрый тест (стоп на первом FAIL)
+./oc_manager.sh apply               # применить сохранённую конфигурацию
+./oc_manager.sh revert              # откат к стоковым частотам
+./oc_manager.sh set cpu=2400 npu=1000 gpu=800  # установить конкретные частоты
+./oc_manager.sh monitor             # мониторинг + автооткат при нестабильности
+./oc_test.sh --compare              # FPS на всех частотах (до и после DTB OC)
 ```
 
 **Результаты (Orange Pi 5 Pro, RK3588S, yolo11n detect):**
@@ -579,12 +595,8 @@ watch -n 1 'cat /sys/kernel/debug/rknpu/load'
 - Замеряет FPS на стоковых частотах
 - Устанавливает каждую частоту, замеряет FPS
 - Если FPS падает >5% от baseline — считается нестабильным
-- При 3 подряд падениях — автооткат governors
+- Разгон оставляется включённым после бенчмарка (откат через `--revert`)
 
-**Установка OC DTB (разблокировка 2352/2400 МГц):**
-```bash
-./oc_test.sh --oc-setup   # модификация DTB + перезагрузка
-```
 **Откат DTB:**
 ```bash
 sudo cp /boot/dtb/rockchip/rk3588s-orangepi-5-pro.dtb.bak \
