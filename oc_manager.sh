@@ -12,10 +12,10 @@
 set -uo pipefail
 cd "$(dirname "$0")"
 
-CONTAINER="webcam-webcam-1"
+CONTAINER="percept"
 MODEL="yolo11n"
 TASK="detect"
-OC_DIR="/home/orangepi/work/webcam/overclock"
+OC_DIR="$(dirname "$0")/overclock"
 OC_STATE="$OC_DIR/oc_state.conf"
 OC_DTB="/boot/dtb/rockchip/rk3588s-orangepi-5-pro.dtb"
 OC_DTB_BAK="/boot/dtb/rockchip/rk3588s-orangepi-5-pro.dtb.bak"

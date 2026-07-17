@@ -10,7 +10,7 @@
 set -uo pipefail
 cd "$(dirname "$0")"
 
-CONTAINER="webcam-webcam-1"
+CONTAINER="percept"
 MODEL="yolo11n"
 TASK="detect"
 OC_DTB="/boot/dtb/rockchip/rk3588s-orangepi-5-pro.dtb"

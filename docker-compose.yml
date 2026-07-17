@@ -1,5 +1,6 @@
 services:
   percept:
+    container_name: percept
     build: .
     network_mode: host
     devices:

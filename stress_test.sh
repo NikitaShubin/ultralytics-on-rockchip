@@ -923,15 +923,15 @@ while True:
     time.sleep(60)
 PYEOF
     # Копируем скрипт в контейнер
-    docker cp "$host_script" webcam-webcam-1:"$NPU_CONTAINER_SCRIPT" 2>/dev/null
+    docker cp "$host_script" percept:"$NPU_CONTAINER_SCRIPT" 2>/dev/null
     rm -f "$host_script"
     # Маппинг модели: хост → Docker (/app/model/)
     local docker_model="/app/model/$(basename "$MODEL_PATH")"
     # Остановить предыдущий NPU stress в контейнере (если есть)
-    docker exec webcam-webcam-1 pkill -f "npu_stress_oc" 2>/dev/null || true
+    docker exec percept pkill -f "npu_stress_oc" 2>/dev/null || true
     sleep 1
     # Запуск через docker exec в фоне (хост PID = docker exec процесс)
-    docker exec webcam-webcam-1 python3 "$NPU_CONTAINER_SCRIPT" "$docker_model" "$NPU_CORES" "$NPU_STREAMS" > /dev/null 2>&1 &
+    docker exec percept python3 "$NPU_CONTAINER_SCRIPT" "$docker_model" "$NPU_CORES" "$NPU_STREAMS" > /dev/null 2>&1 &
     NPU_PID=$!
     echo "[NPU] ядра=$NPU_CORES × $NPU_STREAMS потоков модель=$(basename "$MODEL_PATH") (PID $NPU_PID)"
 }
