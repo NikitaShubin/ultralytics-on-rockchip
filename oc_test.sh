@@ -11,6 +11,10 @@ set -uo pipefail
 cd "$(dirname "$0")"
 
 CONTAINER="percept"
+
+require_root() {
+    [[ $EUID -ne 0 ]] && { echo "[ОШИБКА] Запустите через: sudo $0 $*"; exit 1; }
+}
 TASK="detect"
 OC_DTB="/boot/dtb/rockchip/rk3588s-orangepi-5-pro.dtb"
 OC_DTB_BAK="/boot/dtb/rockchip/rk3588s-orangepi-5-pro.dtb.bak"
@@ -55,10 +59,8 @@ is_oc_installed() {
 }
 
 measure_fps() {
-    docker pause "$CONTAINER" 2>/dev/null || true
     local result
     result=$(docker exec "$CONTAINER" $FPS_CMD 2>/dev/null | grep '^\{')
-    docker unpause "$CONTAINER" 2>/dev/null || true
     echo "$result" | python3 -c "import sys,json; d=json.load(sys.stdin); print(f'{d.get(\"npu_none\",{}).get(\"fps\",0):.2f}')" 2>/dev/null || echo "0"
 }
 
@@ -85,6 +87,8 @@ if [[ $FPS_ONLY -eq 1 ]]; then
     exit 0
 fi
 
+require_root "$@"
+
 # ─── Только OC DTB ───────────────────────────────────────────────────────────
 
 apply_oc_dtb() {
@@ -92,7 +96,11 @@ apply_oc_dtb() {
         echo "[OK] OC DTB уже установлен"
         return 0
     fi
-    [[ -f "$OC_DTB_BAK" ]] || { echo "[ОШИБКА] Бэкап не найден"; exit 1; }
+    [[ -f "$OC_DTB" ]] || { echo "[ОШИБКА] DTB не найден: $OC_DTB"; exit 1; }
+    if [[ ! -f "$OC_DTB_BAK" ]]; then
+        echo "  Создание бэкапа DTB..."
+        cp "$OC_DTB" "$OC_DTB_BAK"
+    fi
 
     echo "  Декомпиляция DTB..."
     dtc -I dtb -O dts -o "$OC_DTS" "$OC_DTB" 2>/dev/null
@@ -128,7 +136,7 @@ apply_oc_dtb() {
     dtc -I dts -O dtb -o /tmp/oc_new.dtb "$OC_DTS" 2>/dev/null
     [[ -s /tmp/oc_new.dtb ]] || { echo "[ОШИБКА] Компиляция failed"; exit 1; }
 
-    echo 'orangepi' | sudo -S cp /tmp/oc_new.dtb "$OC_DTB"
+    cp /tmp/oc_new.dtb "$OC_DTB"
     echo "[OK] OC DTB установлен"
 }
 
@@ -139,7 +147,7 @@ if [[ $OC_SETUP_ONLY -eq 1 ]]; then
     apply_oc_dtb
     echo "  Перезагрузка через 5 сек..."
     sleep 5
-    echo 'orangepi' | sudo -S reboot
+    reboot
     exit 0
 fi
 
@@ -150,10 +158,8 @@ if [[ $COMPARE -eq 1 ]]; then
     echo "  СРАВНЕНИЕ FPS НА РАЗНЫХ ЧАСТОТАХ"
     echo "════════════════════════════════════════════════════════"
     echo "  Базовый FPS (все на ondemand)..."
-    echo 'orangepi' | sudo -S bash -c '
-        for p in /sys/devices/system/cpu/cpufreq/policy{0,4,6}; do echo ondemand > "$p/scaling_governor"; done
-        echo rknpu_ondemand > /sys/class/devfreq/fdab0000.npu/governor
-    ' 2>/dev/null
+    for p in /sys/devices/system/cpu/cpufreq/policy{0,4,6}; do echo ondemand > "$p/scaling_governor"; done
+    echo rknpu_ondemand > /sys/class/devfreq/fdab0000.npu/governor
     sleep 2
     baseline=$(measure_fps)
     echo "  Baseline: $baseline FPS"
@@ -162,11 +168,9 @@ if [[ $COMPARE -eq 1 ]]; then
     echo "  CPU разгон (NPU на ondemand):"
     for freq in 2208000 2256000 2304000 2352000 2400000; do
         cat /sys/devices/system/cpu/cpufreq/policy6/scaling_available_frequencies 2>/dev/null | grep -q "$freq" || continue
-        echo 'orangepi' | sudo -S bash -c "
-            for p in /sys/devices/system/cpu/cpufreq/policy{4,6}; do
-                echo userspace > \$p/scaling_governor; echo $freq > \$p/scaling_setspeed
-            done
-        " 2>/dev/null
+        for p in /sys/devices/system/cpu/cpufreq/policy{4,6}; do
+            echo userspace > "$p/scaling_governor"; echo "$freq" > "$p/scaling_setspeed"
+        done
         sleep 1
         fps=$(measure_fps)
         mhz=$(freq_to_mhz "$freq")
@@ -176,15 +180,11 @@ if [[ $COMPARE -eq 1 ]]; then
 
     echo ""
     echo "  NPU разгон (CPU на ondemand):"
-    echo 'orangepi' | sudo -S bash -c '
-        for p in /sys/devices/system/cpu/cpufreq/policy{0,4,6}; do echo ondemand > "$p/scaling_governor"; done
-    ' 2>/dev/null
+    for p in /sys/devices/system/cpu/cpufreq/policy{0,4,6}; do echo ondemand > "$p/scaling_governor"; done
     for freq in 600000000 700000000 800000000 900000000 1000000000 1050000000 1100000000; do
-        echo 'orangepi' | sudo -S bash -c "
-            echo userspace > /sys/class/devfreq/fdab0000.npu/governor
-            echo $freq > /sys/class/devfreq/fdab0000.npu/min_freq
-            echo $freq > /sys/class/devfreq/fdab0000.npu/max_freq
-        " 2>/dev/null
+        echo userspace > /sys/class/devfreq/fdab0000.npu/governor
+        echo "$freq" > /sys/class/devfreq/fdab0000.npu/min_freq
+        echo "$freq" > /sys/class/devfreq/fdab0000.npu/max_freq
         sleep 1
         fps=$(measure_fps)
         mhz=$(freq_to_mhz "$freq")
@@ -192,10 +192,8 @@ if [[ $COMPARE -eq 1 ]]; then
         printf "    %5s МГц: %s FPS (%s)\n" "$mhz" "$fps" "$drop"
     done
 
-    echo 'orangepi' | sudo -S bash -c '
-        echo rknpu_ondemand > /sys/class/devfreq/fdab0000.npu/governor
-        for p in /sys/devices/system/cpu/cpufreq/policy{0,4,6}; do echo ondemand > "$p/scaling_governor"; done
-    ' 2>/dev/null
+    echo rknpu_ondemand > /sys/class/devfreq/fdab0000.npu/governor
+    for p in /sys/devices/system/cpu/cpufreq/policy{0,4,6}; do echo ondemand > "$p/scaling_governor"; done
     echo ""
     echo "════════════════════════════════════════════════════════"
     exit 0
@@ -225,4 +223,4 @@ echo "    sudo ./oc_test.sh --fps-only"
 echo "    sudo ./oc_test.sh --compare"
 echo "════════════════════════════════════════════════════════"
 sleep 5
-echo 'orangepi' | sudo -S reboot
+reboot

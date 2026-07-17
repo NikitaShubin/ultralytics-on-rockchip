@@ -27,7 +27,7 @@ CPU_ONLY=0
 NO_RAM=0
 NPU_CORES="0,1,2"
 NPU_STREAMS=1
-MODEL="model/yolo26x-seg.rknn"
+MODEL="model/model.rknn"
 INTERVAL=2
 LOG_FILE=""
 RAM_MB=1024
@@ -49,7 +49,7 @@ usage() {
   -d, --duration SEC     Длительность в секундах (0 = до Ctrl+C, по умолчанию)
   -c, --npu-cores LIST   NPU ядра через запятую (по умолчанию: 0,1,2)
   -s, --npu-streams N    Потоков инференса на ядро (по умолчанию: 8)
-  -m, --model FILE       RKNN модель (по умолчанию: model/yolo26x-seg.rknn)
+  -m, --model FILE       RKNN модель (по умолчанию: model/model.rknn)
   -i, --interval SEC     Интервал мониторинга (по умолчанию: 2)
   -l, --log FILE         CSV лог результатов
   --npu-only             Только NPU
@@ -504,11 +504,14 @@ monitor_step() {
         ts=$(date +%H:%M:%S)
         local cpu_pct; cpu_pct=$(read_cpu_load)
         local npu_pct; npu_pct=$(npu_load_avg)
-        local npu_cores; npu_cores=$(read_npu_load_cores)
-        local temps; temps=$(get_temps)
 
-        printf "  %-9s %4s%% %4s%%  %-24s  %s\n" \
-            "$ts" "$cpu_pct" "$npu_pct" "$npu_cores" "$temps"
+        printf "  %-8s %4s%% %4s%%" "$ts" "$cpu_pct" "$npu_pct"
+        for f in "${THERMAL_FILES[@]}"; do
+            local raw
+            raw=$(cat "$f" 2>/dev/null || echo "0")
+            printf " %4s" "$((raw / 1000))"
+        done
+        echo ""
     done
 }
 
@@ -698,13 +701,30 @@ overclock_loop() {
 
 declare -a THERMAL_NAMES=()
 declare -a THERMAL_FILES=()
+declare -a THERMAL_SHORT=()
+
+thermal_short_name() {
+    case "$1" in
+        soc-thermal)        echo "SOC" ;;
+        bigcore0-thermal)   echo "BIG0" ;;
+        bigcore1-thermal)   echo "BIG1" ;;
+        littlecore-thermal) echo "LIT" ;;
+        center-thermal)     echo "CTR" ;;
+        gpu-thermal)        echo "GPU" ;;
+        npu-thermal)        echo "NPU" ;;
+        *) echo "${1%%-thermal}" | cut -c1-5 ;;
+    esac
+}
 
 init_thermal() {
     local i=0
     for zone_dir in /sys/class/thermal/thermal_zone*; do
         [[ -f "$zone_dir/type" && -f "$zone_dir/temp" ]] || continue
-        THERMAL_NAMES[$i]=$(cat "$zone_dir/type")
+        local name
+        name=$(cat "$zone_dir/type")
+        THERMAL_NAMES[$i]="$name"
         THERMAL_FILES[$i]="$zone_dir/temp"
+        THERMAL_SHORT[$i]=$(thermal_short_name "$name")
         ((i++))
     done
 }
@@ -777,24 +797,32 @@ read_npu_load_cores() {
 npu_load_avg() {
     local raw
     raw=$(read_npu_load_cores)
-    if [[ -z "$raw" ]]; then
-        echo 0
-        return
-    fi
-    local sum=0 cnt=0
-    for token in $raw; do
-        local v="${token#*=}"
-        v="${v%%%}"
-        if [[ "$v" =~ ^[0-9]+$ ]]; then
-            sum=$((sum + v))
-            cnt=$((cnt + 1))
+    if [[ -n "$raw" ]]; then
+        local sum=0 cnt=0
+        for token in $raw; do
+            local v="${token#*=}"
+            v="${v%%%}"
+            if [[ "$v" =~ ^[0-9]+$ ]]; then
+                sum=$((sum + v))
+                cnt=$((cnt + 1))
+            fi
+        done
+        if [[ $cnt -gt 0 ]]; then
+            echo $((sum / cnt))
+            return
         fi
-    done
-    if [[ $cnt -gt 0 ]]; then
-        echo $((sum / cnt))
-    else
-        echo 0
     fi
+    # Fallback: /sys/class/devfreq (формат "100@1000000000Hz")
+    local devfreq
+    devfreq=$(cat /sys/class/devfreq/fdab0000.npu/load 2>/dev/null || echo "")
+    if [[ -n "$devfreq" ]]; then
+        local pct="${devfreq%%@*}"
+        if [[ "$pct" =~ ^[0-9]+$ ]]; then
+            echo "$pct"
+            return
+        fi
+    fi
+    echo 0
 }
 
 # ─── RAM ────────────────────────────────────────────────────────────────────
@@ -811,6 +839,23 @@ NPU_SCRIPT=""
 STOP=0
 CLEANUP_DONE=0
 
+kill_npu_stress_in_container() {
+    # Контейнер не содержит pkill/kill — используем Python для поиска и убийства процессов
+    docker exec percept python3 -c "
+import os, signal, glob
+for f in glob.glob('/proc/[0-9]*/cmdline'):
+    try:
+        pid = int(f.split('/')[2])
+        if pid <= 1:
+            continue
+        cmd = open(f, 'rb').read().decode('utf-8', errors='replace')
+        if 'npu_stress' in cmd:
+            os.kill(pid, signal.SIGKILL)
+    except (OSError, ValueError, PermissionError):
+        pass
+" 2>/dev/null || true
+}
+
 cleanup() {
     [[ $CLEANUP_DONE -eq 1 ]] && return
     CLEANUP_DONE=1
@@ -825,14 +870,10 @@ cleanup() {
     pkill -f 'stress --cpu' 2>/dev/null || true
     pkill -f 'stress --vm' 2>/dev/null || true
 
-    # Остановить NPU Python процесс (SIGTERM → 3с → SIGKILL)
+    # Убить NPU Python процессы внутри контейнера (pkill недоступен → Python)
+    kill_npu_stress_in_container
+    # Также убить хост-процесс docker exec (если ещё жив)
     if [[ -n "$NPU_PID" ]] && kill -0 "$NPU_PID" 2>/dev/null; then
-        kill -TERM "$NPU_PID" 2>/dev/null || true
-        local waited=0
-        while kill -0 "$NPU_PID" 2>/dev/null && [[ $waited -lt 3 ]]; do
-            sleep 1
-            waited=$((waited + 1))
-        done
         kill -9 "$NPU_PID" 2>/dev/null || true
     fi
 
@@ -928,7 +969,7 @@ PYEOF
     # Маппинг модели: хост → Docker (/app/model/)
     local docker_model="/app/model/$(basename "$MODEL_PATH")"
     # Остановить предыдущий NPU stress в контейнере (если есть)
-    docker exec percept pkill -f "npu_stress_oc" 2>/dev/null || true
+    kill_npu_stress_in_container
     sleep 1
     # Запуск через docker exec в фоне (хост PID = docker exec процесс)
     docker exec percept python3 "$NPU_CONTAINER_SCRIPT" "$docker_model" "$NPU_CORES" "$NPU_STREAMS" > /dev/null 2>&1 &
@@ -941,13 +982,17 @@ PYEOF
 monitor() {
     local elapsed=0
 
-    [[ -n "$LOG_FILE" ]] && echo "time,elapsed,cpu%,npu%,npu_cores,ram_used_mb,temps" > "$LOG_FILE"
+    [[ -n "$LOG_FILE" ]] && echo "time,elapsed,cpu%,npu%,ram_used_mb,temps" > "$LOG_FILE"
 
-    printf "%-9s %5s %5s  %-24s %7s  %s\n" \
-        "ВРЕМЯ" "CPU%" "NPU%" "NPU_LOAD" "RAM_МБ" "ТЕМПЕРАТУРЫ"
-    printf "%-9s %5s %5s  %-24s %7s  %s\n" \
-        "" "/proc" "/sys" "(C0=XX% C1=XX% C2=XX%)" "(used)" "(big/little/npu/soc)"
-    echo "──────────────────────────────────────────────────────────────────────────────────────"
+    # Заголовок: строка имён
+    printf "%-8s %5s %5s %5s" "ВРЕМЯ" "CPU%" "NPU%" "RAM"
+    for short in "${THERMAL_SHORT[@]}"; do
+        printf " %4s" "$short"
+    done
+    echo ""
+    # Разделитель (─ = 3 байта UTF-8, printf считает байты)
+    printf "%s\n" "───────────────────────────────────────────────────────────"
+    echo ""
 
     while true; do
         sleep "$INTERVAL"
@@ -964,15 +1009,25 @@ monitor() {
         ts=$(date +%H:%M:%S)
         local cpu_pct; cpu_pct=$(read_cpu_load)
         local npu_pct; npu_pct=$(npu_load_avg)
-        local npu_cores; npu_cores=$(read_npu_load_cores)
         read -r _ ram_used <<< "$(read_ram)"
-        local temps; temps=$(get_temps)
 
-        printf "%-9s %4s%% %4s%%  %-24s %6s  %s\n" \
-            "$ts" "$cpu_pct" "$npu_pct" "$npu_cores" "$ram_used" "$temps"
+        printf "%-8s %4s%% %4s%% %5s" "$ts" "$cpu_pct" "$npu_pct" "$ram_used"
+        for f in "${THERMAL_FILES[@]}"; do
+            local raw
+            raw=$(cat "$f" 2>/dev/null || echo "0")
+            printf " %4s" "$((raw / 1000))"
+        done
+        echo ""
 
-        [[ -n "$LOG_FILE" ]] && \
-            echo "${ts},${elapsed},${cpu_pct},${npu_pct},\"${npu_cores}\",${ram_used},\"${temps}\"" >> "$LOG_FILE"
+        [[ -n "$LOG_FILE" ]] && {
+            local temps_csv=""
+            for f in "${THERMAL_FILES[@]}"; do
+                local raw; raw=$(cat "$f" 2>/dev/null || echo "0")
+                [[ -n "$temps_csv" ]] && temps_csv+=","
+                temps_csv+="$((raw / 1000))"
+            done
+            echo "${ts},${elapsed},${cpu_pct},${npu_pct},${ram_used},${temps_csv}" >> "$LOG_FILE"
+        }
     done
 }
 
@@ -987,7 +1042,7 @@ print_results() {
     for i in "${!THERMAL_NAMES[@]}"; do
         local raw
         raw=$(cat "${THERMAL_FILES[$i]}" 2>/dev/null || echo "0")
-        printf "  %-25s %3d°C\n" "${THERMAL_NAMES[$i]}" $((raw / 1000))
+        printf "  %-10s %3d°C\n" "${THERMAL_SHORT[$i]}" $((raw / 1000))
     done
     local npu_cores; npu_cores=$(read_npu_load_cores)
     [[ -n "$npu_cores" ]] && echo -e "\nNPU load: $npu_cores"

@@ -270,17 +270,18 @@ docker compose run --rm converter python eval_coco.py
 ## Стресс-тест
 
 Нагрузочный тест CPU + NPU + RAM с мониторингом температур и загрузки.
-Полезно для валидации эффективности охлаждения и стабильности NPU под нагрузкой.
+Не требует root — обычный пользователь из группы `docker` может запускать напрямую.
+Root необходим только для режима `--overclock`.
 
 ```bash
 # Всё (CPU + NPU + RAM), до Ctrl+C
 ./stress_test.sh
 
+# 5 минут, макс. нагрузка на NPU (16 потоков)
+./stress_test.sh -d 300 -s 16
+
 # Только NPU, 10 минут
 ./stress_test.sh --npu-only -d 600
-
-# 3 ядра × 8 потоков, конкретная модель
-./stress_test.sh -c 0,1,2 -s 8 -m model/yolo26x-seg.rknn
 
 # С логом в CSV
 ./stress_test.sh -d 3600 -l stress_results.csv
@@ -291,11 +292,18 @@ docker compose run --rm converter python eval_coco.py
 | `-d, --duration SEC` | `0` (до Ctrl+C) | Длительность |
 | `-c, --npu-cores` | `0,1,2` | NPU ядра |
 | `-s, --npu-streams` | `8` | Потоков инференса на ядро |
-| `-m, --model` | `model/yolo26x-seg.rknn` | RKNN модель |
+| `-m, --model` | `model/model.rknn` | RKNN модель |
 | `-i, --interval SEC` | `2` | Интервал мониторинга |
 | `-l, --log FILE` | — | CSV лог |
 | `--npu-only` | — | Только NPU |
 | `--cpu-only` | — | Только CPU + RAM |
+
+Вывод мониторинга (компактный, влезает в 80 колонок):
+```
+ВРЕМЯ  CPU%  NPU%   RAM  SOC BIG0 BIG1  LIT  CTR  GPU  NPU
+───────────────────────────────────────────────────────────
+21:18:37    0%  100%  6573   66   69   70   67   62   61   63
+```
 
 Ctrl+C корректно останавливает все процессы и выводит финальные температуры.
 
@@ -438,8 +446,18 @@ datasets/
 ## Мониторинг NPU
 
 ```bash
+# Нагрузка + частота (всегда доступно)
+cat /sys/class/devfreq/fdab0000.npu/load
+# Вывод: 100@1000000000Hz  (нагрузка% @ частота)
+
+# Только частота
+cat /sys/devices/platform/fdab0000.npu/devfreq/fdab0000.npu/cur_freq
+
+# Нагрузка по ядрам (требует debugfs, может быть пусто)
 cat /sys/kernel/debug/rknpu/load
-watch -n 1 'cat /sys/kernel/debug/rknpu/load'
+
+# Непрерывный мониторинг
+watch -n1 'cat /sys/class/devfreq/fdab0000.npu/load'
 ```
 
 ## Известные ограничения
@@ -451,6 +469,10 @@ watch -n 1 'cat /sys/kernel/debug/rknpu/load'
 - INT8 калибровка на 512 изображениях
 - GigE камера: первый захват может быть медленным (GVCP discovery)
 - USB камера на WiFi: HTTP poll может давать ~5fps из-за RTT
+- **RK3588S shared bus**: NPU инференс DMA может вызывать микро-глитчи USB камеры (~50мс). Код.camera_source.py` автоматически повторяет чтение при первом сбое перед закрытием камеры
+- **Питание**: слабый БП вызывает brownout при одновременной нагрузке CPU+NPU+камера → перезагрузка. Рекомендуется БП ≥5V/4A
+- **ONNX CPU на RK3588S**: инференс через CPU потребляет слишком много энергии и вызывает brownout. Используйте всегда `BACKEND=npu`
+- **Конвертер Docker**: запуск контейнера конвертера может вызвать перезагрузку на RK3588S (конфликт NPU). Решение: предварительно заполненные `benchmark/temp_models/`
 
 ---
 
@@ -524,25 +546,23 @@ watch -n 1 'cat /sys/kernel/debug/rknpu/load'
 
 Менеджер разгона с проверкой стабильности по FPS. Автоматически определяет нестабильность.
 
-#### Первый запуск (установка OC DTB overlay, разблокировка 2352/2400 МГц):
-
-```bash
-./bench_overclock.sh --setup          # модификация DTB + reboot (однократно)
-```
-
 #### Бенчмарк с разгоном:
 
 ```bash
-./bench_overclock.sh                              # текущая модель
-./bench_overclock.sh --model yolo11x-pose         # конкретная модель
-./bench_overclock.sh --measure 30                 # дольше измерение (по умолчанию 20с)
-./bench_overclock.sh --quantize int8              # только INT8
+sudo ./bench_overclock.sh                              # текущая модель
+sudo ./bench_overclock.sh --model yolo11x-pose         # конкретная модель
+sudo ./bench_overclock.sh --measure 30                 # дольше измерение (по умолчанию 20с)
+sudo ./bench_overclock.sh --quantize int8              # только INT8
 ```
+
+> При первом запуске скрипт автоматически устанавливает OC DTB overlay
+> (разблокировка 2352/2400 МГц) и перезагружает систему.
+> После ребута повторите ту же команду — начнётся бенчмарк.
 
 #### Откат к стоковым частотам:
 
 ```bash
-./bench_overclock.sh --revert
+sudo ./bench_overclock.sh --revert
 ```
 
 #### Два типа FPS-замеров:
@@ -555,14 +575,14 @@ watch -n 1 'cat /sys/kernel/debug/rknpu/load'
 #### Управление разгоном:
 
 ```bash
-./oc_manager.sh status              # текущее состояние
-./oc_manager.sh test                # тест всех частот + поиск макс. стабильной
-./oc_manager.sh test --quick        # быстрый тест (стоп на первом FAIL)
-./oc_manager.sh apply               # применить сохранённую конфигурацию
-./oc_manager.sh revert              # откат к стоковым частотам
-./oc_manager.sh set cpu=2400 npu=1000 gpu=800  # установить конкретные частоты
-./oc_manager.sh monitor             # мониторинг + автооткат при нестабильности
-./oc_test.sh --compare              # FPS на всех частотах (до и после DTB OC)
+./oc_manager.sh status              # текущее состояние (без sudo)
+sudo ./oc_manager.sh test           # тест всех частот + поиск макс. стабильной
+sudo ./oc_manager.sh test --quick   # быстрый тест (стоп на первом FAIL)
+sudo ./oc_manager.sh apply          # применить сохранённую конфигурацию
+sudo ./oc_manager.sh revert         # откат к стоковым частотам
+sudo ./oc_manager.sh set cpu=2400 npu=1000 gpu=800  # установить конкретные частоты
+sudo ./oc_manager.sh monitor        # мониторинг + автооткат при нестабильности
+sudo ./oc_test.sh --compare         # FPS на всех частотах (до и после DTB OC)
 ```
 
 **Результаты (Orange Pi 5 Pro, RK3588S, yolo11n detect):**

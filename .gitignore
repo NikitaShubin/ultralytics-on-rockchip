@@ -44,6 +44,7 @@ model/
 fps_before.txt
 fps_after.txt
 oc_results.csv
+results/
 
 # Test images (user data)
 test/*_pred.jpg

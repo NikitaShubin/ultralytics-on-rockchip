@@ -21,6 +21,9 @@ REVERT=0
 
 OC_DIR="$(dirname "$0")/overclock"
 RESULTS_DIR="$(dirname "$0")/results"
+OC_DTB="/boot/dtb/rockchip/rk3588s-orangepi-5-pro.dtb"
+OC_DTB_BAK="/boot/dtb/rockchip/rk3588s-orangepi-5-pro.dtb.bak"
+OC_DTS="/tmp/oc_base.dts"
 TIMESTAMP=$(date '+%Y%m%d_%H%M%S')
 CSV_FILE="$RESULTS_DIR/bench_overclock_${TIMESTAMP}.csv"
 
@@ -55,7 +58,6 @@ for arg in "$@"; do
         --measure=*)    MEASURE="${arg#--measure=}" ;;
         --quantize=*)   QUANTIZE="${arg#--quantize=}" ;;
         --revert)       REVERT=1 ;;
-        --setup)        SETUP=1 ;;
         -h|--help)
             echo "Использование: $(basename "$0") [опции]"
             echo ""
@@ -65,7 +67,8 @@ for arg in "$@"; do
             echo "  --measure=SEC     Измерение (по умолчанию: 20)"
             echo "  --quantize=MODE   none/int8/both (по умолчанию: both)"
             echo "  --revert          Откат к стоковым частотам"
-            echo "  --setup           Установить DTB overlay для разгона + reboot"
+            echo ""
+            echo "  OC DTB устанавливается автоматически при первом запуске."
             exit 0
             ;;
     esac
@@ -74,6 +77,12 @@ done
 MODEL="${MODEL:-$(detect_model)}"
 
 # ─── Утилиты ────────────────────────────────────────────────────────────────
+
+require_root() {
+    [[ $EUID -ne 0 ]] && { echo "[ОШИБКА] Запустите через: sudo $0 $*"; exit 1; }
+}
+
+require_root "$@"
 
 die() { echo "[ОШИБКА] $*"; exit 1; }
 
@@ -87,32 +96,58 @@ require_docker() {
     docker ps --format '{{.Names}}' | grep -q "^${CONTAINER}$" || die "Контейнер $CONTAINER не запущен"
 }
 
-service_pause() {
-    docker pause "$CONTAINER" 2>/dev/null || true
-}
-
-service_unpause() {
-    docker unpause "$CONTAINER" 2>/dev/null || true
+is_oc_installed() {
+    cat /sys/devices/system/cpu/cpufreq/policy6/scaling_available_frequencies 2>/dev/null | grep -q "2352000"
 }
 
 do_setup() {
-    if cat /sys/devices/system/cpu/cpufreq/policy6/scaling_available_frequencies 2>/dev/null | grep -q "2352000"; then
+    if is_oc_installed; then
         log "Overclock уже установлен (2352 МГц доступен)"
         return 0
     fi
 
-    local env_file="/boot/orangepiEnv.txt"
-    [[ -f "$env_file" ]] || die "Файл $env_file не найден"
-    [[ -f "/boot/dtb/rockchip/overlay/rk3588-opi5pro-oc.dtbo" ]] || die "Overlay не найден"
-
-    log "Установка DTB overlay для разгона..."
-    echo 'orangepi' | sudo -S sed -i 's/^overlays=.*/overlays=rk3588-opi5pro-oc/' "$env_file" 2>/dev/null
-    if ! grep -q "rk3588-opi5pro-oc" "$env_file" 2>/dev/null; then
-        echo 'orangepi' | sudo -S bash -c "echo 'overlays=rk3588-opi5pro-oc' >> $env_file" 2>/dev/null
+    [[ -f "$OC_DTB" ]] || die "DTB не найден: $OC_DTB"
+    if [[ ! -f "$OC_DTB_BAK" ]]; then
+        log "Создание бэкапа DTB..."
+        cp "$OC_DTB" "$OC_DTB_BAK"
     fi
-    log "Reboot через 3 секунды..."
+
+    log "Декомпиляция DTB..."
+    dtc -I dtb -O dts -o "$OC_DTS" "$OC_DTB" 2>/dev/null
+    [[ -f "$OC_DTS" ]] || die "Декомпиляция DTB failed"
+
+    log "CPU: расблокировка 2352/2400 МГц..."
+    sed -i '/opp-2352000000/,/};/ { /opp-supported-hw/s/=.*/= <0xffffffff 0xffffffff>;/ }' "$OC_DTS"
+    sed -i '/opp-2400000000/,/};/ { /opp-supported-hw/s/=.*/= <0xffffffff 0xffffffff>;/ }' "$OC_DTS"
+
+    log "NPU/GPU: добавление 1050/1100 МГц..."
+    local npu_opp='			opp-1050000000 {
+				opp-supported-hw = <0xf9 0xffffffff>;
+				opp-hz = <0x00 0x3e919e40>;
+				opp-microvolt = <0xdbba0 0xdbba0 0xdbba0 0xdbba0 0xdbba0 0xdbba0>;
+			};
+			opp-1100000000 {
+				opp-supported-hw = <0xf9 0xffffffff>;
+				opp-hz = <0x00 0x4190ce80>;
+				opp-microvolt = <0xe7ef0 0xe7ef0 0xe7ef0 0xe7ef0 0xe7ef0 0xe7ef0>;
+			};'
+    local gpu_line npu_line
+    gpu_line=$(grep -n "opp-1000000000 {" "$OC_DTS" | head -1 | cut -d: -f1)
+    npu_line=$(grep -n "opp-1000000000 {" "$OC_DTS" | tail -1 | cut -d: -f1)
+    for anchor in $npu_line $gpu_line; do
+        local end
+        end=$(awk -v start="$anchor" 'NR>=start && /^\t\t\};/{print NR; exit}' "$OC_DTS")
+        [[ -n "$end" ]] && sed -i "${end}r /dev/stdin" "$OC_DTS" <<< "$npu_opp"
+    done
+
+    log "Компиляция DTB..."
+    dtc -I dts -O dtb -o /tmp/oc_new.dtb "$OC_DTS" 2>/dev/null
+    [[ -s /tmp/oc_new.dtb ]] || die "Компиляция DTB failed"
+
+    cp /tmp/oc_new.dtb "$OC_DTB"
+    log "OC DTB установлен. Reboot через 3 секунды..."
     sleep 3
-    echo 'orangepi' | sudo -S reboot 2>/dev/null
+    reboot
 }
 
 freq_to_mhz() {
@@ -140,40 +175,32 @@ get_max_temp() {
 
 set_cpu_freq() {
     local freq=$1
-    echo 'orangepi' | sudo -S bash -c "
-        for p in /sys/devices/system/cpu/cpufreq/policy{4,6}; do
-            echo userspace > \$p/scaling_governor 2>/dev/null
-            echo $freq > \$p/scaling_setspeed 2>/dev/null
-        done
-    " 2>/dev/null
+    for p in /sys/devices/system/cpu/cpufreq/policy{4,6}; do
+        echo userspace > "$p/scaling_governor" 2>/dev/null
+        echo "$freq" > "$p/scaling_setspeed" 2>/dev/null
+    done
 }
 
 set_npu_freq() {
     local freq=$1
-    echo 'orangepi' | sudo -S bash -c "
-        echo userspace > /sys/class/devfreq/fdab0000.npu/governor 2>/dev/null
-        echo $freq > /sys/class/devfreq/fdab0000.npu/min_freq 2>/dev/null
-        echo $freq > /sys/class/devfreq/fdab0000.npu/max_freq 2>/dev/null
-    " 2>/dev/null
+    echo userspace > /sys/class/devfreq/fdab0000.npu/governor 2>/dev/null
+    echo "$freq" > /sys/class/devfreq/fdab0000.npu/min_freq 2>/dev/null
+    echo "$freq" > /sys/class/devfreq/fdab0000.npu/max_freq 2>/dev/null
 }
 
 set_gpu_freq() {
     local freq=$1
-    echo 'orangepi' | sudo -S bash -c "
-        echo userspace > /sys/class/devfreq/fb000000.gpu/governor 2>/dev/null
-        echo $freq > /sys/class/devfreq/fb000000.gpu/min_freq 2>/dev/null
-        echo $freq > /sys/class/devfreq/fb000000.gpu/max_freq 2>/dev/null
-    " 2>/dev/null
+    echo userspace > /sys/class/devfreq/fb000000.gpu/governor 2>/dev/null
+    echo "$freq" > /sys/class/devfreq/fb000000.gpu/min_freq 2>/dev/null
+    echo "$freq" > /sys/class/devfreq/fb000000.gpu/max_freq 2>/dev/null
 }
 
 restore_governors() {
-    echo 'orangepi' | sudo -S bash -c "
-        for p in /sys/devices/system/cpu/cpufreq/policy{0,4,6}; do
-            echo ondemand > \$p/scaling_governor 2>/dev/null
-        done
-        echo rknpu_ondemand > /sys/class/devfreq/fdab0000.npu/governor 2>/dev/null
-        echo simple_ondemand > /sys/class/devfreq/fb000000.gpu/governor 2>/dev/null
-    " 2>/dev/null
+    for p in /sys/devices/system/cpu/cpufreq/policy{0,4,6}; do
+        echo ondemand > "$p/scaling_governor" 2>/dev/null
+    done
+    echo rknpu_ondemand > /sys/class/devfreq/fdab0000.npu/governor 2>/dev/null
+    echo simple_ondemand > /sys/class/devfreq/fb000000.gpu/governor 2>/dev/null
 }
 
 # ─── Замер FPS ──────────────────────────────────────────────────────────────
@@ -189,10 +216,8 @@ measure_fps_inference() {
         both) quantize_flag="--quantize both" ;;
     esac
 
-    service_pause
     local result
     result=$(docker exec "$CONTAINER" $FPS_CMD $quantize_flag 2>/dev/null | grep -E '^\{' | tail -1)
-    service_unpause
 
     if [[ -z "$result" ]]; then
         echo '{"cpu":{"fps":0},"npu_none":{"fps":0},"npu_int8":{"fps":0}}'
@@ -289,6 +314,7 @@ do_convert() {
     fi
 
     log "Конвертация $MODEL..."
+    mkdir -p benchmark/results
     cd benchmark
     python3 benchmark.py --phase convert --model "$MODEL" --quantize "$QUANTIZE" 2>&1 | while IFS= read -r line; do
         log "[convert] $line"
@@ -396,10 +422,10 @@ echo ""
 
 require_docker
 
-# Setup
-if [[ ${SETUP:-0} -eq 1 ]]; then
+# Проверка OC DTB — если не установлен, установить и перезагрузиться
+if ! is_oc_installed; then
+    log "OC DTB не установлен — автоматическая установка..."
     do_setup
-    exit 0
 fi
 
 # Определяем доступные частоты

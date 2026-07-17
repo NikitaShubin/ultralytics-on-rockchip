@@ -47,6 +47,10 @@ GPU_FREQS=(400000000 500000000 600000000 700000000 800000000 900000000 100000000
 
 # ─── Утилиты ────────────────────────────────────────────────────────────────
 
+require_root() {
+    [[ $EUID -ne 0 ]] && { echo "[ОШИБКА] Запустите через: sudo $0 $*"; exit 1; }
+}
+
 die() { echo "[ОШИБКА] $*"; exit 1; }
 
 require_docker() {
@@ -80,10 +84,8 @@ get_max_temp() {
 
 # Замер FPS — возвращает только число
 measure_fps() {
-    docker pause "$CONTAINER" 2>/dev/null || true
     local result
     result=$(docker exec "$CONTAINER" $FPS_CMD 2>/dev/null | grep '^\{')
-    docker unpause "$CONTAINER" 2>/dev/null || true
     if [[ -z "$result" ]]; then
         echo "0"
         return
@@ -130,40 +132,32 @@ load_state() {
 
 set_cpu_freq() {
     local freq=$1
-    echo 'orangepi' | sudo -S bash -c "
-        for p in /sys/devices/system/cpu/cpufreq/policy{4,6}; do
-            echo userspace > \$p/scaling_governor 2>/dev/null
-            echo $freq > \$p/scaling_setspeed 2>/dev/null
-        done
-    " 2>/dev/null
+    for p in /sys/devices/system/cpu/cpufreq/policy{4,6}; do
+        echo userspace > "$p/scaling_governor" 2>/dev/null
+        echo "$freq" > "$p/scaling_setspeed" 2>/dev/null
+    done
 }
 
 set_npu_freq() {
     local freq=$1
-    echo 'orangepi' | sudo -S bash -c "
-        echo userspace > /sys/class/devfreq/fdab0000.npu/governor 2>/dev/null
-        echo $freq > /sys/class/devfreq/fdab0000.npu/min_freq 2>/dev/null
-        echo $freq > /sys/class/devfreq/fdab0000.npu/max_freq 2>/dev/null
-    " 2>/dev/null
+    echo userspace > /sys/class/devfreq/fdab0000.npu/governor 2>/dev/null
+    echo "$freq" > /sys/class/devfreq/fdab0000.npu/min_freq 2>/dev/null
+    echo "$freq" > /sys/class/devfreq/fdab0000.npu/max_freq 2>/dev/null
 }
 
 set_gpu_freq() {
     local freq=$1
-    echo 'orangepi' | sudo -S bash -c "
-        echo userspace > /sys/class/devfreq/fb000000.gpu/governor 2>/dev/null
-        echo $freq > /sys/class/devfreq/fb000000.gpu/min_freq 2>/dev/null
-        echo $freq > /sys/class/devfreq/fb000000.gpu/max_freq 2>/dev/null
-    " 2>/dev/null
+    echo userspace > /sys/class/devfreq/fb000000.gpu/governor 2>/dev/null
+    echo "$freq" > /sys/class/devfreq/fb000000.gpu/min_freq 2>/dev/null
+    echo "$freq" > /sys/class/devfreq/fb000000.gpu/max_freq 2>/dev/null
 }
 
 restore_governors() {
-    echo 'orangepi' | sudo -S bash -c "
-        for p in /sys/devices/system/cpu/cpufreq/policy{0,4,6}; do
-            echo ondemand > \$p/scaling_governor 2>/dev/null
-        done
-        echo rknpu_ondemand > /sys/class/devfreq/fdab0000.npu/governor 2>/dev/null
-        echo simple_ondemand > /sys/class/devfreq/fb000000.gpu/governor 2>/dev/null
-    " 2>/dev/null
+    for p in /sys/devices/system/cpu/cpufreq/policy{0,4,6}; do
+        echo ondemand > "$p/scaling_governor" 2>/dev/null
+    done
+    echo rknpu_ondemand > /sys/class/devfreq/fdab0000.npu/governor 2>/dev/null
+    echo simple_ondemand > /sys/class/devfreq/fb000000.gpu/governor 2>/dev/null
 }
 
 # ─── Команды ─────────────────────────────────────────────────────────────────
@@ -418,11 +412,11 @@ cmd_monitor() {
 
 case "${1:-help}" in
     status)  cmd_status ;;
-    test)    cmd_test "${2:-}" ;;
-    apply)   cmd_apply ;;
-    revert)  cmd_revert ;;
-    set)     shift; cmd_set "$@" ;;
-    monitor) cmd_monitor ;;
+    test)    require_root "$@"; cmd_test "${2:-}" ;;
+    apply)   require_root "$@"; cmd_apply ;;
+    revert)  require_root "$@"; cmd_revert ;;
+    set)     require_root "$@"; shift; cmd_set "$@" ;;
+    monitor) require_root "$@"; cmd_monitor ;;
     *)
         echo "Использование: $(basename "$0") <команда>"
         echo ""
