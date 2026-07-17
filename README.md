@@ -82,6 +82,57 @@ docker compose up -d --build
 ./stop.sh
 ```
 
+## Автозапуск после перезагрузки
+
+Два компонента должны запускаться автоматически: **Docker** (восстановление контейнеров) и **rknn_server** (NPU runtime).
+
+### Docker
+
+```bash
+sudo systemctl enable docker
+```
+
+### RKNN Server
+
+Создать юнит `/etc/systemd/system/rknn_server.service`:
+
+```bash
+sudo tee /etc/systemd/system/rknn_server.service << 'EOF'
+[Unit]
+Description=RKNN Server (NPU runtime)
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/rknn_server
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+sudo systemctl daemon-reload
+sudo systemctl enable rknn_server
+```
+
+### Проверка
+
+```bash
+systemctl is-enabled docker          # должен вывести: enabled
+systemctl is-enabled rknn_server     # должен вывести: enabled
+pgrep -la rknn_server                # должен вывести: ... /usr/bin/rknn_server
+```
+
+### Отключение автозапуска
+
+```bash
+sudo systemctl disable docker
+sudo systemctl disable rknn_server
+sudo rm /etc/systemd/system/rknn_server.service
+sudo systemctl daemon-reload
+```
+
 ## Деплой модели
 
 ```bash
@@ -317,6 +368,7 @@ deploy.sh                    # Деплой модели (конвертация
 setup_datasets.py            # Загрузка датасетов (COCO val2017)
 stress_test.sh               # Стресс-тест NPU/CPU/RAM (bash, Ctrl+C)
 stress_test.py               # Стресс-тест NPU/CPU/RAM (python)
+bench_overclock.sh           # Бенчмарк с разгоном CPU/NPU/GPU (FPS до → разгон → FPS после)
 benchmark/
 ├── benchmark.py             # Оркестратор: --phase convert|validate|bench|all
 ├── convert_bench.py         # Фаза 1: экспорт + компиляция (4 файла на модель)
