@@ -88,12 +88,23 @@ class USBCamera(CameraSource):
         return False
 
     def read(self) -> np.ndarray | None:
-        """Считать один кадр."""
+        """Считать один кадр с повторной попыткой при glitch'е USB.
+
+        RK3588S использует shared bus для NPU и USB-контроллера.
+        При NPU inference DMA-транзакции кратковременно нагружают шину,
+        вызывая USB glitch (~50ms), во время которого камера перечисляется
+        на шине. Без retry немедленное закрытие VideoCapture приводит к
+        потере кадров и бесконечному циклу reconnect каждые 7-9 секунд.
+        """
         if self._cap is None:
             return None
+        ret, frame = self._cap.read()
+        if ret:
+            return frame
         if self._device and not Path(self._device).exists():
             self.close()
             return None
+        time.sleep(0.05)
         ret, frame = self._cap.read()
         return frame if ret else None
 
@@ -252,7 +263,7 @@ class CameraManager:
         self.file_path = file_path
         self._source: CameraSource | None = None
         self._fallback_count = 0
-        self._max_fallback = 3
+        self._max_fallback = 2
         self._skip_gige = False
 
     def open(self) -> bool:
@@ -305,7 +316,7 @@ class CameraManager:
     def _reconnect(self) -> None:
         """Переподключение к источнику изображения."""
         self.close()
-        time.sleep(0.5)
+        time.sleep(0.2)
         self.open()
 
     def close(self) -> None:

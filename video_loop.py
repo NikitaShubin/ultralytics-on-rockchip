@@ -64,7 +64,7 @@ class VideoLoop:
         while self._running:
             frame = self._cam.read()
             if frame is None:
-                await asyncio.sleep(0.5)
+                await asyncio.sleep(0.1)
                 continue
             capture_ts = time.monotonic()
             self._frame_id += 1
