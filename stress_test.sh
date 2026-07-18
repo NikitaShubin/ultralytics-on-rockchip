@@ -33,6 +33,10 @@ INTERVAL=2
 LOG_FILE=""
 RAM_MB=1024
 DISPLAY_MODE="tui"
+# Сохранённые оригинальные governors (для восстановления)
+SAVED_GOVERNORS=""
+SAVED_NPU_GOV=""
+SAVED_GPU_GOV=""
 
 # ─── Overclock ──────────────────────────────────────────────────────────────
 
@@ -393,6 +397,49 @@ set_gpu_max_freq() {
 
 get_gpu_cur_freq() {
     cat /sys/class/devfreq/fb000000.gpu/cur_freq 2>/dev/null || echo 0
+}
+
+# ─── Сохранение/восстановление governors (для обычного стресс-теста) ─────────
+
+save_governors() {
+    SAVED_GOVERNORS=""
+    for policy in /sys/devices/system/cpu/cpufreq/policy{0,4,6}; do
+        [[ -d "$policy" ]] || continue
+        local gov
+        gov=$(cat "$policy/scaling_governor" 2>/dev/null)
+        SAVED_GOVERNORS="${SAVED_GOVERNORS}$(basename $policy)=$gov "
+    done
+    SAVED_NPU_GOV=$(cat /sys/class/devfreq/fdab0000.npu/governor 2>/dev/null || echo "rknpu_ondemand")
+    SAVED_GPU_GOV=$(cat /sys/class/devfreq/fb000000.gpu/governor 2>/dev/null || echo "simple_ondemand")
+}
+
+set_performance_governors() {
+    save_governors
+    # CPU: performance → фиксирует частоту на максимуме (через sudo)
+    local ok=1
+    for policy in /sys/devices/system/cpu/cpufreq/policy{0,4,6}; do
+        [[ -d "$policy" ]] || continue
+        echo 'orangepi' | sudo -S sh -c "echo performance > $policy/scaling_governor" 2>/dev/null || ok=0
+    done
+    if [[ $ok -eq 1 ]]; then
+        echo "[OK] Governors → performance (CPU зафиксирован на максимуме)"
+    else
+        echo "[WARN] Не удалось сменить governors (нужен sudo). CPU будет на ondemand"
+    fi
+}
+
+restore_saved_governors() {
+    [[ -z "$SAVED_GOVERNORS" ]] && return
+    for token in $SAVED_GOVERNORS; do
+        local name="${token%%=*}"
+        local gov="${token#*=}"
+        local policy="/sys/devices/system/cpu/cpufreq/$name"
+        [[ -d "$policy" ]] || continue
+        echo 'orangepi' | sudo -S sh -c "echo $gov > $policy/scaling_governor" 2>/dev/null || true
+    done
+    echo 'orangepi' | sudo -S sh -c "echo $SAVED_NPU_GOV > /sys/class/devfreq/fdab0000.npu/governor" 2>/dev/null || true
+    echo 'orangepi' | sudo -S sh -c "echo $SAVED_GPU_GOV > /sys/class/devfreq/fb000000.gpu/governor" 2>/dev/null || true
+    echo "[OK] Governors восстановлены (${SAVED_GOVERNORS%,})"
 }
 
 # ─── Overclock: фильтрация доступных частот ─────────────────────────────────
@@ -1336,6 +1383,9 @@ cleanup() {
     [[ -n "$NPU_SCRIPT" ]] && rm -f "$NPU_SCRIPT"
     rm -f "$CPU_STATE_FILE"
 
+    # Восстановить оригинальные governors (performance → ondemand)
+    restore_saved_governors
+
     echo "[ГОТОВО] Нагрузка снята"
 }
 
@@ -1557,6 +1607,9 @@ echo "  Модель: $MODEL"
 echo "════════════════════════════════════════════════════════"
 echo "════════════════════════════════════════════════════════"
 echo ""
+
+# Фиксировать CPU на максимуме (performance governor)
+set_performance_governors
 
 if [[ $NPU_ONLY -eq 0 ]]; then
     start_cpu_stress
