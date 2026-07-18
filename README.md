@@ -274,8 +274,11 @@ docker compose run --rm converter python eval_coco.py
 Root необходим только для режима `--overclock`.
 
 ```bash
-# Всё (CPU + NPU + RAM), до Ctrl+C
+# TUI-режим (по умолчанию): Unicode-бары, per-core CPU, температуры с градиентом
 ./stress_test.sh
+
+# Компактный табличный режим (старый формат)
+./stress_test.sh --compact
 
 # 5 минут, макс. нагрузка на NPU (16 потоков)
 ./stress_test.sh -d 300 -s 16
@@ -297,13 +300,13 @@ Root необходим только для режима `--overclock`.
 | `-l, --log FILE` | — | CSV лог |
 | `--npu-only` | — | Только NPU |
 | `--cpu-only` | — | Только CPU + RAM |
+| `--compact` | — | Компактный табличный режим (без Unicode-баров) |
 
-Вывод мониторинга (компактный, влезает в 80 колонок):
-```
-ВРЕМЯ  CPU%  NPU%   RAM  SOC BIG0 BIG1  LIT  CTR  GPU  NPU
-───────────────────────────────────────────────────────────
-21:18:37    0%  100%  6573   66   69   70   67   62   61   63
-```
+TUI-режим (по умолчанию):
+- Кластеры CPU: policy0 (LIT A55), policy4 (BIG0 A76), policy6 (BIG1 A76) с per-core sub-барами
+- NPU: aggregate load bar (debugfs, fallback devfreq)
+- RAM: usage bar
+- Температуры: 3-цветный градиент (зелёный → жёлтый → красный) + throttle-индикаторы
 
 Ctrl+C корректно останавливает все процессы и выводит финальные температуры.
 
@@ -473,6 +476,7 @@ watch -n1 'cat /sys/class/devfreq/fdab0000.npu/load'
 - **Питание**: слабый БП вызывает brownout при одновременной нагрузке CPU+NPU+камера → перезагрузка. Рекомендуется БП ≥5V/4A
 - **ONNX CPU на RK3588S**: инференс через CPU потребляет слишком много энергии и вызывает brownout. Используйте всегда `BACKEND=npu`
 - **Конвертер Docker**: запуск контейнера конвертера может вызвать перезагрузку на RK3588S (конфликт NPU). Решение: предварительно заполненные `benchmark/temp_models/`
+- **GPU stress**: Mali-G610 использует проприетарный Bifrost kernel driver (DDK g21p0) без userspace библиотеки. Vulkan ICD (Panthor/Panfrost) не работает с проприетарным ядром. EGL Mesa fallback-ит на llvmpipe (CPU). GPU stress недоступен без `libmali.so` от Rockchip той же DDK-версии. CPU+NPU стресс покрывают ~95% peak power по общим power rail'ам
 
 ---
 

@@ -26,11 +26,13 @@ NPU_ONLY=0
 CPU_ONLY=0
 NO_RAM=0
 NPU_CORES="0,1,2"
-NPU_STREAMS=1
+NPU_STREAMS=2
 MODEL="model/model.rknn"
+STRESS_MODEL=""
 INTERVAL=2
 LOG_FILE=""
 RAM_MB=1024
+DISPLAY_MODE="tui"
 
 # ─── Overclock ──────────────────────────────────────────────────────────────
 
@@ -50,11 +52,13 @@ usage() {
   -c, --npu-cores LIST   NPU ядра через запятую (по умолчанию: 0,1,2)
   -s, --npu-streams N    Потоков инференса на ядро (по умолчанию: 8)
   -m, --model FILE       RKNN модель (по умолчанию: model/model.rknn)
+  --stress-model FILE    RKNN модель для NPU стресса (по умолчанию: model/stress_model.rknn если есть)
   -i, --interval SEC     Интервал мониторинга (по умолчанию: 2)
   -l, --log FILE         CSV лог результатов
   --npu-only             Только NPU
   --cpu-only             Только CPU + RAM
   --no-ram               Без нагрузки на RAM
+  --compact              Компактный табличный режим (без псевдографики)
 
 Режим разгона (все флаги требуют --overclock):
   --overclock            Пошаговый разгон CPU + NPU + GPU
@@ -75,11 +79,13 @@ while [[ $# -gt 0 ]]; do
         -c|--npu-cores)   NPU_CORES="$2"; shift 2 ;;
         -s|--npu-streams) NPU_STREAMS="$2"; shift 2 ;;
         -m|--model)       MODEL="$2"; shift 2 ;;
+        --stress-model)   STRESS_MODEL="$2"; shift 2 ;;
         -i|--interval)    INTERVAL="$2"; shift 2 ;;
         -l|--log)         LOG_FILE="$2"; shift 2 ;;
         --npu-only)       NPU_ONLY=1; shift ;;
         --cpu-only)       CPU_ONLY=1; shift ;;
         --no-ram)         NO_RAM=1; shift ;;
+        --compact)        DISPLAY_MODE="compact"; shift ;;
         --overclock)      OVERCLOCK=1; shift ;;
         --oc-setup)       OC_SETUP=1; shift ;;
         --oc-restore)     OC_RESTORE=1; shift ;;
@@ -107,6 +113,19 @@ MODEL_PATH="$SCRIPT_DIR/$MODEL"
 
 if [[ ! -f "$MODEL_PATH" ]]; then
     echo "[ОШИБКА] Модель не найдена: $MODEL_PATH"
+    exit 1
+fi
+
+# Определение модели для NPU стресса
+if [[ -n "$STRESS_MODEL" ]]; then
+    STRESS_MODEL_PATH="$SCRIPT_DIR/$STRESS_MODEL"
+elif [[ -f "$SCRIPT_DIR/model/stress_model.rknn" ]]; then
+    STRESS_MODEL_PATH="$SCRIPT_DIR/model/stress_model.rknn"
+else
+    STRESS_MODEL_PATH="$MODEL_PATH"
+fi
+if [[ ! -f "$STRESS_MODEL_PATH" ]]; then
+    echo "[ОШИБКА] Стресс-модель не найдена: $STRESS_MODEL_PATH"
     exit 1
 fi
 
@@ -795,6 +814,7 @@ read_npu_load_cores() {
 }
 
 npu_load_avg() {
+    # Сначала debugfs — точные per-core значения
     local raw
     raw=$(read_npu_load_cores)
     if [[ -n "$raw" ]]; then
@@ -812,23 +832,458 @@ npu_load_avg() {
             return
         fi
     fi
-    # Fallback: /sys/class/devfreq (формат "100@1000000000Hz")
-    local devfreq
-    devfreq=$(cat /sys/class/devfreq/fdab0000.npu/load 2>/dev/null || echo "")
-    if [[ -n "$devfreq" ]]; then
-        local pct="${devfreq%%@*}"
-        if [[ "$pct" =~ ^[0-9]+$ ]]; then
-            echo "$pct"
-            return
-        fi
-    fi
-    echo 0
+    # Без root — devfreq aggregate бесполезен (100% = "хотя бы одно ядро занято")
+    # Возвращаем -1 как sentinel "нет данных"
+    echo -1
 }
 
 # ─── RAM ────────────────────────────────────────────────────────────────────
 
 read_ram() {
     awk '/^MemTotal:/{total=$2} /^MemAvailable:/{avail=$2} END{printf "%d %d", total/1024, (total-avail)/1024}' /proc/meminfo
+}
+
+# ─── TUI: топология CPU кластеров ──────────────────────────────────────────
+
+# Кластеры: LIT (policy0: cpu0-3), BIG0 (policy4: cpu4-5), BIG1 (policy6: cpu6-7)
+declare -a CLUSTER_NAMES=()
+declare -a CLUSTER_CORES=()
+declare -A CORE_TO_CLUSTER=()
+
+init_cpu_clusters() {
+    local policy
+    for policy in /sys/devices/system/cpu/cpufreq/policy*; do
+        local pname
+        pname=$(basename "$policy")
+        local cores_str
+        cores_str=$(cat "$policy/affected_cpus" 2>/dev/null) || continue
+        local label
+        case "$pname" in
+            policy0) label="LIT" ;;
+            policy4) label="BIG0" ;;
+            policy6) label="BIG1" ;;
+            *) label="CPU${pname#policy}" ;;
+        esac
+        local -a cores=()
+        local c
+        for c in $cores_str; do
+            cores+=("$c")
+            CORE_TO_CLUSTER[$c]="$label"
+        done
+        CLUSTER_NAMES+=("$label")
+        CLUSTER_CORES+=("${cores[*]}")
+    done
+}
+
+# ─── TUI: per-core CPU загрузка ─────────────────────────────────────────────
+
+CPU_CORES_STATE_FILE="$HOME/.stress_cpu_cores_state"
+
+read_cpu_load_cores() {
+    # Читает /proc/stat для каждого cpuN, считает дельту.
+    # Возвращает: "cpu0=52 cpu1=47 ..." (строка)
+    local -A cur_idle cur_total
+    local i line
+    while IFS= read -r line; do
+        local name="${line%% *}"
+        local rest="${line#* }"
+        [[ "$name" == cpu || "$name" == cpu[0-9]* ]] || continue
+        local -a v=($rest)
+        local idle=$(( ${v[3]:-0} + ${v[4]:-0} ))
+        local total=0
+        local j
+        for j in 0 1 2 3 4 5 6 7; do
+            total=$(( total + ${v[$j]:-0} ))
+        done
+        cur_idle[$name]=$idle
+        cur_total[$name]=$total
+    done < /proc/stat
+
+    # Читаем предыдущее состояние
+    local -A prev_idle prev_total
+    if [[ -f "$CPU_CORES_STATE_FILE" ]]; then
+        while IFS='=' read -r key val; do
+            [[ "$key" == *_idle ]] && prev_idle[${key%_idle}]="$val"
+            [[ "$key" == *_total ]] && prev_total[${key%_total}]="$val"
+        done < "$CPU_CORES_STATE_FILE"
+    fi
+
+    # Записываем текущее состояние
+    local state=""
+    for name in "${!cur_idle[@]}"; do
+        state+="${name}_idle=${cur_idle[$name]}"$'\n'
+        state+="${name}_total=${cur_total[$name]}"$'\n'
+    done
+    rm -f "$CPU_CORES_STATE_FILE" 2>/dev/null
+    echo -n "$state" > "$CPU_CORES_STATE_FILE" 2>/dev/null
+
+    # Считаем загрузку
+    local result=""
+    for name in $(echo "${!cur_idle[@]}" | tr ' ' '\n' | sort -V); do
+        [[ "$name" == "cpu" ]] && continue
+        if [[ -n "${prev_idle[$name]:-}" && -n "${prev_total[$name]:-}" ]]; then
+            local d_idle=$(( cur_idle[$name] - ${prev_idle[$name]:-0} ))
+            local d_total=$(( cur_total[$name] - ${prev_total[$name]:-0} ))
+            if [[ $d_total -gt 0 ]]; then
+                local pct=$(( (d_total - d_idle) * 100 / d_total ))
+                [[ -n "$result" ]] && result+=" "
+                result+="${name}=${pct}"
+            fi
+        fi
+    done
+    echo "$result"
+}
+
+# ─── TUI: детекция троттлинга ───────────────────────────────────────────────
+
+read_throttle_status() {
+    # Определяет thermal throttling по trip point'ам термозон.
+    # RK3588S: soc-thermal имеет passive trip @ 75°C — ядро снижает частоту CPU.
+    # Для NPU/GPU нет passive trip — используем порог 85°C.
+    # Возвращает: "CPU=0|1 NPU=0|1 GPU=0|1" + "FREQ_CPU=xxx FREQ_NPU=xxx FREQ_GPU=xxx"
+    local cpu_thr=0 npu_thr=0 gpu_thr=0
+
+    # CPU: soc-thermal passive trip = 75°C (75000 millidegrees)
+    local soc_temp
+    soc_temp=$(cat /sys/class/thermal/thermal_zone*/temp 2>/dev/null | head -1 || echo 0)
+    # Ищем именно soc-thermal
+    for zone_dir in /sys/class/thermal/thermal_zone*; do
+        local zname
+        zname=$(cat "$zone_dir/type" 2>/dev/null)
+        if [[ "$zname" == "soc-thermal" ]]; then
+            soc_temp=$(cat "$zone_dir/temp" 2>/dev/null || echo 0)
+            break
+        fi
+    done
+    [[ $soc_temp -ge 75000 ]] && cpu_thr=1
+
+    # NPU: ищем npu-thermal, порог 85°C
+    for zone_dir in /sys/class/thermal/thermal_zone*; do
+        local zname
+        zname=$(cat "$zone_dir/type" 2>/dev/null)
+        if [[ "$zname" == "npu-thermal" ]]; then
+            local npu_temp
+            npu_temp=$(cat "$zone_dir/temp" 2>/dev/null || echo 0)
+            [[ $npu_temp -ge 85000 ]] && npu_thr=1
+            break
+        fi
+    done
+
+    # GPU: ищем gpu-thermal, порог 85°C
+    for zone_dir in /sys/class/thermal/thermal_zone*; do
+        local zname
+        zname=$(cat "$zone_dir/type" 2>/dev/null)
+        if [[ "$zname" == "gpu-thermal" ]]; then
+            local gpu_temp
+            gpu_temp=$(cat "$zone_dir/temp" 2>/dev/null || echo 0)
+            [[ $gpu_temp -ge 85000 ]] && gpu_thr=1
+            break
+        fi
+    done
+
+    # Частоты для отображения
+    local cpu_freq npu_freq gpu_freq
+    cpu_freq=$(cat /sys/devices/system/cpu/cpufreq/policy6/scaling_cur_freq 2>/dev/null || echo 0)
+    npu_freq=$(cat /sys/class/devfreq/fdab0000.npu/cur_freq 2>/dev/null || echo 0)
+    gpu_freq=$(cat /sys/class/devfreq/fb000000.gpu/cur_freq 2>/dev/null || echo 0)
+
+    echo "CPU=${cpu_thr} NPU=${npu_thr} GPU=${gpu_thr} FREQ_CPU=${cpu_freq} FREQ_NPU=${npu_freq} FREQ_GPU=${gpu_freq}"
+}
+
+# ─── TUI: полосы (Unicode + ANSI) ───────────────────────────────────────────
+
+_COLOR_GREEN='\033[32m'
+_COLOR_YELLOW='\033[33m'
+_COLOR_RED='\033[31m'
+_COLOR_MAGENTA='\033[35m'
+_COLOR_RESET='\033[0m'
+
+bar() {
+    # $1 = процент (0-100), $2 = ширина полосы в символах
+    # $3 = "throttled" (опционально) — красный вместо зелёного
+    local pct=${1:-0}
+    local width=${2:-24}
+    local throttled="${3:-}"
+    [[ $pct -gt 100 ]] && pct=100
+    [[ $pct -lt 0 ]] && pct=0
+
+    local filled=$(( pct * width / 100 ))
+    local empty=$(( width - filled ))
+
+    local color
+    if [[ -n "$throttled" ]]; then
+        color="$_COLOR_MAGENTA"
+    else
+        color="$_COLOR_GREEN"
+    fi
+
+    printf "${color}["
+    local i
+    for ((i=0; i<filled; i++)); do printf '█'; done
+    for ((i=0; i<empty; i++)); do printf '░'; done
+    printf "]${_COLOR_RESET}"
+}
+
+temp_bar() {
+    # $1 = температура (°C, целое), $2 = ширина полосы
+    # Зелёный 0-60, жёлтый 60-85, красный 85-115
+    local temp=${1:-0}
+    local width=${2:-24}
+    local max_temp=115
+
+    [[ $temp -gt $max_temp ]] && temp=$max_temp
+    [[ $temp -lt 0 ]] && temp=0
+
+    local pct=$(( temp * 100 / max_temp ))
+
+    # Каждый символ полосы — диапазон temps_per_char градусов
+    local temps_per_char=$(( max_temp * 100 / width / 100 ))
+    [[ $temps_per_char -lt 1 ]] && temps_per_char=1
+
+    local filled=$(( pct * width / 100 ))
+    local empty=$(( width - filled ))
+
+    # Рисуем полосу сегментами: каждый сегмент окрашен по зоне
+    local i seg_temp
+    for ((i=0; i<filled; i++)); do
+        seg_temp=$(( (i + 1) * max_temp / width ))
+        if [[ $seg_temp -le 60 ]]; then
+            printf "${_COLOR_GREEN}█"
+        elif [[ $seg_temp -le 85 ]]; then
+            printf "${_COLOR_YELLOW}█"
+        else
+            printf "${_COLOR_RED}█"
+        fi
+    done
+    printf "${_COLOR_RESET}"
+    for ((i=0; i<empty; i++)); do printf '░'; done
+}
+
+# ─── TUI: мониторинг ───────────────────────────────────────────────────────
+
+monitor_tui() {
+    local elapsed=0
+
+    # CPU кластеры
+    init_cpu_clusters
+
+    # Определяем ширину полосы
+    local term_cols
+    term_cols=$(tput cols 2>/dev/null || echo 80)
+    local bar_w=$(( (term_cols - 34) / 2 ))
+    [[ $bar_w -lt 20 ]] && bar_w=20
+    [[ $bar_w -gt 40 ]] && bar_w=40
+
+    [[ -n "$LOG_FILE" ]] && echo "time,elapsed,cpu%,npu%,ram_used_mb,temps" > "$LOG_FILE"
+
+    tput clear 2>/dev/null
+
+    while true; do
+        sleep "$INTERVAL"
+        [[ $STOP -eq 1 ]] && break
+
+        elapsed=$((elapsed + INTERVAL))
+
+        if [[ $DURATION -gt 0 && $elapsed -ge $DURATION ]]; then
+            break
+        fi
+
+        # Сбор данных
+        local ts cpu_pct npu_pct npu_cores_str
+        ts=$(date +%H:%M:%S)
+        cpu_pct=$(read_cpu_load)
+        npu_pct=$(npu_load_avg)
+        npu_cores_str=$(read_npu_load_cores)
+        local ram_total ram_used
+        read -r ram_total ram_used <<< "$(read_ram)"
+
+        # CPU per-core
+        local cpu_cores_str
+        cpu_cores_str=$(read_cpu_load_cores)
+
+        # Троттлинг
+        local throttle_str
+        throttle_str=$(read_throttle_status)
+
+        # Парсим троттлинг в переменные
+        local thr_cpu=0 thr_npu=0 thr_gpu=0
+        local freq_cpu=0 freq_npu=0 freq_gpu=0
+        local token
+        for token in $throttle_str; do
+            local key="${token%%=*}"
+            local val="${token#*=}"
+            case "$key" in
+                CPU)      thr_cpu=$val ;;
+                NPU)      thr_npu=$val ;;
+                GPU)      thr_gpu=$val ;;
+                FREQ_CPU) freq_cpu=$val ;;
+                FREQ_NPU) freq_npu=$val ;;
+                FREQ_GPU) freq_gpu=$val ;;
+            esac
+        done
+
+        # Парсим per-core загрузку
+        declare -A core_loads=()
+        for token in $cpu_cores_str; do
+            local k="${token%%=*}"
+            local v="${token#*=}"
+            core_loads[$k]=$v
+        done
+
+        # ── Отрисовка ──
+        tput cup 0 0 2>/dev/null
+
+        # Заголовок
+        printf "\033[1m══════════════════════════════════════════════════════════════${_COLOR_RESET}\n"
+        printf "  СТРЕСС-ТЕСТ [%s]%*s%s\n" "$(printf '%02d:%02d:%02d' $((elapsed/3600)) $(((elapsed%3600)/60)) $((elapsed%60)))" $((term_cols - 50)) "" "$ts"
+        printf "\033[1m══════════════════════════════════════════════════════════════${_COLOR_RESET}\n"
+        echo ""
+
+        local BF="  %-20s"
+
+        # ── CPU ──
+        printf "  \033[1mCPU\033[0m\n"
+
+        local ci
+        for ci in "${!CLUSTER_NAMES[@]}"; do
+            local label="${CLUSTER_NAMES[$ci]}"
+            local -a cluster_cores=(${CLUSTER_CORES[$ci]})
+            local n_cores=${#cluster_cores[@]}
+
+            local sum=0 cnt=0
+            for c in "${cluster_cores[@]}"; do
+                local cv=${core_loads[cpu$c]:-0}
+                sum=$((sum + cv))
+                cnt=$((cnt + 1))
+            done
+            local avg=0
+            [[ $cnt -gt 0 ]] && avg=$((sum / cnt))
+
+            local cluster_freq=0
+            case "$label" in
+                LIT)  cluster_freq=$(cat /sys/devices/system/cpu/cpufreq/policy0/scaling_cur_freq 2>/dev/null || echo 0) ;;
+                BIG0) cluster_freq=$(cat /sys/devices/system/cpu/cpufreq/policy4/scaling_cur_freq 2>/dev/null || echo 0) ;;
+                BIG1) cluster_freq=$(cat /sys/devices/system/cpu/cpufreq/policy6/scaling_cur_freq 2>/dev/null || echo 0) ;;
+            esac
+
+            local cluster_thr=""
+            [[ $thr_cpu -eq 1 ]] && cluster_thr="thr"
+
+            printf "$BF" "${label} [${label}-$((n_cores - 1))]"
+            bar "$avg" "$bar_w" "$cluster_thr"
+            printf " %3s%%" "$avg"
+            if [[ -n "$cluster_thr" ]]; then
+                printf "  \033[31mСНИЖЕНО %s\033[0m" "$(freq_display "$cluster_freq")"
+            fi
+            echo ""
+
+            for c in "${cluster_cores[@]}"; do
+                local cv=${core_loads[cpu$c]:-0}
+                printf "$BF" "  cpu$c"
+                bar "$cv" "$bar_w" ""
+                printf " %3s%%\n" "$cv"
+            done
+        done
+        echo ""
+
+        # ── NPU ──
+        local npu_thr_tag=""
+        [[ $thr_npu -eq 1 ]] && npu_thr_tag="thr"
+
+        printf "  \033[1mNPU\033[0m\n"
+
+        if [[ "$npu_pct" == "-1" ]]; then
+            # debugfs недоступен — devfreq aggregate бесполезен
+            printf "$BF" "NPU"
+            printf "\033[90m["
+            local i
+            for ((i=0; i<bar_w; i++)); do printf '░'; done
+            printf "] \033[33mнет данных\033[0m \033[90m(требуется sudo)\033[0m"
+            echo ""
+        else
+            printf "$BF" "NPU"
+            bar "$npu_pct" "$bar_w" "$npu_thr_tag"
+            printf " %3s%%" "$npu_pct"
+            if [[ $thr_npu -eq 1 ]]; then
+                printf "  \033[31mСНИЖЕНО %s\033[0m" "$(freq_display "$freq_npu")"
+            fi
+            echo ""
+
+            local npu_core_num=0
+            for token in $npu_cores_str; do
+                local ck="${token%%=*}"
+                local cv="${token#*=}"
+                cv="${cv%%%}"
+                [[ -z "$cv" ]] && continue
+                [[ ! "$cv" =~ ^[0-9]+$ ]] && continue
+                printf "$BF" "  NPU${npu_core_num}"
+                bar "$cv" "$bar_w" "$npu_thr_tag"
+                printf " %3s%%\n" "$cv"
+                ((npu_core_num++))
+            done
+        fi
+        echo ""
+
+        # ── GPU ──
+        local gpu_load_str
+        gpu_load_str=$(cat /sys/class/devfreq/fb000000.gpu/load 2>/dev/null || echo "0")
+        local gpu_pct="${gpu_load_str%%@*}"
+        [[ ! "$gpu_pct" =~ ^[0-9]+$ ]] && gpu_pct=0
+        local gpu_thr_tag=""
+        [[ $thr_gpu -eq 1 ]] && gpu_thr_tag="thr"
+
+        printf "  \033[1mGPU\033[0m\n"
+        printf "$BF" "GPU"
+        bar "$gpu_pct" "$bar_w" "$gpu_thr_tag"
+        printf " %3s%%" "$gpu_pct"
+        if [[ $thr_gpu -eq 1 ]]; then
+            printf "  \033[31mСНИЖЕНО %s\033[0m" "$(freq_display "$freq_gpu")"
+        fi
+        echo ""
+        echo ""
+
+        # ── RAM ──
+        local ram_pct=0
+        [[ $ram_total -gt 0 ]] && ram_pct=$((ram_used * 100 / ram_total))
+
+        printf "  \033[1mRAM\033[0m\n"
+        printf "$BF" "${ram_used}/${ram_total} MB"
+        local ram_filled=$(( ram_pct * bar_w / 100 ))
+        local ram_empty=$(( bar_w - ram_filled ))
+        printf "${_COLOR_GREEN}["
+        local ri
+        for ((ri=0; ri<ram_filled; ri++)); do printf '█'; done
+        for ((ri=0; ri<ram_empty; ri++)); do printf '░'; done
+        printf "]${_COLOR_RESET} %3s%%\n" "$ram_pct"
+        echo ""
+
+        # ── ТЕМПЕРАТУРЫ ──
+        printf "  \033[1mТЕМПЕРАТУРЫ\033[0m\n"
+        for i in "${!THERMAL_NAMES[@]}"; do
+            local raw
+            raw=$(cat "${THERMAL_FILES[$i]}" 2>/dev/null || echo "0")
+            local temp=$((raw / 1000))
+            printf " $BF" "${THERMAL_SHORT[$i]}"
+            temp_bar "$temp" "$bar_w"
+            printf " %3d°C\n" "$temp"
+        done
+
+        echo ""
+        printf "\033[1m══════════════════════════════════════════════════════════════${_COLOR_RESET}\n"
+
+        # Лог
+        [[ -n "$LOG_FILE" ]] && {
+            local temps_csv=""
+            for f in "${THERMAL_FILES[@]}"; do
+                local raw; raw=$(cat "$f" 2>/dev/null || echo "0")
+                [[ -n "$temps_csv" ]] && temps_csv+=","
+                temps_csv+="$((raw / 1000))"
+            done
+            local csv_npu
+            [[ "$npu_pct" == "-1" ]] && csv_npu="" || csv_npu="$npu_pct"
+            echo "${ts},${elapsed},${cpu_pct},${csv_npu},${ram_used},${temps_csv}" >> "$LOG_FILE"
+        }
+    done
 }
 
 # ─── Управление процессами ─────────────────────────────────────────────────
@@ -966,15 +1421,18 @@ PYEOF
     # Копируем скрипт в контейнер
     docker cp "$host_script" percept:"$NPU_CONTAINER_SCRIPT" 2>/dev/null
     rm -f "$host_script"
-    # Маппинг модели: хост → Docker (/app/model/)
-    local docker_model="/app/model/$(basename "$MODEL_PATH")"
+    # Копируем стресс-модель в контейнер
+    local stress_basename
+    stress_basename=$(basename "$STRESS_MODEL_PATH")
+    docker cp "$STRESS_MODEL_PATH" percept:"/app/model/$stress_basename" 2>/dev/null
+    local docker_model="/app/model/$stress_basename"
     # Остановить предыдущий NPU stress в контейнере (если есть)
     kill_npu_stress_in_container
     sleep 1
     # Запуск через docker exec в фоне (хост PID = docker exec процесс)
     docker exec percept python3 "$NPU_CONTAINER_SCRIPT" "$docker_model" "$NPU_CORES" "$NPU_STREAMS" > /dev/null 2>&1 &
     NPU_PID=$!
-    echo "[NPU] ядра=$NPU_CORES × $NPU_STREAMS потоков модель=$(basename "$MODEL_PATH") (PID $NPU_PID)"
+    echo "[NPU] ядра=$NPU_CORES × $NPU_STREAMS потоков модель=$stress_basename (PID $NPU_PID)"
 }
 
 # ─── Мониторинг ─────────────────────────────────────────────────────────────
@@ -1011,7 +1469,9 @@ monitor() {
         local npu_pct; npu_pct=$(npu_load_avg)
         read -r _ ram_used <<< "$(read_ram)"
 
-        printf "%-8s %4s%% %4s%% %5s" "$ts" "$cpu_pct" "$npu_pct" "$ram_used"
+        local npu_display
+        [[ "$npu_pct" == "-1" ]] && npu_display=" n/a" || npu_display="$npu_pct"
+        printf "%-8s %4s%% %4s%% %5s" "$ts" "$cpu_pct" "$npu_display" "$ram_used"
         for f in "${THERMAL_FILES[@]}"; do
             local raw
             raw=$(cat "$f" 2>/dev/null || echo "0")
@@ -1026,7 +1486,9 @@ monitor() {
                 [[ -n "$temps_csv" ]] && temps_csv+=","
                 temps_csv+="$((raw / 1000))"
             done
-            echo "${ts},${elapsed},${cpu_pct},${npu_pct},${ram_used},${temps_csv}" >> "$LOG_FILE"
+            local csv_npu
+            [[ "$npu_pct" == "-1" ]] && csv_npu="" || csv_npu="$npu_pct"
+            echo "${ts},${elapsed},${cpu_pct},${csv_npu},${ram_used},${temps_csv}" >> "$LOG_FILE"
         }
     done
 }
@@ -1106,6 +1568,10 @@ if [[ $CPU_ONLY -eq 0 ]]; then
     sleep 5
 fi
 
-monitor
+if [[ "$DISPLAY_MODE" == "compact" ]]; then
+    monitor
+else
+    monitor_tui
+fi
 
 print_results
