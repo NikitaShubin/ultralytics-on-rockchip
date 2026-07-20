@@ -28,6 +28,8 @@ services:
       - ./templates:/app/templates:ro
       - ./benchmark:/app/benchmark:rw
       - ./datasets/coco_val2017:/app/coco_val2017:ro
+      - ./datasets/dotav1:/app/dotav1:ro
+      - ./datasets/cityscapes:/app/cityscapes:ro
     environment:
       - BACKEND=${BACKEND:-npu}
       - MODEL=${MODEL:-yolo11n}

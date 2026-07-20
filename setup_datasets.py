@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import argparse
 import subprocess
 import sys
 import zipfile
@@ -10,12 +11,15 @@ from pathlib import Path
 
 DATASETS_DIR = Path(__file__).parent / 'datasets'
 
+DOTAV1_URL = 'https://github.com/ultralytics/assets/releases/download/v0.0.0/DOTAv1.zip'
+CITYSCAPES_HF_REPO = 'Chris1/cityscapes'
+
 
 def download_file(url: str, dest: Path) -> None:
-    """Загрузка файла с прогрессом."""
+    """Загрузка файла с прогрессом (curl следует за редиректами)."""
     print(f'Загрузка {url}...')
     subprocess.run(
-        ['wget', '-q', '--show-progress', '-O', str(dest), url],
+        ['curl', '-fSL', '-o', str(dest), url],
         check=True,
     )
 
@@ -63,16 +67,214 @@ def setup_coco_val2017() -> None:
     print(f'COCO val2017 готова: {coco_dir}')
 
 
+def setup_dota_v1() -> None:
+    """Загрузка DOTAv1 val split (458 изображений + YOLO OBB аннотации).
+
+    Скачивает полный DOTAv1.zip (~1.9 ГБ), извлекает только val split,
+    удаляет zip-архив.
+    """
+    dota_dir = DATASETS_DIR / 'dotav1'
+    images_val = dota_dir / 'images' / 'val'
+    labels_val = dota_dir / 'labels' / 'val'
+
+    # Проверка: всё уже на месте
+    if (images_val.exists()
+            and (any(images_val.glob('*.png')) or any(images_val.glob('*.jpg')))
+            and labels_val.exists() and any(labels_val.glob('*.txt'))):
+        n_img = len(list(images_val.iterdir()))
+        n_lbl = len(list(labels_val.glob('*.txt')))
+        print(f'DOTAv1 val уже загружена: {n_img} изображений, {n_lbl} аннотаций')
+        return
+
+    print('Загрузка DOTAv1 (~1.9 ГБ)...')
+    zip_path = DATASETS_DIR / 'DOTAv1.zip'
+    if not zip_path.exists():
+        download_file(DOTAV1_URL, zip_path)
+
+    print('Распаковка val split из DOTAv1.zip...')
+    with zipfile.ZipFile(zip_path, 'r') as z:
+        # Список файлов val split (strip top-level dir)
+        val_files = [f for f in z.namelist() if '/val/' in f]
+        print(f'  Найдено {len(val_files)} файлов в val split')
+
+        for f in val_files:
+            # Strip top-level directory (DOTAv1/ или dota/)
+            parts = f.split('/')
+            if len(parts) > 1 and '.' not in parts[0]:
+                stripped = '/'.join(parts[1:])
+            else:
+                stripped = f
+            if not stripped:
+                continue
+            target = dota_dir / stripped
+            if f.endswith('/'):
+                target.mkdir(parents=True, exist_ok=True)
+            else:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                with z.open(f) as src, open(target, 'wb') as dst:
+                    dst.write(src.read())
+
+    # Удаляем zip
+    zip_path.unlink(missing_ok=True)
+
+    # Удаляем train split и прочие файлы если попали
+    for sub in ['train', 'test']:
+        for parent in [dota_dir / 'images', dota_dir / 'labels']:
+            d = parent / sub
+            if d.exists():
+                import shutil
+                shutil.rmtree(d)
+
+    # Удаляем лишние файлы из корня (LICENSE, README, и т.д.)
+    for f in dota_dir.iterdir():
+        if f.is_file():
+            f.unlink(missing_ok=True)
+
+    n_img = len(list(images_val.iterdir())) if images_val.exists() else 0
+    n_lbl = len(list(labels_val.glob('*.txt'))) if labels_val.exists() else 0
+    print(f'DOTAv1 val готова: {n_img} изображений, {n_lbl} аннотаций')
+    print(f'  Директория: {dota_dir}')
+
+
+def setup_cityscapes_val() -> None:
+    """Загрузка Cityscapes val split (500 изображений + маски).
+
+    Скачивает parquet-файлы val split напрямую с HuggingFace
+    и извлекает изображения и маски как PNG файлы.
+    """
+    cs_dir = DATASETS_DIR / 'cityscapes'
+    images_val = cs_dir / 'images' / 'val'
+    masks_val = cs_dir / 'masks' / 'val'
+
+    # Проверка: всё уже на месте
+    if (images_val.exists()
+            and len(list(images_val.glob('*.png'))) >= 450
+            and masks_val.exists()
+            and len(list(masks_val.glob('*.png'))) >= 450):
+        n_img = len(list(images_val.glob('*.png')))
+        n_mask = len(list(masks_val.glob('*.png')))
+        print(f'Cityscapes val уже загружена: {n_img} изображений, {n_mask} масок')
+        return
+
+    # Список parquet-файлов val split (через API с редиректами)
+    parquet_urls = [
+        'https://huggingface.co/api/datasets/Chris1/cityscapes/parquet/default/validation/0.parquet',
+        'https://huggingface.co/api/datasets/Chris1/cityscapes/parquet/default/validation/1.parquet',
+    ]
+
+    images_val.mkdir(parents=True, exist_ok=True)
+    masks_val.mkdir(parents=True, exist_ok=True)
+
+    # Проверяем, есть ли pyarrow (нужен для чтения parquet)
+    try:
+        import pyarrow.parquet as pq
+    except ImportError:
+        try:
+            import pyarrow
+        except ImportError:
+            print('Установка pyarrow...')
+            subprocess.check_call([
+                sys.executable, '-m', 'pip', 'install', '--user', 'pyarrow', '-q',
+            ])
+            import pyarrow.parquet as pq
+
+    from io import BytesIO
+    from PIL import Image
+
+    idx = 0
+    for url in parquet_urls:
+        fname = url.split('/')[-1]
+        cache_path = cs_dir / f'val_{fname}'
+
+        if not cache_path.exists():
+            print(f'Загрузка {fname}...')
+            subprocess.run(
+                ['curl', '-fSL', '-o', str(cache_path), url],
+                check=True,
+            )
+
+        print(f'Извлечение из {fname}...')
+        table = pq.read_table(str(cache_path))
+
+        for row_idx in range(len(table)):
+            row = {col: table.column(col)[row_idx].as_py() for col in table.column_names}
+
+            # Изображение
+            img_bytes = row['image']['bytes']
+            img = Image.open(BytesIO(img_bytes))
+
+            # Маска сегментации
+            mask_data = row['semantic_segmentation']
+            if isinstance(mask_data, dict) and 'bytes' in mask_data:
+                mask = Image.open(BytesIO(mask_data['bytes']))
+            elif isinstance(mask_data, dict) and 'path' in mask_data:
+                # Если путь — качаем отдельно
+                mask_url = f'https://huggingface.co/datasets/Chris1/cityscapes/resolve/main/{mask_data["path"]}'
+                mask_cache = cs_dir / mask_data['path'].split('/')[-1]
+                if not mask_cache.exists():
+                    subprocess.run(
+                        ['curl', '-fSL', '-o', str(mask_cache), mask_url],
+                        check=True,
+                    )
+                mask = Image.open(mask_cache)
+
+            image_path = images_val / f'{idx:06d}.png'
+            mask_path = masks_val / f'{idx:06d}.png'
+
+            if not image_path.exists():
+                img.save(image_path)
+            if not mask_path.exists():
+                mask.save(mask_path)
+
+            idx += 1
+
+            if idx % 50 == 0:
+                print(f'  Сохранено {idx}/500...')
+
+        # Освобождаем память
+        del table
+
+    # Удаляем parquet-кэш
+    for f in cs_dir.glob('val_*.parquet'):
+        f.unlink(missing_ok=True)
+
+    n_img = len(list(images_val.glob('*.png')))
+    n_mask = len(list(masks_val.glob('*.png')))
+    print(f'Cityscapes val готова: {n_img} изображений, {n_mask} масок')
+    print(f'  Директория: {cs_dir}')
+
+
 def main() -> None:
-    """Главная функция: загрузка всех необходимых датасетов."""
+    parser = argparse.ArgumentParser(
+        description='Загрузка датасетов для калибровки и валидации',
+    )
+    parser.add_argument('--coco', action='store_true', help='Загрузить COCO val2017')
+    parser.add_argument('--dota', action='store_true', help='Загрузить DOTAv1 val')
+    parser.add_argument('--cityscapes', action='store_true', help='Загрузить Cityscapes val')
+    parser.add_argument('--all', action='store_true', help='Загрузить все датасеты (по умолчанию)')
+    args = parser.parse_args()
+
+    # Если ничего не указано — загружаем всё
+    if not (args.coco or args.dota or args.cityscapes or args.all):
+        args.all = True
+
     DATASETS_DIR.mkdir(parents=True, exist_ok=True)
 
     print('=== Подготовка датасетов ===')
     print()
 
-    setup_coco_val2017()
+    if args.all or args.coco:
+        setup_coco_val2017()
+        print()
 
-    print()
+    if args.all or args.dota:
+        setup_dota_v1()
+        print()
+
+    if args.all or args.cityscapes:
+        setup_cityscapes_val()
+        print()
+
     print('=== Все датасеты готовы ===')
     print(f'Директория: {DATASETS_DIR}')
 

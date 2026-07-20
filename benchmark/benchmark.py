@@ -45,6 +45,12 @@ LOG_FILE = RESULTS_DIR / 'benchmark.log'
 COCO_VAL_DIR = PROJECT_DIR / 'datasets' / 'coco_val2017'
 COCO_VAL_CONTAINER = '/app/coco_val2017'
 
+DOTA_VAL_DIR = PROJECT_DIR / 'datasets' / 'dotav1'
+DOTA_VAL_CONTAINER = '/app/dotav1'
+
+CITYSCAPES_VAL_DIR = PROJECT_DIR / 'datasets' / 'cityscapes'
+CITYSCAPES_VAL_CONTAINER = '/app/cityscapes'
+
 WARMUP_S = int(os.environ.get('BENCH_WARMUP', '10'))
 MEASURE_S = int(os.environ.get('BENCH_MEASURE', '20'))
 CONVERT_TIMEOUT = int(os.environ.get('BENCH_CONVERT_TIMEOUT', '7200'))
@@ -63,6 +69,10 @@ def _container_data_path(data_dir: Path) -> str:
     """Сопоставление host data_dir с путём контейнера."""
     if data_dir.name == 'coco_val2017' or data_dir == COCO_VAL_DIR:
         return f'{COCO_VAL_CONTAINER}/images/val2017'
+    if data_dir.name == 'dotav1' or data_dir == DOTA_VAL_DIR:
+        return f'{DOTA_VAL_CONTAINER}/images/val'
+    if data_dir.name == 'cityscapes' or data_dir == CITYSCAPES_VAL_DIR:
+        return f'{CITYSCAPES_VAL_CONTAINER}/images/val'
     return f'/app/benchmark/data/{data_dir.name}'
 
 
@@ -77,6 +87,8 @@ def run_converter(model_name: str, task: str, output_dir: Path, data_dir: Path) 
         'docker', 'compose', '-f', str(CONVERTER_COMPOSE), 'run', '--rm',
         '-v', f'{BENCHMARK_DIR}:/app/benchmark',
         '-v', f'{COCO_VAL_DIR}:{COCO_VAL_CONTAINER}:ro',
+        '-v', f'{DOTA_VAL_DIR}:{DOTA_VAL_CONTAINER}:ro',
+        '-v', f'{CITYSCAPES_VAL_DIR}:{CITYSCAPES_VAL_CONTAINER}:ro',
         '-e', f'CONVERT_QUANTIZE={QUANTIZE}',
         '-e', 'KEEP_MODELS=1',
         '--entrypoint', 'python',
@@ -126,6 +138,8 @@ def run_validate(model_name: str, task: str, temp_dir: Path, data_dir: Path) -> 
         'docker', 'compose', '-f', str(CONVERTER_COMPOSE), 'run', '--rm',
         '-v', f'{BENCHMARK_DIR}:/app/benchmark',
         '-v', f'{COCO_VAL_DIR}:{COCO_VAL_CONTAINER}:ro',
+        '-v', f'{DOTA_VAL_DIR}:{DOTA_VAL_CONTAINER}:ro',
+        '-v', f'{CITYSCAPES_VAL_DIR}:{CITYSCAPES_VAL_CONTAINER}:ro',
         '--entrypoint', 'python',
         'converter',
         '/app/benchmark/validate_bench.py',
@@ -174,6 +188,8 @@ def run_fps(model_name: str, task: str, temp_dir: Path, data_dir: Path,
         'docker', 'compose', '-f', str(WEB_COMPOSE), 'run', '--rm',
         '-v', f'{BENCHMARK_DIR}:/app/benchmark',
         '-v', f'{COCO_VAL_DIR}:{COCO_VAL_CONTAINER}:ro',
+        '-v', f'{DOTA_VAL_DIR}:{DOTA_VAL_CONTAINER}:ro',
+        '-v', f'{CITYSCAPES_VAL_DIR}:{CITYSCAPES_VAL_CONTAINER}:ro',
         '-e', 'TEST_MODE=1',
         '-e', 'WEB_MODE=0',
         '-e', 'CAM_MODE=file',
@@ -342,6 +358,10 @@ def main() -> None:
 
         if model.dataset == 'coco_val2017':
             model_data_dir = COCO_VAL_DIR
+        elif model.dataset == 'dotav1':
+            model_data_dir = DOTA_VAL_DIR
+        elif model.dataset == 'cityscapes':
+            model_data_dir = CITYSCAPES_VAL_DIR
         else:
             model_data_dir = DATA_DIR / model.dataset
 

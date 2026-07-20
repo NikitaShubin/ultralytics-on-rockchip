@@ -52,6 +52,8 @@ test/*_preview.jpg
 
 # Datasets (large, downloaded on demand)
 datasets/coco_val2017/
+datasets/dotav1/
+datasets/cityscapes/
 
 # Overclock binaries
 overclock/*.dtbo

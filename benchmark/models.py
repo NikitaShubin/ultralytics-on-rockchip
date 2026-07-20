@@ -21,8 +21,8 @@ class Model(NamedTuple):
             'seg': 'coco_val2017',
             'pose': 'coco_val2017',
             'cls': 'coco_val2017',
-            'obb': 'dota8',
-            'sem': 'cityscapes8',
+            'obb': 'dotav1',
+            'sem': 'cityscapes',
         }[self.task]
 
     @property
