@@ -114,6 +114,7 @@ def main() -> dict:
     task = sys.argv[2]
     model_dir = Path(sys.argv[3])
     test_data_dir = sys.argv[4] if len(sys.argv) > 4 else '/app/coco_val2017/images/val2017'
+    input_size = int(sys.argv[5]) if len(sys.argv) > 5 else 640
 
     sys.stderr.write(json.dumps({'phase': 'start', 'model': model_name, 'task': task}) + '\n')
 
@@ -136,7 +137,7 @@ def main() -> dict:
         print(json.dumps(result))
         return result
 
-    sys.stderr.write(f'[ИНФО] загружено {len(images)} тестовых изображений\n')
+    sys.stderr.write(f'[ИНФО] загружено {len(images)} тестовых изображений, input_size={input_size}\n')
 
     t_start = time.time()
     results = {'model': model_name, 'task': task, 'validations': {}}
@@ -144,7 +145,7 @@ def main() -> dict:
     if rknn_none_path.exists():
         sys.stderr.write(f'[ВАЛИДАЦИЯ] FP32: ONNX vs {rknn_none_path.name}...\n')
         t0 = time.time()
-        v_fp32 = run_validation(str(onnx_path), str(rknn_none_path), images)
+        v_fp32 = run_validation(str(onnx_path), str(rknn_none_path), images, input_size=input_size)
         elapsed = time.time() - t0
         v_fp32['elapsed'] = round(elapsed, 1)
         results['validations']['fp32'] = v_fp32
@@ -157,7 +158,7 @@ def main() -> dict:
     if rknn_int8_path.exists():
         sys.stderr.write(f'[ВАЛИДАЦИЯ] INT8: ONNX vs {rknn_int8_path.name}...\n')
         t0 = time.time()
-        v_int8 = run_validation(str(onnx_path), str(rknn_int8_path), images)
+        v_int8 = run_validation(str(onnx_path), str(rknn_int8_path), images, input_size=input_size)
         elapsed = time.time() - t0
         v_int8['elapsed'] = round(elapsed, 1)
         results['validations']['int8'] = v_int8

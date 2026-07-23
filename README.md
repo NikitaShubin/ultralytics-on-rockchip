@@ -38,39 +38,76 @@
 ### Предустановка: RKNN Runtime (версия >= 2.3.2)
 
 Конвертер использует `rknn-toolkit2` v2.3.2 — хостовой runtime должен совпадать.
-Проверка текущей версии:
 
+Проверка текущей версии:
 ```bash
+# Читает строки из бинарника и ищет номер версии
 strings /usr/lib/librknnrt.so | grep "librknnrt version"
 ```
 
 Обновление (требуется root):
-
 ```bash
-# Бэкап + замена runtime (librknnrt.so + rknn_server)
-kill $(pgrep rknn_server)
+# 1. Остановить rknn_server, если запущен (без ошибки если не запущен)
+pgrep -x rknn_server && kill $(pgrep -x rknn_server) || true
+
+# 2. Бэкап текущего runtime перед заменой
 sudo cp /usr/lib/librknnrt.so /usr/lib/librknnrt.so.bak
-curl -sL -o /tmp/librknnrt.so "https://raw.githubusercontent.com/airockchip/rknn-toolkit2/master/rknpu2/runtime/Linux/librknn_api/aarch64/librknnrt.so"
-curl -sL -o /tmp/rknn_server "https://raw.githubusercontent.com/airockchip/rknn-toolkit2/master/rknpu2/runtime/Linux/rknn_server/aarch64/usr/bin/rknn_server"
+
+# 3. Скачать свежий librknnrt.so (библиотека NPU runtime)
+curl -sL -o /tmp/librknnrt.so \
+  "https://raw.githubusercontent.com/airockchip/rknn-toolkit2/master/rknpu2/runtime/Linux/librknn_api/aarch64/librknnrt.so"
+
+# 4. Скачать свежий rknn_server (демон для NPU)
+curl -sL -o /tmp/rknn_server \
+  "https://raw.githubusercontent.com/airockchip/rknn-toolkit2/master/rknpu2/runtime/Linux/rknn_server/aarch64/usr/bin/rknn_server"
+
+# 5. Заменить библиотеку (требует root, так как файл в /usr/lib)
 sudo cp /tmp/librknnrt.so /usr/lib/librknnrt.so
+
+# 6. Заменить бинарник сервера (требует root)
 sudo cp /tmp/rknn_server /usr/bin/rknn_server
+
+# 7. Сделать бинарник исполняемым
 sudo chmod +x /usr/bin/rknn_server
+
+# 8. Запустить rknn_server в фоне (NPU будет доступна для инференса)
 rknn_server &
 ```
 
 Откат:
 ```bash
-kill $(pgrep rknn_server)
+# Остановить текущий rknn_server
+pgrep -x rknn_server && kill $(pgrep -x rknn_server) || true
+
+# Восстановить бэкап библиотеки
 sudo cp /usr/lib/librknnrt.so.bak /usr/lib/librknnrt.so
+
+# Запустить восстановленный rknn_server
 rknn_server &
 ```
 
 ## Быстрый старт
 
+**Перед первым запуском** необходимо сконвертировать модель:
+
 ```bash
+# FP32 — быстрый старт, без калибровки и скачивания датасетов
+./deploy.sh yolo26n-pose
+```
+
+Это сконвертирует модель в RKNN (FP32) и запустит сервис.
+
+После этого можно переключать уже сконвертированные модели без повторной конвертации:
+
+```bash
+# Переключить на другую модель
+curl "http://localhost:5000/reload?model=yolo11n"
+
+# Конвертировать + запустить новую модель
+./deploy.sh yolo26n-seg
+
+# Просто перезапустить сервис (без конвертации)
 ./start.sh
-# или вручную:
-docker compose up -d --build
 ```
 
 Просмотр: `http://<host>:5000/`
@@ -136,17 +173,20 @@ sudo systemctl daemon-reload
 ## Деплой модели
 
 ```bash
-# Деплой текущей модели из model/
-./deploy.sh
-
-# Конвертация + деплой конкретной модели (INT8)
+# FP32 — без калибровки (быстрый старт)
 ./deploy.sh yolo26n-pose
 
-# Полный тест (конвертация + FPS бенчмарк + запуск)
-./deploy.sh yolo26n-pose --full-test
-```
+# INT8 — автозагрузка нужного датасета
+./deploy.sh yolo11n --int8            # COCO val2017 (~19 GB)
+./deploy.sh yolo26n-obb --int8        # DOTAv1 (~1.9 GB)
+./deploy.sh yolo26n-sem --int8        # Cityscapes val
 
-При первом запуске автоматически скачивается COCO val2017 (~19 GB) для калибровки INT8.
+# Конвертация + FPS бенчмарк + запуск
+./deploy.sh yolo26n-pose --full-test
+
+# Перезапуск текущей модели из model/
+./deploy.sh
+```
 
 ## Режимы камеры
 
@@ -195,14 +235,20 @@ docker compose run --rm converter convert my-model.pt
 
 ## Подготовка датасетов
 
-Датасет **скачивается автоматически** при первом запуске `./deploy.sh` (если отсутствует).
+Датасет **скачивается автоматически** при первом запуске `./deploy.sh --int8` (если отсутствует).
 Можно загрузить вручную:
 
 ```bash
+# Все три датасета
 python3 setup_datasets.py
+
+# Только нужный
+python3 setup_datasets.py --coco        # COCO val2017 (~19 GB) — detect, seg, cls, pose
+python3 setup_datasets.py --dota        # DOTAv1 (~1.9 GB) — obb
+python3 setup_datasets.py --cityscapes  # Cityscapes val — semantic
 ```
 
-Загружает COCO val2017 (~19 GB, 5000 изображений + аннотации) для калибровки и валидации.
+Для FP32-моделей датасеты **не нужны** — калибровка не выполняется.
 
 ## Бенчмарк (3 фазы)
 
@@ -366,6 +412,8 @@ video_loop.py                # Async capture → detect → notify loop
 websocket_server.py          # WebSocket push для live viewer
 detector_frame.py            # DetectorFrame dataclass
 utils.py                     # Обратная совместимость (переэкспорт из percept/)
+camtest.py                   # Утилита тестирования камеры
+validate_npu.py              # Утилита валидации NPU
 docker-compose.yml           # Сервис webcam
 Dockerfile                   # Образ (rknn-toolkit-lite2 + OpenCV + pypylon)
 model/                       # Активная модель (.rknn/.onnx + _postprocess.py)
@@ -375,29 +423,39 @@ templates/
 test/                        # Тестовые изображения
 start.sh                     # Запуск сервера
 stop.sh                      # Остановка сервера
-deploy.sh                    # Деплой модели (конвертация + тест + запуск, автозагрузка датасета)
-setup_datasets.py            # Загрузка датасетов (COCO val2017)
+deploy.sh                    # Деплой модели (конвертация + запуск, --int8 для калибровки)
+setup_datasets.py            # Загрузка датасетов (--coco, --dota, --cityscapes, --all)
+oc_manager.sh                # Менеджер разгона (test/apply/revert/monitor/set)
+oc_test.sh                   # Тест разгона (пошаговый переход по частотам)
 stress_test.sh               # Стресс-тест NPU/CPU/RAM (bash, Ctrl+C)
 stress_test.py               # Стресс-тест NPU/CPU/RAM (python)
 bench_overclock.sh           # Бенчмарк с разгоном CPU/NPU/GPU (FPS до → разгон → FPS после)
+overclock/
+└── rk3588-opi5pro-oc.dts    # Device tree overlay для разгона Orange Pi 5 Pro
 benchmark/
 ├── benchmark.py             # Оркестратор: --phase convert|validate|bench|all
 ├── convert_bench.py         # Фаза 1: экспорт + компиляция (4 файла на модель)
 ├── validate_bench.py        # Фаза 2: ONNX vs RKNN FP32+INT8 валидация
 ├── fps_bench.py             # Фаза 3: FPS + CPU/NPU нагрузка
 ├── models.py                # Списки моделей (FULL: 111, PILOT: 10)
-├── temp_models/             # Временные файлы конвертации (перенос на ПК)
+├── run.sh                   # Обёртка для benchmark.py
+├── setup_datasets.py        # Загрузка датасетов для бенчмарка
+├── temp_models/             # Временные файлы конвертации (создаётся при запуске)
 └── results/                 # Результаты (results.json, summary.tsv, benchmark.log)
 converter/
 ├── converter.py             # Конвертер YOLO → ONNX → RKNN
 ├── postprocess.py           # Постпроцесс (NMS, scale, decode)
 ├── eval_coco.py             # COCO mAP валидация
-├── templates/               # Шаблоны постпроцесса (6 задач)
+├── templates/               # Шаблоны постпроцесса (7 задач: det/seg/cls/pose/obb/sem/detr)
 ├── patches/                 # RKNN-патчи
 ├── weights/                 # Исходные .pt
+├── docker-compose.yml       # Docker compose конвертера
+├── Dockerfile               # Образ конвертера (python:3.11-slim, x86/ARM)
 └── model/                   # Скомпилированные модели
-datasets/
-└── coco_val2017/            # 5000 изображений + аннотации
+datasets/                    # Датасеты (скачиваются on-demand)
+├── coco_val2017/            # COCO val2017 — detect, seg, cls, pose (~19 GB)
+├── dotav1/                  # DOTAv1 — obb (~1.9 GB)
+└── cityscapes/              # Cityscapes — semantic
 ```
 
 ## Конфигурация

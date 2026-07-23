@@ -13,6 +13,8 @@ def apply():
     _patch_segment26(H.Segment26)
     _patch_pose26(H.Pose26)
     _patch_obb26(H.OBB26)
+    if hasattr(H, 'SemanticSegment'):
+        _patch_semantic_segment(H.SemanticSegment)
     _patch_rknn_config_fuse_bug()
     _patch_fold_constant()
 
@@ -72,13 +74,47 @@ def _patch_detect(cls):
     cls.forward = patched
 
 
+def _rknn_semantic_segment(self, x):
+    """RKNN совместимый forward для SemanticSegment.
+
+    Заменяет bilinear interpolation на nearest и убирает argmax,
+    которые не поддерживаются RKNN.
+    """
+    import torch.nn.functional as F
+    logits = self.classifier(x[0])
+    y = F.interpolate(logits, scale_factor=8, mode='nearest')
+    return y
+
+
+def _patch_semantic_segment(cls):
+    """Патч головы SemanticSegment для совместимости с RKNN."""
+    original = cls.forward
+
+    def patched(self, x):
+        if (self.export and self.format == "rknn") or getattr(self, '_rknn_mode', False):
+            return _rknn_semantic_segment(self, x)
+        return original(self, x)
+
+    cls.forward = patched
+
+
+def _resolve_heads(self):
+    """Определить box/cls/angle heads для old-style (cv2/cv3) и end2end (one2one)."""
+    if getattr(self, 'cv2', None) is not None:
+        return self.cv2, self.cv3, getattr(self, 'cv4', None)
+    o2o = getattr(self, 'one2one', None) or {}
+    third = o2o.get('angle_head') or o2o.get('mask_head')
+    return (o2o.get('box_head'), o2o.get('cls_head'), third)
+
+
 def _rknn_detect(self, x):
     """RKNN совместимый forward для Detect."""
     nl = self.nl
+    box_h, cls_h, _ = _resolve_heads(self)
     out = []
     for i in range(nl):
-        box = self.cv2[i](x[i])
-        cls = self.cv3[i](x[i]).sigmoid()
+        box = box_h[i](x[i])
+        cls = cls_h[i](x[i]).sigmoid()
         sm = cls.sum(dim=1, keepdim=True)
         out.extend([box, cls, sm])
     return out
@@ -99,11 +135,12 @@ def _patch_obb(cls):
 def _rknn_obb(self, x):
     """RKNN совместимый forward для OBB."""
     nl = self.nl
+    box_h, cls_h, angle_h = _resolve_heads(self)
     out = []
     for i in range(nl):
-        box = self.cv2[i](x[i])
-        cls = self.cv3[i](x[i]).sigmoid()
-        angle = self.cv4[i](x[i])
+        box = box_h[i](x[i])
+        cls = cls_h[i](x[i]).sigmoid()
+        angle = angle_h[i](x[i])
         out.extend([box, cls, angle])
     return out
 
@@ -111,12 +148,13 @@ def _rknn_obb(self, x):
 def _rknn_pose(self, x):
     """RKNN совместимый forward для Pose."""
     nl = self.nl
+    box_h, cls_h, kpt_h = _resolve_heads(self)
+    has_kpts_head = box_h is not None and hasattr(self, 'cv4_kpts') and self.cv4_kpts is not None
     out = []
-    has_kpts_head = hasattr(self, 'cv4_kpts') and self.cv4_kpts is not None
     for i in range(nl):
-        box = self.cv2[i](x[i])
-        cls = self.cv3[i](x[i]).sigmoid()
-        feat = self.cv4[i](x[i])
+        box = box_h[i](x[i])
+        cls = cls_h[i](x[i]).sigmoid()
+        feat = kpt_h[i](x[i]) if kpt_h is not None else x[i]
         if has_kpts_head:
             kpt = self.cv4_kpts[i](feat)
         else:
@@ -152,12 +190,13 @@ def _patch_segment(cls):
 def _rknn_segment(self, x):
     """RKNN совместимый forward для Segment."""
     nl = self.nl
+    box_h, cls_h, coeff_h = _resolve_heads(self)
     out = []
     p = self.proto(x[0])
     for i in range(nl):
-        box = self.cv2[i](x[i])
-        cls = self.cv3[i](x[i]).sigmoid()
-        coeff = self.cv4[i](x[i])
+        box = box_h[i](x[i])
+        cls = cls_h[i](x[i]).sigmoid()
+        coeff = coeff_h[i](x[i])
         out.extend([box, cls, coeff])
     out.append(p)
     return out
@@ -166,12 +205,13 @@ def _rknn_segment(self, x):
 def _rknn_segment26(self, x):
     """RKNN совместимый forward для Segment26."""
     nl = self.nl
+    box_h, cls_h, coeff_h = _resolve_heads(self)
     out = []
     p = self.proto(x)  # Proto26 ожидает полный список признаков backbone
     for i in range(nl):
-        box = self.cv2[i](x[i])
-        cls = self.cv3[i](x[i]).sigmoid()
-        coeff = self.cv4[i](x[i])
+        box = box_h[i](x[i])
+        cls = cls_h[i](x[i]).sigmoid()
+        coeff = coeff_h[i](x[i])
         out.extend([box, cls, coeff])
     out.append(p)
     return out

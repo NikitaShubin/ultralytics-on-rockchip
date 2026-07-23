@@ -89,7 +89,13 @@ class ModelBackend:
         if self.backend == 'cpu':
             return self._session.run(None, {self._input_name: tensor / 255.0})
         nhwc = tensor.transpose(0, 2, 3, 1)
-        return self.rknn.inference(inputs=[nhwc])
+        outputs = self.rknn.inference(inputs=[nhwc])
+        if outputs is None:
+            raise RuntimeError(
+                f'RKNN inference вернул None (input shape={nhwc.shape}, '
+                f'model={self.model_name}{self.rknn_suffix})'
+            )
+        return outputs
 
     def reload(self, model_name: str = '', backend: str | None = None,
                rknn_suffix: str | None = None) -> None:

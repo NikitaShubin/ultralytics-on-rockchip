@@ -25,6 +25,16 @@ from pathlib import Path
 
 import numpy as np
 
+# ─── Детекция rknnlite ──────────────────────────────────────────────────────
+
+try:
+    from rknnlite.api import RKNNLite as _RKNNLite
+    HAS_RKNNLITE = True
+except ImportError:
+    HAS_RKNNLITE = False
+
+PROJECT_DIR = Path(__file__).parent.resolve()
+
 # ─── Температура ───────────────────────────────────────────────────────────
 
 THERMAL_ZONES: dict[str, str] = {}
@@ -71,6 +81,7 @@ class NPUStress:
 
     На каждое ядро запускается `streams` потоков, каждый со своим RKNNRuntime,
     чтобы реально загрузить NPU (один поток = ~30-50% одного ядра).
+    Автоматически выбирает: прямой rknnlite (если доступен) или Docker.
     """
 
     def __init__(self, model_path: str, core_ids: list[int],
@@ -80,8 +91,28 @@ class NPUStress:
         self.fps_counter = fps_counter  # shared [total_frames, stop_flag]
         self.streams_per_core = streams_per_core
         self._threads: list[threading.Thread] = []
+        self._docker_proc: subprocess.Popen | None = None
 
     def start(self):
+        if HAS_RKNNLITE:
+            self._start_local()
+        else:
+            self._start_docker()
+
+    def stop(self):
+        self.fps_counter[1] = 1  # stop flag
+        if self._docker_proc:
+            self._docker_proc.terminate()
+            try:
+                self._docker_proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self._docker_proc.kill()
+            self._docker_proc = None
+        _stop_npu_stress_in_container()
+        for t in self._threads:
+            t.join(timeout=5)
+
+    def _start_local(self):
         for core_id in self.core_ids:
             for stream_idx in range(self.streams_per_core):
                 t = threading.Thread(
@@ -91,11 +122,6 @@ class NPUStress:
                 )
                 self._threads.append(t)
                 t.start()
-
-    def stop(self):
-        self.fps_counter[1] = 1  # stop flag
-        for t in self._threads:
-            t.join(timeout=5)
 
     def _run(self, core_id: int, stream_idx: int):
         from rknnlite.api import RKNNLite
@@ -131,6 +157,143 @@ class NPUStress:
 
         rknn.release()
         print(f'[NPU] {label}: остановлен')
+
+    def _start_docker(self):
+        """Запуск NPU стресса через Docker (rknnlite недоступен на хосте)."""
+        ensure_percept_container()
+
+        script_dir = Path(__file__).parent.resolve()
+        container_script = '/tmp/npu_stress_oc.py'
+
+        # Создаём скрипт инференса
+        import tempfile
+        host_script = tempfile.mktemp(suffix='.py')
+        cores_arg = ','.join(str(c) for c in self.core_ids)
+        with open(host_script, 'w') as f:
+            f.write(f'''\
+import sys, signal, threading, time, numpy as np
+CORES_MAP = {{
+    0: 'NPU_CORE_0', 1: 'NPU_CORE_1', 2: 'NPU_CORE_2',
+    3: 'NPU_CORE_0_1', 4: 'NPU_CORE_0_1_2',
+}}
+model_path = sys.argv[1]
+core_ids = [int(x) for x in sys.argv[2].split(',')]
+streams = int(sys.argv[3])
+stop = threading.Event()
+def run(core_id, idx):
+    from rknnlite.api import RKNNLite
+    core_name = CORES_MAP.get(core_id, f'NPU_CORE_{{core_id}}')
+    mask = getattr(RKNNLite, core_name, None)
+    if mask is None: return
+    rknn = RKNNLite()
+    if rknn.load_rknn(model_path) != 0:
+        print(f'[NPU] core{{core_id}}/s{{idx}}: load failed', file=sys.stderr); return
+    if rknn.init_runtime(core_mask=mask) != 0:
+        print(f'[NPU] core{{core_id}}/s{{idx}}: init failed', file=sys.stderr); return
+    dummy = np.random.randint(0, 255, (1, 3, 640, 640), dtype=np.uint8)
+    print(f'[NPU] core{{core_id}}/s{{idx}}: started', flush=True)
+    while not stop.is_set():
+        try:
+            rknn.inference(inputs=[dummy])
+        except Exception as e:
+            print(f'[NPU] core{{core_id}}/s{{idx}}: {{e}}', file=sys.stderr)
+            time.sleep(1)
+    rknn.release()
+    print(f'[NPU] core{{core_id}}/s{{idx}}: stopped', flush=True)
+for cid in core_ids:
+    for s in range(streams):
+        t = threading.Thread(target=run, args=(cid, s), daemon=True)
+        t.start()
+signal.signal(signal.SIGTERM, lambda *_: stop.set())
+signal.signal(signal.SIGINT, lambda *_: stop.set())
+while True: time.sleep(60)
+''')
+
+        # Копируем скрипт и модель в контейнер
+        subprocess.run(['docker', 'cp', host_script, f'percept:{container_script}'],
+                       capture_output=True)
+        os.unlink(host_script)
+
+        stress_basename = Path(self.model_path).name
+        container_model = f'/app/model/{stress_basename}'
+        subprocess.run(['docker', 'cp', self.model_path, f'percept:{container_model}'],
+                       capture_output=True)
+
+        _stop_npu_stress_in_container()
+        time.sleep(1)
+
+        cores_arg = ','.join(str(c) for c in self.core_ids)
+        self._docker_proc = subprocess.Popen(
+            ['docker', 'exec', 'percept', 'python3', container_script,
+             container_model, cores_arg, str(self.streams_per_core)],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        total = len(self.core_ids) * self.streams_per_core
+        print(f'[NPU] Docker: {len(self.core_ids)} ядра × {self.streams_per_core} потоков = {total} (PID {self._docker_proc.pid})')
+
+
+# ─── Docker container management ─────────────────────────────────────────────
+
+_percept_container_started = False
+
+
+def ensure_percept_container():
+    """Проверяет/запускает контейнер percept для NPU инференса."""
+    global _percept_container_started
+    result = subprocess.run(
+        ['docker', 'inspect', '-f', '{{.State.Running}}', 'percept'],
+        capture_output=True, text=True,
+    )
+    if result.stdout.strip() == 'true':
+        return True
+    print('[NPU] Контейнер percept не запущен, запускаю...')
+    subprocess.run(
+        ['docker', 'compose', '-f', str(PROJECT_DIR / 'docker-compose.yml'),
+         'up', '-d', 'percept'],
+        capture_output=True, text=True,
+    )
+    for _ in range(30):
+        time.sleep(1)
+        result = subprocess.run(
+            ['docker', 'inspect', '-f', '{{.State.Running}}', 'percept'],
+            capture_output=True, text=True,
+        )
+        if result.stdout.strip() == 'true':
+            time.sleep(2)
+            print('[OK] Контейнер percept запущен')
+            _percept_container_started = True
+            return True
+    print('[ОШИБКА] Не удалось запустить контейнер percept')
+    return False
+
+
+def stop_percept_if_started():
+    """Останавливает контейнер percept, если был запущен автоматически."""
+    global _percept_container_started
+    if _percept_container_started:
+        print('[NPU] Останавливаю контейнер percept...')
+        subprocess.run(
+            ['docker', 'compose', '-f', str(PROJECT_DIR / 'docker-compose.yml'),
+             'stop', 'percept'],
+            capture_output=True,
+        )
+        _percept_container_started = False
+
+
+def _stop_npu_stress_in_container():
+    """Останавливает NPU stress процессы внутри контейнера."""
+    subprocess.run(
+        ['docker', 'exec', 'percept', 'python3', '-c',
+         'import os,signal,glob\n'
+         'for f in glob.glob("/proc/[0-9]*/cmdline"):\n'
+         ' try:\n'
+         '  pid=int(f.split("/")[2])\n'
+         '  if pid<=1: continue\n'
+         '  cmd=open(f,"rb").read().decode("utf-8",errors="replace")\n'
+         '  if "npu_stress" in cmd: os.kill(pid,signal.SIGKILL)\n'
+         ' except: pass'],
+        capture_output=True,
+    )
 
 
 # ─── CPU стресс-тест ──────────────────────────────────────────────────────
@@ -394,7 +557,42 @@ def main():
     if args.model:
         model_path = args.model
     else:
-        model_path = str(Path(__file__).parent / 'model' / 'yolo26x-seg.rknn')
+        # Ищем стресс-модель: stress_model.rknn → model.rknn → генерация
+        candidates = [
+            PROJECT_DIR / 'model' / 'stress_model.rknn',
+            PROJECT_DIR / 'model' / 'model.rknn',
+            PROJECT_DIR / 'model' / 'yolo26x-seg.rknn',
+        ]
+        model_path = None
+        for c in candidates:
+            if c.exists():
+                model_path = str(c)
+                break
+        if model_path is None:
+            # Автогенерация стресс-модели
+            print('[NPU] RKNN модель не найдена, генерирую synth_stress...')
+            onnx_path = PROJECT_DIR / 'model' / 'synth_stress.onnx'
+            rknn_path = PROJECT_DIR / 'model' / 'stress_model.rknn'
+            if not onnx_path.exists():
+                subprocess.run(
+                    ['python3', str(PROJECT_DIR / 'converter' / 'synth_stress.py'),
+                     '-o', str(onnx_path)],
+                    check=True,
+                )
+            if not rknn_path.exists():
+                subprocess.run(
+                    ['docker', 'compose', '-f',
+                     str(PROJECT_DIR / 'converter' / 'docker-compose.yml'),
+                     'run', '--rm', '--entrypoint', 'python', 'converter', '-c',
+                     f'from rknn.api import RKNN; rknn=RKNN(); '
+                     f'rknn.config(mean_values=[[0,0,0]],std_values=[[255,255,255]],target_platform="rk3588"); '
+                     f'rknn.load_onnx(model="{onnx_path}"); '
+                     f'rknn.build(do_quantization=False); '
+                     f'rknn.export_rknn("{rknn_path}"); rknn.release(); print("OK")'],
+                    check=True,
+                )
+            model_path = str(rknn_path)
+            print(f'[OK] Стресс-модель: {model_path}')
     if not Path(model_path).exists():
         print(f'[ОШИБКА] модель не найдена: {model_path}')
         sys.exit(1)
@@ -469,6 +667,7 @@ def main():
             monitor.stop()
         if npu_stress:
             npu_stress.stop()
+        stop_percept_if_started()
         if cpu_stress:
             cpu_stress.stop()
         if ram_stress:

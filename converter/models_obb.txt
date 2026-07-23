@@ -1,0 +1,16 @@
+# Oriented bounding box models for RKNN
+yolov8n-obb
+yolov8s-obb
+yolov8m-obb
+yolov8l-obb
+yolov8x-obb
+yolo11n-obb
+yolo11s-obb
+yolo11m-obb
+yolo11l-obb
+yolo11x-obb
+yolo26n-obb
+yolo26s-obb
+yolo26m-obb
+yolo26l-obb
+yolo26x-obb

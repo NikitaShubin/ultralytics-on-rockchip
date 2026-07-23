@@ -1,0 +1,6 @@
+# Semantic segmentation models for RKNN
+yolo26n-sem
+yolo26s-sem
+yolo26m-sem
+yolo26l-sem
+yolo26x-sem

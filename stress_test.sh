@@ -37,6 +37,8 @@ DISPLAY_MODE="tui"
 SAVED_GOVERNORS=""
 SAVED_NPU_GOV=""
 SAVED_GPU_GOV=""
+# Автоуправление контейнером percept
+PERCEPT_CONTAINER_STARTED=0
 
 # ─── Overclock ──────────────────────────────────────────────────────────────
 
@@ -126,7 +128,44 @@ if [[ -n "$STRESS_MODEL" ]]; then
 elif [[ -f "$SCRIPT_DIR/model/stress_model.rknn" ]]; then
     STRESS_MODEL_PATH="$SCRIPT_DIR/model/stress_model.rknn"
 else
-    STRESS_MODEL_PATH="$MODEL_PATH"
+    # Автогенерация: ONNX через synth_stress.py → RKNN через converter
+    echo "[NPU] Стресс-модель не найдена, генерирую..."
+    ONNX_PATH="$SCRIPT_DIR/model/synth_stress.onnx"
+    RKNN_PATH="$SCRIPT_DIR/model/stress_model.rknn"
+    if [[ ! -f "$ONNX_PATH" ]]; then
+        python3 "$SCRIPT_DIR/converter/synth_stress.py" -o "$ONNX_PATH" 2>&1 || {
+            echo "[ОШИБКА] synth_stress.py не удался"; exit 1
+        }
+    fi
+    # Конвертация ONNX → RKNN через converter контейнер
+    if [[ ! -f "$RKNN_PATH" ]]; then
+        _py_code=$(mktemp /tmp/rknn_build_XXXXXX.py)
+        cat > "$_py_code" <<'INNEREOF'
+from rknn.api import RKNN
+import sys, os
+onnx_path = os.environ['ONNX_PATH']
+rknn_path = os.environ['RKNN_PATH']
+rknn = RKNN()
+rknn.config(mean_values=[[0,0,0]], std_values=[[255,255,255]], target_platform='rk3588')
+rknn.load_onnx(model=onnx_path)
+rknn.build(do_quantization=False)
+rknn.export_rknn(rknn_path)
+rknn.release()
+print('OK')
+INNEREOF
+        docker compose -f "$SCRIPT_DIR/converter/docker-compose.yml" run --rm \
+            -e "ONNX_PATH=$ONNX_PATH" -e "RKNN_PATH=$RKNN_PATH" \
+            --entrypoint python converter "$_py_code" 2>&1 \
+            || { echo "[ОШИБКА] RKNN конвертация не удалась"; rm -f "$_py_code"; exit 1; }
+        rm -f "$_py_code"
+    fi
+    if [[ -f "$RKNN_PATH" ]]; then
+        STRESS_MODEL_PATH="$RKNN_PATH"
+        echo "[OK] Стресс-модель сгенерирована: $RKNN_PATH"
+    else
+        STRESS_MODEL_PATH="$MODEL_PATH"
+        echo "[WARN] Не удалось сгенерировать, используется: $MODEL_PATH"
+    fi
 fi
 if [[ ! -f "$STRESS_MODEL_PATH" ]]; then
     echo "[ОШИБКА] Стресс-модель не найдена: $STRESS_MODEL_PATH"
@@ -1386,6 +1425,9 @@ cleanup() {
     # Восстановить оригинальные governors (performance → ondemand)
     restore_saved_governors
 
+    # Остановить контейнер percept, если был запущен автоматически
+    stop_percept_if_started
+
     echo "[ГОТОВО] Нагрузка снята"
 }
 
@@ -1418,9 +1460,43 @@ start_ram_stress() {
 
 # ─── NPU stress (Python через Docker, rknnlite только в контейнере) ──────────
 
+ensure_percept_container() {
+    # Проверяет, запущен ли контейнер percept. Если нет — запускает.
+    local status
+    status=$(docker inspect -f '{{.State.Running}}' percept 2>/dev/null || echo "false")
+    if [[ "$status" == "true" ]]; then
+        return 0
+    fi
+    echo "[NPU] Контейнер percept не запущен, запускаю..."
+    docker compose -f "$SCRIPT_DIR/docker-compose.yml" up -d percept 2>&1 | tail -3
+    # Ждать готовности контейнера (rknn_server внутри)
+    local i
+    for ((i=0; i<30; i++)); do
+        status=$(docker inspect -f '{{.State.Running}}' percept 2>/dev/null || echo "false")
+        if [[ "$status" == "true" ]]; then
+            sleep 2
+            echo "[OK] Контейнер percept запущен"
+            PERCEPT_CONTAINER_STARTED=1
+            return 0
+        fi
+        sleep 1
+    done
+    echo "[ОШИБКА] Не удалось запустить контейнер percept"
+    return 1
+}
+
+stop_percept_if_started() {
+    if [[ $PERCEPT_CONTAINER_STARTED -eq 1 ]]; then
+        echo "[NPU] Останавливаю контейнер percept (был запущен автоматически)..."
+        docker compose -f "$SCRIPT_DIR/docker-compose.yml" stop percept 2>/dev/null
+        PERCEPT_CONTAINER_STARTED=0
+    fi
+}
+
 NPU_CONTAINER_SCRIPT="/tmp/npu_stress_oc.py"
 
 start_npu_stress() {
+    ensure_percept_container || return 1
     local host_script
     host_script=$(mktemp /tmp/npu_stress_XXXXXX.py)
     cat > "$host_script" <<'PYEOF'

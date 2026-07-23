@@ -23,6 +23,10 @@ COCO_VAL_DIR = Path("/app/coco_val2017")
 COCO_VAL_IMG_DIR = COCO_VAL_DIR / "images" / "val2017"
 COCO_VAL_YAML = COCO_VAL_DIR / "coco_val.yaml"
 COCO_VAL_POSE_YAML = COCO_VAL_DIR / "coco_val_pose.yaml"
+DOTA_VAL_DIR = Path("/app/dotav1")
+DOTA_VAL_IMG_DIR = DOTA_VAL_DIR / "images" / "val"
+CITYSCAPES_VAL_DIR = Path("/app/cityscapes")
+CITYSCAPES_VAL_IMG_DIR = CITYSCAPES_VAL_DIR / "images" / "val"
 MODEL_DIR = Path("/app/converter/model")
 WEIGHTS_DIR = Path("/app/converter/weights")
 
@@ -77,29 +81,68 @@ def _clean_pt_cache(name):
             f.unlink(missing_ok=True)
 
 
-def _ensure_coco_val():
-    """Проверить наличие COCO val 2017 (зашит в Docker-образ)."""
-    if not COCO_VAL_IMG_DIR.exists() or not list(COCO_VAL_IMG_DIR.glob("*.jpg")):
+def _dataset_name(task: str) -> str:
+    """Вернуть читаемое имя датасета для задачи."""
+    return {
+        "detect": "COCO val2017",
+        "segment": "COCO val2017",
+        "classify": "COCO val2017",
+        "pose": "COCO val2017",
+        "obb": "DOTAv1",
+        "semantic": "Cityscapes",
+    }.get(task, "COCO val2017")
+
+
+def _ensure_dataset(task: str = "detect") -> Path:
+    """Проверить наличие нужного датасета для калибровки. Вернуть путь к датасету."""
+    if task == "obb":
+        if DOTA_VAL_IMG_DIR.exists() and any(DOTA_VAL_IMG_DIR.glob("*.png")):
+            n = len(list(DOTA_VAL_IMG_DIR.glob("*.png")))
+            log(f"DOTA val готова: {n} изображений")
+            return DOTA_VAL_DIR
+        raise RuntimeError(
+            f"DOTA val не найдена в {DOTA_VAL_DIR}. "
+            f"Скачайте: python3 setup_datasets.py --dota"
+        )
+    elif task == "semantic":
+        if CITYSCAPES_VAL_IMG_DIR.exists() and any(CITYSCAPES_VAL_IMG_DIR.glob("*.png")):
+            n = len(list(CITYSCAPES_VAL_IMG_DIR.glob("*.png")))
+            log(f"Cityscapes val готова: {n} изображений")
+            return CITYSCAPES_VAL_DIR
+        raise RuntimeError(
+            f"Cityscapes val не найдена в {CITYSCAPES_VAL_DIR}. "
+            f"Скачайте: python3 setup_datasets.py --cityscapes"
+        )
+    else:
+        if COCO_VAL_IMG_DIR.exists() and any(COCO_VAL_IMG_DIR.glob("*.jpg")):
+            n = len(list(COCO_VAL_IMG_DIR.glob("*.jpg")))
+            log(f"COCO val 2017 готова: {n} изображений")
+            return COCO_VAL_DIR
         raise RuntimeError(
             f"COCO val 2017 не найдена в {COCO_VAL_IMG_DIR}. "
-            f"Убедитесь, что Docker-образ содержит набор данных."
+            f"Скачайте: python3 setup_datasets.py --coco"
         )
-    n = len(list(COCO_VAL_IMG_DIR.glob("*.jpg")))
-    log(f"COCO val 2017 готова: {n} изображений")
-    return COCO_VAL_DIR
 
 
 def _make_calib_yaml(task: str = "detect") -> str:
-    """Генерирует калибровочный YAML на лету из полного val2017.
+    """Генерирует калибровочный YAML на лету для нужного датасета и задачи."""
+    data_dir = _ensure_dataset(task)
 
-    Все изображения COCO val2017 (5000 шт.) используются и для калибровки,
-    и для валидации — никаких отдельных папок.
-    """
+    if task == "obb":
+        return _make_dota_calib_yaml(data_dir)
+    elif task == "semantic":
+        return _make_cityscapes_calib_yaml(data_dir)
+    else:
+        return _make_coco_calib_yaml(data_dir, task)
+
+
+def _make_coco_calib_yaml(data_dir: Path, task: str = "detect") -> str:
+    """Калибровочный YAML для COCO val2017 (detect, seg, cls, pose)."""
     n = len(list(COCO_VAL_IMG_DIR.glob("*.jpg")))
-    log(f"Калибровочный набор данных: {n} изображений из {COCO_VAL_IMG_DIR}")
+    log(f"Калибровочный набор: COCO val2017 — {n} изображений")
 
     lines = [
-        f"path: {COCO_VAL_DIR}",
+        f"path: {data_dir}",
         f"train: images/val2017",
         f"val: images/val2017",
     ]
@@ -113,18 +156,6 @@ def _make_calib_yaml(task: str = "detect") -> str:
             "  val: annotations/person_keypoints_val2017.json",
             "names:",
             "  0: person",
-        ])
-    elif task in ("segment", "semantic"):
-        lines.extend([
-            "nc: 80",
-            "names:",
-        ])
-        for i, name in enumerate(COCO_CLASSES):
-            lines.append(f"  {i}: {name}")
-        lines.extend([
-            "annotations:",
-            "  train: annotations/instances_val2017.json",
-            "  val: annotations/instances_val2017.json",
         ])
     else:
         lines.extend([
@@ -141,7 +172,69 @@ def _make_calib_yaml(task: str = "detect") -> str:
 
     calib_yaml = Path("/tmp/calib.yaml")
     calib_yaml.write_text("\n".join(lines) + "\n")
-    log(f"Сгенерирован калибровочный YAML: {calib_yaml} (задача={task}, {n} изображений)")
+    log(f"Калибровочный YAML: {calib_yaml} (задача={task})")
+    return str(calib_yaml)
+
+
+def _make_dota_calib_yaml(data_dir: Path) -> str:
+    """Калибровочный YAML для DOTAv1 (obb)."""
+    n = len(list(DOTA_VAL_IMG_DIR.glob("*.png")))
+    log(f"Калибровочный набор: DOTAv1 val — {n} изображений")
+
+    lines = [
+        f"path: {data_dir}",
+        f"train: images/val",
+        f"val: images/val",
+        "nc: 15",
+        "names:",
+        "  0: plane",
+        "  1: ship",
+        "  2: storage-tank",
+        "  3: baseball-diamond",
+        "  4: tennis-court",
+        "  5: basketball-court",
+        "  6: ground-track-field",
+        "  7: soccer-ball-field",
+        "  8: roundabout",
+        "  9: harbor",
+        "  10: swimming-pool",
+        "  11: helicopter",
+        "  12: vehicle",
+        "  13: helicopter",  # placeholder (DOTA has 15 classes, ultralytics OBB uses subset)
+        "  14: container-crane",
+    ]
+
+    calib_yaml = Path("/tmp/calib.yaml")
+    calib_yaml.write_text("\n".join(lines) + "\n")
+    log(f"Калибровочный YAML: {calib_yaml} (задача=obb)")
+    return str(calib_yaml)
+
+
+def _make_cityscapes_calib_yaml(data_dir: Path) -> str:
+    """Калибровочный YAML для Cityscapes val (semantic)."""
+    n = len(list(CITYSCAPES_VAL_IMG_DIR.glob("*.png")))
+    log(f"Калибровочный набор: Cityscapes val — {n} изображений")
+
+    CITYSCAPES_CLASSES = [
+        "road", "sidewalk", "building", "wall", "fence", "pole",
+        "traffic light", "traffic sign", "vegetation", "terrain",
+        "sky", "person", "rider", "car", "truck", "bus",
+        "train", "motorcycle", "bicycle",
+    ]
+
+    lines = [
+        f"path: {data_dir}",
+        f"train: images/val",
+        f"val: images/val",
+        f"nc: {len(CITYSCAPES_CLASSES)}",
+        "names:",
+    ]
+    for i, name in enumerate(CITYSCAPES_CLASSES):
+        lines.append(f"  {i}: {name}")
+
+    calib_yaml = Path("/tmp/calib.yaml")
+    calib_yaml.write_text("\n".join(lines) + "\n")
+    log(f"Калибровочный YAML: {calib_yaml} (задача=semantic)")
     return str(calib_yaml)
 
 
@@ -211,12 +304,12 @@ def export_and_compile(pt_path, info=None, quantize="none"):
 
     export_kwargs = {"format": "rknn", "opset": opset}
     if quantize == "int8":
-        _ensure_coco_val()
         task = info.get("task", "detect") if info else "detect"
+        _ensure_dataset(task)
         data_yaml = _make_calib_yaml(task)
         export_kwargs["data"] = data_yaml
         export_kwargs["quantize"] = 8
-        log(f"Квантизация INT8 включена, калибровка: COCO val 2017 (все изображения, задача={task})")
+        log(f"Квантизация INT8: задача={task}, калибровка из {_dataset_name(task)}")
 
     t0 = time.time()
     log(f"Запуск model.export() ...")
@@ -903,18 +996,12 @@ def load_model_list(path):
     return names
 
 
-def cmd_test_all_detect(args):
-    """Тестирование всех моделей детекции."""
+def cmd_test_all(args):
+    """Универсальное тестирование моделей по списку."""
     models = load_model_list(args.model_list)
     if not models:
-        log("Список моделей не найден, используются модели детекции по умолчанию")
-        models = [
-            "yolov8n", "yolov8s", "yolov8m", "yolov8l", "yolov8x",
-            "yolov5nu", "yolov5su", "yolov5mu", "yolov5lu", "yolov5xu",
-            "yolov9t", "yolov9s", "yolov9m", "yolov9c", "yolov9e",
-            "yolov10n", "yolov10s", "yolov10m", "yolov10l", "yolov10b", "yolov10x",
-            "yolo11n", "yolo11s", "yolo11m", "yolo11l", "yolo11x",
-        ]
+        log(f"Список моделей не найден: {args.model_list}")
+        return {}
 
     results = {}
     for name in models:
@@ -922,7 +1009,13 @@ def cmd_test_all_detect(args):
         log(f"Тестирование {name}...")
         try:
             pt = resolve_pt(name)
-            res = cmd_convert(argparse.Namespace(model=name, **vars(args)))
+            convert_args = argparse.Namespace(
+                model=name,
+                quantize=getattr(args, "quantize", "none"),
+                test=True,
+                deploy=False,
+            )
+            res = cmd_convert(convert_args)
             results[name] = {"status": "ПРОЙДЕНО" if res.get("pass") else "ПРОВАЛ", **res}
         except Exception as e:
             log(f"ОШИБКА: {e}")
@@ -932,14 +1025,48 @@ def cmd_test_all_detect(args):
     print(f"\n{'='*60}")
     print("ИТОГИ")
     print(f"{'='*60}")
-    print(f"{'Модель':<20} {'Статус':<8} {'max_diff':<10} {'iou_avg':<10}")
-    print("-" * 50)
+    print(f"{'Модель':<25} {'Статус':<8} {'max_diff':<10} {'iou_avg':<10}")
+    print("-" * 55)
     for name, res in results.items():
         md = res.get("max_diff_avg", "-")
         iou = res.get("iou_avg", "-")
-        print(f"{name:<20} {res['status']:<8} {md:<10} {iou:<10}")
+        print(f"{name:<25} {res['status']:<8} {md:<10} {iou:<10}")
 
     return results
+
+
+def cmd_test_all_tasks(args):
+    """Тестирование всех типов моделей (detect, seg, cls, pose, obb, sem)."""
+    task_lists = [
+        ("detect", "models_detect.txt"),
+        ("seg",    "models_seg.txt"),
+        ("cls",    "models_cls.txt"),
+        ("pose",   "models_pose.txt"),
+        ("obb",    "models_obb.txt"),
+        ("sem",    "models_sem.txt"),
+    ]
+
+    all_results = {}
+    for task, default_list in task_lists:
+        log(f"\n{'#'*60}")
+        log(f"# ТЕСТИРОВАНИЕ: {task}")
+        log(f"{'#'*60}")
+        model_list = getattr(args, 'model_list', None) or default_list
+        task_args = argparse.Namespace(model_list=model_list, **vars(args))
+        results = cmd_test_all(task_args)
+        all_results.update(results)
+
+    print(f"\n{'='*60}")
+    print("ИТОГИ ВСЕХ ЗАДАЧ")
+    print(f"{'='*60}")
+    print(f"{'Модель':<25} {'Статус':<8} {'max_diff':<10} {'iou_avg':<10}")
+    print("-" * 55)
+    for name, res in all_results.items():
+        md = res.get("max_diff_avg", "-")
+        iou = res.get("iou_avg", "-")
+        print(f"{name:<25} {res['status']:<8} {md:<10} {iou:<10}")
+
+    return all_results
 
 
 def export_onnx_only(pt_path):
@@ -1031,9 +1158,30 @@ def main():
     p_validate = sub.add_parser("validate", help="Validate existing .rknn against COCO val2017")
     p_validate.add_argument("model", help="Path or name of .rknn file")
 
-    p_test = sub.add_parser("test-all-detect", help="Test all detection models")
-    p_test.add_argument("--model-list", default="models_detect.txt",
-                        help="Path to model list file")
+    TASK_LISTS = [
+        ("detect", "models_detect.txt"),
+        ("seg",    "models_seg.txt"),
+        ("cls",    "models_cls.txt"),
+        ("pose",   "models_pose.txt"),
+        ("obb",    "models_obb.txt"),
+        ("sem",    "models_sem.txt"),
+    ]
+
+    for task, default_list in TASK_LISTS:
+        cmd_name = f"test-all-{task}"
+        p = sub.add_parser(cmd_name, help=f"Test all {task} models")
+        p.add_argument("--model-list", default=default_list,
+                       help="Path to model list file")
+
+    p_test_all = sub.add_parser("test-all", help="Test ALL task types (detect, seg, cls, pose, obb, sem)")
+    p_test_all.add_argument("--model-list", default=None,
+                            help="Override model list (for single-task testing)")
+
+    for task, default_list in TASK_LISTS:
+        cmd_name = f"batch-onnx-{task}"
+        p = sub.add_parser(cmd_name, help=f"Export ONNX (RK-opt) for all {task} models")
+        p.add_argument("--model-list", default=default_list,
+                       help="Path to model list file")
 
     p_batch_onnx = sub.add_parser("batch-onnx", help="Export ONNX (RK-opt) for all models in list")
     p_batch_onnx.add_argument("--model-list", default="models_detect.txt",
@@ -1057,8 +1205,12 @@ def main():
         cmd_convert(args)
     elif args.command == "validate":
         cmd_validate(args)
-    elif args.command == "test-all-detect":
-        cmd_test_all_detect(args)
+    elif args.command == "test-all":
+        cmd_test_all_tasks(args)
+    elif args.command and args.command.startswith("test-all-"):
+        cmd_test_all(args)
+    elif args.command and args.command.startswith("batch-onnx-"):
+        cmd_batch_onnx(args)
     elif args.command == "batch-onnx":
         cmd_batch_onnx(args)
     elif args.command == "convert-all":

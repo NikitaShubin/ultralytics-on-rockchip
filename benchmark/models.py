@@ -62,6 +62,9 @@ PILOT = _build([
     ('yolov3', ['u'], ['detect']),
     ('yolov5', ['nu'], ['detect']),
     ('yolov8', ['n'], ['detect', 'seg', 'pose', 'obb', 'cls']),
-    ('yolo11', ['n'], ['detect']),
-    ('yolo26', ['n'], ['detect', 'sem']),
+    ('yolov9', ['t'], ['detect']),
+    ('yolov10', ['n'], ['detect']),
+    ('yolo11', ['n'], ['detect', 'seg', 'cls', 'pose', 'obb']),
+    ('yolo12', ['n'], ['detect']),
+    ('yolo26', ['n'], ['detect', 'seg', 'cls', 'pose', 'obb', 'sem']),
 ])
