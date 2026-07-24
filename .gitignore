@@ -24,6 +24,7 @@ converter/check0_*/
 converter/check1_*/
 converter/check2_*/
 converter/core.*
+converter/postprocess.py
 
 # Benchmark temp files (large RKNN conversion artifacts)
 benchmark/temp_models/
