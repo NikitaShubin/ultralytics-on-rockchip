@@ -307,7 +307,7 @@ python benchmark.py --phase convert validate --clean
 |-------------|----------|
 | `onnx` | Только ONNX CPU |
 | `none` | Только FP32 RKNN |
-| `int8` | INT8 RKNN (нужен датасет, автозагрузка) |
+| `int8` | INT8 без калибровки (без скачивания датасета) |
 | `int8-calib` | INT8 с калибровкой на датасете |
 | `all` | Все варианты (по умолчанию) |
 

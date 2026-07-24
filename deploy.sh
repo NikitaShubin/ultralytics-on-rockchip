@@ -4,7 +4,7 @@
 # Использование:
 #   ./deploy.sh yolo26n-pose                # FP16 RKNN (быстрый старт)
 #   ./deploy.sh yolo26n-pose --fp16         # FP16 RKNN (то же что без флага)
-#   ./deploy.sh yolo26n-pose --int8         # INT8 (нужен датасет, автозагрузка)
+#   ./deploy.sh yolo26n-pose --int8         # INT8 без калибровки
 #   ./deploy.sh yolo26n-pose --int8-calib   # INT8 с калибровкой (нужен датасет)
 #   ./deploy.sh yolo26n-pose --onnx         # ONNX на CPU (без NPU)
 #   ./deploy.sh yolo26n-pose --full-test    # Конвертация + FPS тест
@@ -60,9 +60,8 @@ quantize_label() {
 # Гарантируем mount-точки до любого вызова Docker
 ensure_mountpoints
 
-# Скачать датасет для int8 / int8-calib и только нужный
-if [ "$QUANTIZE" = "int8" ] || [ "$QUANTIZE" = "int8-calib" ]; then
-    if [ -n "$MODEL" ]; then
+# Скачать датасет только для int8-calib и только нужный
+if [ "$QUANTIZE" = "int8-calib" ] && [ -n "$MODEL" ]; then
     DATASET=$(detect_dataset "$MODEL")
 
     if [ "$DATASET" = "coco" ]; then
@@ -89,7 +88,6 @@ if [ "$QUANTIZE" = "int8" ] || [ "$QUANTIZE" = "int8-calib" ]; then
             echo "=== Загрузка ImageNet val (~6.3 GB) для калибровки INT8 Classify ==="
             python3 setup_datasets.py --imagenet
         fi
-    fi
     fi
 fi
 
