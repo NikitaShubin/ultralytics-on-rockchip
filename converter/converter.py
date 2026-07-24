@@ -1012,9 +1012,14 @@ def cmd_convert(args):
 
     log("Шаг 2: Экспорт ONNX + сборка RKNN")
     quantize = getattr(args, "quantize", "none")
-    if quantize != "none":
-        log(f"Режим квантизации: {quantize}")
-    onnx_path, rknn_path = export_and_compile(pt, info, quantize=quantize)
+    if quantize == "onnx":
+        log("Режим: только ONNX (без RKNN)")
+        onnx_path = export_onnx_only(pt)
+        rknn_path = None
+    else:
+        if quantize != "none":
+            log(f"Режим квантизации: {quantize}")
+        onnx_path, rknn_path = export_and_compile(pt, info, quantize=quantize)
 
     if args.test:
         log("Шаг 3: Валидация")
@@ -1266,8 +1271,8 @@ def main():
 
     p_convert = sub.add_parser("convert", help="Convert .pt → ONNX (RK-opt) → RKNN → validate")
     p_convert.add_argument("model", help="Model name or path (e.g. yolov8m.pt)")
-    p_convert.add_argument("--quantize", choices=["none", "int8", "int8-calib"], default="none",
-                           help="INT8 quantization: none=FP32, int8=INT8 без калибровки, int8-calib=INT8 с калибровкой")
+    p_convert.add_argument("--quantize", choices=["onnx", "none", "int8", "int8-calib"], default="none",
+                           help="onnx=только ONNX (CPU), none=FP16 RKNN, int8=INT8 без калибровки, int8-calib=INT8 с калибровкой")
     p_convert.add_argument("--test", action="store_true",
                            help="Validate ONNX vs RKNN before deploy")
     p_convert.add_argument("--deploy", action="store_true",

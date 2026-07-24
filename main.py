@@ -48,6 +48,7 @@ async def amain() -> None:
         model_dir=config.model_dir,
         model_name=config.model,
         backend=config.backend.value,
+        quantize=config.quantize,
     )
 
     video_loop = VideoLoop(pipeline=pipeline, config=config)

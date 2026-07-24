@@ -66,6 +66,10 @@ class Config:
                 self.model = name_file.read_text().strip()
             if not self.model:
                 self.model = 'yolo11n'
+        self.quantize: str = ''
+        q_file = Path(self.model_dir) / 'quantize.txt'
+        if q_file.is_file():
+            self.quantize = q_file.read_text().strip()
 
     @classmethod
     def from_cli(cls) -> Config:

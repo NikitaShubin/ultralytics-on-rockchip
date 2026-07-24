@@ -173,17 +173,21 @@ sudo systemctl daemon-reload
 ## Деплой модели
 
 ```bash
-# FP32 — без калибровки (быстрый старт)
+# FP16 RKNN — быстрый старт (по умолчанию)
 ./deploy.sh yolo26n-pose
+./deploy.sh yolo26n-pose --fp16          # то же
+
+# ONNX на CPU — без NPU
+./deploy.sh yolo26n-pose --onnx
 
 # INT8 — автозагрузка нужного датасета
-./deploy.sh yolo11n --int8            # COCO val2017 (~19 GB)
-./deploy.sh yolo26n-obb --int8        # DOTAv1 (~1.9 GB)
-./deploy.sh yolo26n-sem --int8        # Cityscapes val
-./deploy.sh yolo26n-cls --int8        # ImageNet val (~6.3 GB)
+./deploy.sh yolo11n --int8               # COCO val2017 (~19 GB)
+./deploy.sh yolo26n-obb --int8           # DOTAv1 (~1.9 GB)
+./deploy.sh yolo26n-sem --int8           # Cityscapes val
+./deploy.sh yolo26n-cls --int8           # ImageNet val (~6.3 GB)
 
 # INT8 с калибровкой (точнее, но нужен датасет)
-./deploy.sh yolo26n-cls --int8-calib  # ImageNet val (~6.3 GB)
+./deploy.sh yolo26n-cls --int8-calib     # ImageNet val (~6.3 GB)
 
 # Конвертация + FPS бенчмарк + запуск
 ./deploy.sh yolo26n-pose --full-test
@@ -191,6 +195,9 @@ sudo systemctl daemon-reload
 # Перезапуск текущей модели из model/
 ./deploy.sh
 ```
+
+Имя модели и тип квантизации отображаются в заголовке вкладки браузера и в ответе `/objects`.
+`model/quantize.txt` хранит текущий тип: `fp16`, `int8`, `int8-calib`, `onnx`.
 
 ## Режимы камеры
 
@@ -426,7 +433,7 @@ camtest.py                   # Утилита тестирования каме�
 validate_npu.py              # Утилита валидации NPU
 docker-compose.yml           # Сервис webcam
 Dockerfile                   # Образ (rknn-toolkit-lite2 + OpenCV + pypylon)
-model/                       # Активная модель (.rknn/.onnx + _postprocess.py + model_name.txt)
+model/                       # Активная модель (.rknn/.onnx + _postprocess.py + model_name.txt + quantize.txt)
 templates/
 ├── index.html               # Live viewer (WebSocket + canvas)
 └── test.html                # Тестовая страница (галерея + drag-drop)
@@ -602,15 +609,17 @@ watch -n1 'cat /sys/class/devfreq/fdab0000.npu/load'
 ### deploy.sh
 Переписан в однокомандный деплой:
 ```bash
-./deploy.sh yolo26n-pose       # конвертация FP32 + запуск
+./deploy.sh yolo26n-pose       # FP16 RKNN (быстрый старт)
+./deploy.sh yolo26n-pose --fp16       # то же
+./deploy.sh yolo26n-pose --onnx       # ONNX на CPU (без NPU)
 ./deploy.sh yolo26n-pose --int8       # конвертация INT8 + запуск
 ./deploy.sh yolo26n-cls --int8-calib  # INT8 с калибровкой (ImageNet)
 ./deploy.sh                    # только запуск (использует .rknn из /model)
 ./deploy.sh yolo26n-pose --full-test  # конвертация + FPS тест
 ```
 Автозагрузка нужного датасета при первом запуске (COCO/DOTA/Cityscapes/ImageNet).
-При конвертации записывает имя модели в `model/model_name.txt`.
-Сервис читает `model_name.txt` при старте — имя модели отображается в заголовке вкладки браузера и в ответе `/objects`.
+При конвертации записывает имя модели в `model/model_name.txt` и тип квантизации в `model/quantize.txt`.
+Сервис читает оба файла при старте — имя модели и тип отображаются в заголовке вкладки браузера и в ответе `/objects`.
 Переменные окружения: `MODEL`, `WEB_MODE`.
 
 ### Стресс-тест

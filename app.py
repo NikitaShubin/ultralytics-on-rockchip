@@ -211,6 +211,7 @@ def create_app(
             'fps': 0.0 if stale else _last_fps,
             'frame_id': _last_frame_id,
             'model': pipeline.model_name,
+            'quantize': pipeline.quantize or 'fp16',
         }
 
     @app.route('/reload')

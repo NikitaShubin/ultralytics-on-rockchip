@@ -35,11 +35,13 @@ class Pipeline:
         model_name: str = '',
         backend: str = 'npu',
         rknn_suffix: str = '',
+        quantize: str = '',
     ) -> None:
         self.model_dir = Path(model_dir)
         self.model_name = model_name or 'yolo11n'
         self.backend = backend
         self.rknn_suffix = rknn_suffix
+        self.quantize = quantize
         self._postprocess = None
         self._visualize = None
         self._custom_preprocess = None

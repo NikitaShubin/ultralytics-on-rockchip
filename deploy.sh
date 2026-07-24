@@ -2,9 +2,11 @@
 # Деплой модели: конвертация + запуск сервиса
 #
 # Использование:
-#   ./deploy.sh yolo26n-pose                # FP32 (быстрый старт)
+#   ./deploy.sh yolo26n-pose                # FP16 RKNN (быстрый старт)
+#   ./deploy.sh yolo26n-pose --fp16         # FP16 RKNN (то же что без флага)
 #   ./deploy.sh yolo26n-pose --int8         # INT8 без калибровки
 #   ./deploy.sh yolo26n-pose --int8-calib   # INT8 с калибровкой (нужен датасет)
+#   ./deploy.sh yolo26n-pose --onnx         # ONNX на CPU (без NPU)
 #   ./deploy.sh yolo26n-pose --full-test    # Конвертация + FPS тест
 #   ./deploy.sh                             # Перезапуск текущей модели из model/
 #
@@ -21,11 +23,14 @@ ensure_mountpoints() {
 MODEL="${1:-}"
 FULL_TEST=false
 QUANTIZE="none"
+BACKEND=""
 
 for arg in "$@"; do
     case "$arg" in
+        --fp16)         QUANTIZE="none" ;;
         --int8)         QUANTIZE="int8" ;;
         --int8-calib)   QUANTIZE="int8-calib" ;;
+        --onnx)         QUANTIZE="onnx"; BACKEND="cpu" ;;
         --full-test)    FULL_TEST=true ;;
     esac
 done
@@ -38,6 +43,17 @@ detect_dataset() {
         *-sem)       echo "cityscapes" ;;
         *-cls)       echo "imagenet" ;;
         *)           echo "coco" ;;
+    esac
+}
+
+# Метка квантизации для model/quantize.txt
+quantize_label() {
+    case "$1" in
+        none)       echo "fp16" ;;
+        int8)       echo "int8" ;;
+        int8-calib) echo "int8-calib" ;;
+        onnx)       echo "onnx" ;;
+        *)          echo "$1" ;;
     esac
 }
 
@@ -82,10 +98,24 @@ if [ -n "$MODEL" ]; then
     if [ -f "model/model_name.txt" ]; then
         CURRENT_MODEL=$(cat "model/model_name.txt" | tr -d '[:space:]')
     fi
-    if [ -f "model/model.rknn" ] && [ "$CURRENT_MODEL" = "$MODEL" ] && [ "$QUANTIZE" = "none" ]; then
-        echo "=== Модель $MODEL уже сконвертирована, пропуск ==="
-    else
-        if [ -f "model/model.rknn" ] && [ "$CURRENT_MODEL" != "$MODEL" ]; then
+    CURRENT_QUANT=""
+    if [ -f "model/quantize.txt" ]; then
+        CURRENT_QUANT=$(cat "model/quantize.txt" | tr -d '[:space:]')
+    fi
+
+    NEED_CONVERT=true
+    if [ "$CURRENT_MODEL" = "$MODEL" ] && [ "$CURRENT_QUANT" = "$(quantize_label "$QUANTIZE")" ]; then
+        if [ "$QUANTIZE" = "onnx" ] && [ -f "model/model.onnx" ]; then
+            echo "=== Модель $MODEL (ONNX) уже сконвертирована, пропуск ==="
+            NEED_CONVERT=false
+        elif [ "$QUANTIZE" != "onnx" ] && [ -f "model/model.rknn" ]; then
+            echo "=== Модель $MODEL ($(quantize_label "$QUANTIZE")) уже сконвертирована, пропуск ==="
+            NEED_CONVERT=false
+        fi
+    fi
+
+    if [ "$NEED_CONVERT" = true ]; then
+        if [ -f "model/model_name.txt" ] && [ "$CURRENT_MODEL" != "$MODEL" ]; then
             echo "=== Удаление предыдущей модели ($CURRENT_MODEL) ==="
             rm -f model/model.rknn model/model.onnx model/postprocess.py
         fi
@@ -94,6 +124,7 @@ if [ -n "$MODEL" ]; then
         docker compose run --rm converter convert "$MODEL" --quantize "$QUANTIZE"
         cd ..
         echo -n "$MODEL" > model/model_name.txt
+        echo -n "$(quantize_label "$QUANTIZE")" > model/quantize.txt
     fi
 fi
 
@@ -115,10 +146,14 @@ fi
 # Запуск сервиса
 echo "=== Запуск сервиса ==="
 ensure_mountpoints
+ENV_ARGS=""
+if [ -n "$BACKEND" ]; then
+    ENV_ARGS="BACKEND=$BACKEND"
+fi
 if [ -n "$MODEL" ]; then
-    MODEL="$MODEL" WEB_MODE=2 docker compose up -d --build
+    MODEL="$MODEL" $ENV_ARGS WEB_MODE=2 docker compose up -d --build
 else
-    WEB_MODE=2 docker compose up -d --build
+    $ENV_ARGS WEB_MODE=2 docker compose up -d --build
 fi
 
 echo ""
