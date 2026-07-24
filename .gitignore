@@ -54,6 +54,8 @@ test/*_preview.jpg
 datasets/coco_val2017/
 datasets/dotav1/
 datasets/cityscapes/
+datasets/imagenet/
+datasets/ILSVRC2012_img_val.tar
 
 # Overclock binaries
 overclock/*.dtbo
