@@ -2,8 +2,9 @@
 # Деплой модели: конвертация + запуск сервиса
 #
 # Использование:
-#   ./deploy.sh yolo26n-pose                # FP32 (без калибровки, быстрый старт)
-#   ./deploy.sh yolo26n-pose --int8         # INT8 (скачает нужный датасет)
+#   ./deploy.sh yolo26n-pose                # FP32 (быстрый старт)
+#   ./deploy.sh yolo26n-pose --int8         # INT8 без калибровки
+#   ./deploy.sh yolo26n-pose --int8-calib   # INT8 с калибровкой (нужен датасет)
 #   ./deploy.sh yolo26n-pose --full-test    # Конвертация + FPS тест
 #   ./deploy.sh                             # Перезапуск текущей модели из model/
 #
@@ -23,8 +24,9 @@ QUANTIZE="none"
 
 for arg in "$@"; do
     case "$arg" in
-        --int8)       QUANTIZE="int8" ;;
-        --full-test)  FULL_TEST=true ;;
+        --int8)         QUANTIZE="int8" ;;
+        --int8-calib)   QUANTIZE="int8-calib" ;;
+        --full-test)    FULL_TEST=true ;;
     esac
 done
 
@@ -41,8 +43,8 @@ detect_dataset() {
 # Гарантируем mount-точки до любого вызова Docker
 ensure_mountpoints
 
-# Скачать датасет только для INT8 и только нужный
-if [ "$QUANTIZE" = "int8" ] && [ -n "$MODEL" ]; then
+# Скачать датасет только для int8-calib и только нужный
+if [ "$QUANTIZE" = "int8-calib" ] && [ -n "$MODEL" ]; then
     DATASET=$(detect_dataset "$MODEL")
 
     if [ "$DATASET" = "coco" ]; then

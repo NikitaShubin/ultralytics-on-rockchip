@@ -286,8 +286,8 @@ def export_and_compile(pt_path, info=None, quantize="none"):
     Аргументы:
         pt_path: путь к весам .pt.
         info: опциональный dict из _detect_model_info().
-        quantize: "none" (по умолчанию) или "int8" — включить квантизацию INT8
-                  с калибровкой на COCO val 2017.
+        quantize: "none" — FP32, "int8" — INT8 без калибровки,
+                  "int8-calib" — INT8 с калибровкой на датасете.
     """
     apply_patches()
     from ultralytics import YOLO
@@ -303,13 +303,15 @@ def export_and_compile(pt_path, info=None, quantize="none"):
     log(f"Используется ONNX opset {opset} для экспорта")
 
     export_kwargs = {"format": "rknn", "opset": opset}
-    if quantize == "int8":
+    if quantize == "int8-calib":
         task = info.get("task", "detect") if info else "detect"
         _ensure_dataset(task)
         data_yaml = _make_calib_yaml(task)
         export_kwargs["data"] = data_yaml
         export_kwargs["quantize"] = 8
-        log(f"Квантизация INT8: задача={task}, калибровка из {_dataset_name(task)}")
+        log(f"Квантизация INT8 с калибровкой: задача={task}, датасет={_dataset_name(task)}")
+    elif quantize == "int8":
+        log("Квантизация INT8 без калибровки")
 
     t0 = time.time()
     log(f"Запуск model.export() ...")
@@ -343,8 +345,13 @@ def export_and_compile(pt_path, info=None, quantize="none"):
     log(f"RKNN: {rknn_path}")
 
     # Логирование dataset.txt для проверки списка калибровочных изображений
-    if quantize == "int8":
+    if quantize == "int8-calib":
         _log_dataset_txt()
+
+    # Для int8 без калибровки: экспортировали ONNX, теперь собираем RKNN
+    if quantize == "int8" and onnx_path:
+        log("Сборка RKNN (int8 без калибровки)...")
+        rknn_path = _build_rknn(onnx_path, quantize=True, calib_dir=None)
 
     return onnx_path, rknn_path
 
@@ -421,12 +428,16 @@ def _build_rknn(onnx_path, quantize, calib_dir=None):
         raise RuntimeError(f"load_onnx не удался: {ret}")
 
     if quantize:
-        log(f"Сборка RKNN (int8) с калибровкой из {calib_dir}")
-        calib_txt = "/tmp/calib.txt"
-        with open(calib_txt, "w") as f:
-            for img_path in sorted(Path(calib_dir).glob("*.jpg"))[:512]:
-                f.write(str(img_path) + "\n")
-        ret = rknn.build(do_quantization=True, dataset=calib_txt)
+        if calib_dir:
+            log(f"Сборка RKNN (int8) с калибровкой из {calib_dir}")
+            calib_txt = "/tmp/calib.txt"
+            with open(calib_txt, "w") as f:
+                for img_path in sorted(Path(calib_dir).glob("*.jpg"))[:512]:
+                    f.write(str(img_path) + "\n")
+            ret = rknn.build(do_quantization=True, dataset=calib_txt)
+        else:
+            log("Сборка RKNN (int8, без калибровки)")
+            ret = rknn.build(do_quantization=True)
     else:
         log("Сборка RKNN (none, без квантизации)")
         ret = rknn.build(do_quantization=False)
@@ -1148,8 +1159,8 @@ def main():
 
     p_convert = sub.add_parser("convert", help="Convert .pt → ONNX (RK-opt) → RKNN → validate")
     p_convert.add_argument("model", help="Model name or path (e.g. yolov8m.pt)")
-    p_convert.add_argument("--quantize", choices=["none", "int8"], default="none",
-                           help="INT8 quantization mode (default: none, no quantization)")
+    p_convert.add_argument("--quantize", choices=["none", "int8", "int8-calib"], default="none",
+                           help="INT8 quantization: none=FP32, int8=INT8 без калибровки, int8-calib=INT8 с калибровкой")
     p_convert.add_argument("--test", action="store_true",
                            help="Validate ONNX vs RKNN before deploy")
     p_convert.add_argument("--deploy", action="store_true",
