@@ -78,13 +78,22 @@ fi
 # Конвертация (если указана модель)
 if [ -n "$MODEL" ]; then
     ensure_mountpoints
-    if [ -f "model/model.rknn" ]; then
-        echo "=== Модель уже сконвертирована, пропуск ==="
+    CURRENT_MODEL=""
+    if [ -f "model/model_name.txt" ]; then
+        CURRENT_MODEL=$(cat "model/model_name.txt" | tr -d '[:space:]')
+    fi
+    if [ -f "model/model.rknn" ] && [ "$CURRENT_MODEL" = "$MODEL" ] && [ "$QUANTIZE" = "none" ]; then
+        echo "=== Модель $MODEL уже сконвертирована, пропуск ==="
     else
+        if [ -f "model/model.rknn" ] && [ "$CURRENT_MODEL" != "$MODEL" ]; then
+            echo "=== Удаление предыдущей модели ($CURRENT_MODEL) ==="
+            rm -f model/model.rknn model/model.onnx model/postprocess.py
+        fi
         echo "=== Конвертация $MODEL (квантизация: $QUANTIZE) ==="
         cd converter
         docker compose run --rm converter convert "$MODEL" --quantize "$QUANTIZE"
         cd ..
+        echo -n "$MODEL" > model/model_name.txt
     fi
 fi
 
