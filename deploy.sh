@@ -11,6 +11,12 @@ set -e
 
 cd "$(dirname "$0")"
 
+# Docker создаёт mount-точки от root, если их нет.
+# Создаём заранее, чтобы монтировались user-owned директории.
+ensure_mountpoints() {
+    mkdir -p datasets/coco_val2017 datasets/dotav1 datasets/cityscapes model
+}
+
 MODEL="${1:-}"
 FULL_TEST=false
 QUANTIZE="none"
@@ -31,6 +37,9 @@ detect_dataset() {
         *)           echo "coco" ;;
     esac
 }
+
+# Гарантируем mount-точки до любого вызова Docker
+ensure_mountpoints
 
 # Скачать датасет только для INT8 и только нужный
 if [ "$QUANTIZE" = "int8" ] && [ -n "$MODEL" ]; then
@@ -59,6 +68,7 @@ fi
 
 # Конвертация (если указана модель)
 if [ -n "$MODEL" ]; then
+    ensure_mountpoints
     if [ -f "model/model.rknn" ]; then
         echo "=== Модель уже сконвертирована, пропуск ==="
     else
@@ -86,6 +96,7 @@ fi
 
 # Запуск сервиса
 echo "=== Запуск сервиса ==="
+ensure_mountpoints
 if [ -n "$MODEL" ]; then
     MODEL="$MODEL" WEB_MODE=2 docker compose up -d --build
 else

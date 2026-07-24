@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import subprocess
 import sys
 import zipfile
@@ -15,19 +16,53 @@ DOTAV1_URL = 'https://github.com/ultralytics/assets/releases/download/v0.0.0/DOT
 CITYSCAPES_HF_REPO = 'Chris1/cityscapes'
 
 
+def ensure_dir(path: Path) -> None:
+    """Создать директорию и проверить права на запись."""
+    path.mkdir(parents=True, exist_ok=True)
+    if not os.access(path, os.W_OK):
+        print(f'ОШИБКА: Нет прав на запись в {path}', file=sys.stderr)
+        print(f'  Возможно, директория создана от root (Docker mount).', file=sys.stderr)
+        print(f'  Исправление: sudo chown -R $(id -u):$(id -g) {path}', file=sys.stderr)
+        sys.exit(1)
+
+
 def download_file(url: str, dest: Path) -> None:
-    """Загрузка файла с прогрессом (curl следует за редиректами)."""
+    """Загрузка файла: сначала в .tmp, потом rename (защита от битых загрузок)."""
+    if dest.exists() and dest.stat().st_size > 0:
+        print(f'Файл уже существует: {dest}')
+        return
+    tmp = dest.with_suffix('.tmp')
+    tmp.unlink(missing_ok=True)
     print(f'Загрузка {url}...')
     subprocess.run(
-        ['curl', '-fSL', '-o', str(dest), url],
+        ['curl', '-fSL', '--progress-bar', '-o', str(tmp), url],
         check=True,
     )
+    if tmp.stat().st_size == 0:
+        tmp.unlink(missing_ok=True)
+        raise RuntimeError(f'Загрузка вернула пустой файл: {url}')
+    tmp.rename(dest)
+    print(f'Загружен: {dest} ({dest.stat().st_size // (1024*1024)} MB)')
+
+
+def validate_zip(path: Path) -> None:
+    """Проверить что файл — валидный zip-архив."""
+    try:
+        with zipfile.ZipFile(path, 'r') as z:
+            z.testzip()
+    except zipfile.BadZipFile:
+        content = path.read_text(errors='replace')[:200]
+        path.unlink(missing_ok=True)
+        raise RuntimeError(
+            f'{path.name} — битый архив. Содержимое файла:\n{content}\n'
+            f'Удалён. Попробуйте снова.'
+        )
 
 
 def setup_coco_val2017() -> None:
     """Загрузка COCO val2017 (5000 изображений + аннотации)."""
     coco_dir = DATASETS_DIR / 'coco_val2017'
-    coco_dir.mkdir(parents=True, exist_ok=True)
+    ensure_dir(coco_dir)
 
     images_dir = coco_dir / 'images' / 'val2017'
     ann_dir = coco_dir / 'annotations'
@@ -46,6 +81,7 @@ def setup_coco_val2017() -> None:
             download_file(ann_url, ann_zip)
 
         print('Распаковка аннотаций...')
+        validate_zip(ann_zip)
         with zipfile.ZipFile(ann_zip, 'r') as z:
             z.extractall(coco_dir)
 
@@ -59,6 +95,7 @@ def setup_coco_val2017() -> None:
             download_file(img_url, img_zip)
 
         print('Распаковка изображений (это может занять время)...')
+        validate_zip(img_zip)
         with zipfile.ZipFile(img_zip, 'r') as z:
             z.extractall(coco_dir / 'images')
 
@@ -74,6 +111,7 @@ def setup_dota_v1() -> None:
     удаляет zip-архив.
     """
     dota_dir = DATASETS_DIR / 'dotav1'
+    ensure_dir(dota_dir)
     images_val = dota_dir / 'images' / 'val'
     labels_val = dota_dir / 'labels' / 'val'
 
@@ -92,6 +130,7 @@ def setup_dota_v1() -> None:
         download_file(DOTAV1_URL, zip_path)
 
     print('Распаковка val split из DOTAv1.zip...')
+    validate_zip(zip_path)
     with zipfile.ZipFile(zip_path, 'r') as z:
         # Список файлов val split (strip top-level dir)
         val_files = [f for f in z.namelist() if '/val/' in f]
@@ -143,6 +182,7 @@ def setup_cityscapes_val() -> None:
     и извлекает изображения и маски как PNG файлы.
     """
     cs_dir = DATASETS_DIR / 'cityscapes'
+    ensure_dir(cs_dir)
     images_val = cs_dir / 'images' / 'val'
     masks_val = cs_dir / 'masks' / 'val'
 
