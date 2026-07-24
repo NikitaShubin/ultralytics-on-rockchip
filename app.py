@@ -210,6 +210,7 @@ def create_app(
             'count': 0 if stale else len(_last_objects),
             'fps': 0.0 if stale else _last_fps,
             'frame_id': _last_frame_id,
+            'model': pipeline.model_name,
         }
 
     @app.route('/reload')

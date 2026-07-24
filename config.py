@@ -6,6 +6,7 @@ import argparse
 import os
 import sys
 from enum import IntEnum
+from pathlib import Path
 
 if sys.version_info >= (3, 11):
     from enum import StrEnum
@@ -44,7 +45,7 @@ class Config:
     """Все параметры конфигурации приложения."""
 
     def __init__(self) -> None:
-        self.model: str = os.environ.get('MODEL', 'yolo11n')
+        self.model: str = os.environ.get('MODEL', '')
         self.backend: Backend = Backend(os.environ.get('BACKEND', 'npu'))
         self.web_mode: WebMode = WebMode(int(os.environ.get('WEB_MODE', '0')))
         self.cam_mode: CameraMode = CameraMode(os.environ.get('CAM_MODE', 'auto'))
@@ -59,6 +60,12 @@ class Config:
         self.jpeg_quality: int = int(os.environ.get('JPEG_QUALITY', '85'))
         self.log_level: str = os.environ.get('LOG_LEVEL', 'INFO')
         self.mask_format: MaskFormat = MaskFormat(os.environ.get('MASK_FORMAT', 'contour'))
+        if not self.model:
+            name_file = Path(self.model_dir) / 'model_name.txt'
+            if name_file.is_file():
+                self.model = name_file.read_text().strip()
+            if not self.model:
+                self.model = 'yolo11n'
 
     @classmethod
     def from_cli(cls) -> Config:

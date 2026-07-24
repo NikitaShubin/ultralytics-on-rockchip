@@ -92,6 +92,7 @@ async function poll() {
     info.textContent = first
       ? `SVR:${serverFps.toFixed(1)} CLT:${clientFps.toFixed(1)} | ${idText} | ${first ? objData.objects.length : 0} objects`
       : `SVR:${serverFps.toFixed(1)} CLT:${clientFps.toFixed(1)} | ${idText} | no detections`;
+    if (objData.model) document.title = objData.model;
   } catch {}
   setTimeout(poll, 50);
 }

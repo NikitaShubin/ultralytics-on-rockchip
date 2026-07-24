@@ -33,7 +33,7 @@ services:
       - ./datasets/imagenet:/app/imagenet:ro
     environment:
       - BACKEND=${BACKEND:-npu}
-      - MODEL=${MODEL:-yolo11n}
+      - MODEL=${MODEL:-}
       - WEB_MODE=${WEB_MODE:-2}
       - CAM_MODE=${CAM_MODE:-auto}
       - CAM_W=${CAM_W:-640}

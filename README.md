@@ -426,7 +426,7 @@ camtest.py                   # Утилита тестирования каме�
 validate_npu.py              # Утилита валидации NPU
 docker-compose.yml           # Сервис webcam
 Dockerfile                   # Образ (rknn-toolkit-lite2 + OpenCV + pypylon)
-model/                       # Активная модель (.rknn/.onnx + _postprocess.py)
+model/                       # Активная модель (.rknn/.onnx + _postprocess.py + model_name.txt)
 templates/
 ├── index.html               # Live viewer (WebSocket + canvas)
 └── test.html                # Тестовая страница (галерея + drag-drop)
@@ -472,7 +472,7 @@ datasets/                    # Датасеты (скачиваются on-deman
 | Переменная | По умолчанию | Описание |
 |------------|-------------|----------|
 | `BACKEND` | `npu` | `npu` или `cpu` |
-| `MODEL` | `yolo11n` | Имя модели (без расширения) |
+| `MODEL` | (из `model_name.txt`) | Имя модели (без расширения). Если не задано, читается из `model/model_name.txt` |
 | `PORT` | `5000` | HTTP порт |
 | `CAM_MODE` | `auto` | Режим камеры |
 | `CAM_SOURCE` | — | Источник (IP/USB/path) |
@@ -504,7 +504,7 @@ datasets/                    # Датасеты (скачиваются on-deman
 |-------|-------|----------|
 | `/` | GET | Live viewer (HTTP poll, SVR/CLT FPS) |
 | `/frame` | GET | Последний обработанный JPEG |
-| `/objects` | GET | JSON: детекции + fps + frame_id |
+| `/objects` | GET | JSON: детекции + fps + frame_id + model |
 | `/reload` | GET | Перезагрузка модели (`?model=name&backend=cpu`) |
 | `/test` | GET | Тестовая страница (галерея + drag-drop) |
 | `/test/images` | GET | JSON: список тестовых изображений |
@@ -566,6 +566,7 @@ watch -n1 'cat /sys/class/devfreq/fdab0000.npu/load'
 - Образ прод: `webcam-percept` (имя в docker-compose.yml оставлено для совместимости)
 - `docker-compose.yml`: сервис `percept`, переменные `MODEL`, `WEB_MODE`
 - `converter/docker-compose.yml`: `image: percept-converter:latest`
+- `config.py` читает `model/model_name.txt` если `MODEL` не задан
 
 ### Калибровка INT8
 - Используются **все 5000 изображений** COCO val2017 (`datasets/coco_val2017/images/val2017/`)
@@ -608,6 +609,8 @@ watch -n1 'cat /sys/class/devfreq/fdab0000.npu/load'
 ./deploy.sh yolo26n-pose --full-test  # конвертация + FPS тест
 ```
 Автозагрузка нужного датасета при первом запуске (COCO/DOTA/Cityscapes/ImageNet).
+При конвертации записывает имя модели в `model/model_name.txt`.
+Сервис читает `model_name.txt` при старте — имя модели отображается в заголовке вкладки браузера и в ответе `/objects`.
 Переменные окружения: `MODEL`, `WEB_MODE`.
 
 ### Стресс-тест
