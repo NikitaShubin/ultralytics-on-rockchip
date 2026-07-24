@@ -348,6 +348,7 @@ def export_and_compile(pt_path, info=None, quantize="none"):
         log(f"Квантизация INT8 с калибровкой: задача={task}, датасет={_dataset_name(task)}")
     elif quantize == "int8":
         log("Квантизация INT8 без калибровки")
+        export_kwargs["quantize"] = 8
 
     t0 = time.time()
     log(f"Запуск model.export() ...")
@@ -383,11 +384,6 @@ def export_and_compile(pt_path, info=None, quantize="none"):
     # Логирование dataset.txt для проверки списка калибровочных изображений
     if quantize == "int8-calib":
         _log_dataset_txt()
-
-    # Для int8 без калибровки: экспортировали ONNX, теперь собираем RKNN
-    if quantize == "int8" and onnx_path:
-        log("Сборка RKNN (int8 без калибровки)...")
-        rknn_path = _build_rknn(onnx_path, quantize=True, calib_dir=None)
 
     return onnx_path, rknn_path
 

@@ -146,14 +146,14 @@ fi
 # Запуск сервиса
 echo "=== Запуск сервиса ==="
 ensure_mountpoints
-ENV_ARGS=""
-if [ -n "$BACKEND" ]; then
-    ENV_ARGS="BACKEND=$BACKEND"
-fi
-if [ -n "$MODEL" ]; then
-    MODEL="$MODEL" $ENV_ARGS WEB_MODE=2 docker compose up -d --build
+if [ -n "$MODEL" ] && [ -n "$BACKEND" ]; then
+    MODEL="$MODEL" BACKEND="$BACKEND" WEB_MODE=2 docker compose up -d --build
+elif [ -n "$MODEL" ]; then
+    MODEL="$MODEL" WEB_MODE=2 docker compose up -d --build
+elif [ -n "$BACKEND" ]; then
+    BACKEND="$BACKEND" WEB_MODE=2 docker compose up -d --build
 else
-    $ENV_ARGS WEB_MODE=2 docker compose up -d --build
+    WEB_MODE=2 docker compose up -d --build
 fi
 
 echo ""
