@@ -1007,7 +1007,7 @@ def load_model_list(path):
     return names
 
 
-QUANT_MODES = ["none", "int8", "int8-calib"]
+QUANT_MODES = ["onnx", "none", "int8", "int8-calib"]
 
 
 def cmd_test_all(args):
@@ -1030,14 +1030,18 @@ def cmd_test_all(args):
             log(f"Тестирование {tag}...")
             try:
                 pt = resolve_pt(name)
-                convert_args = argparse.Namespace(
-                    model=name,
-                    quantize=qmode,
-                    test=True,
-                    deploy=False,
-                )
-                res = cmd_convert(convert_args)
-                results[tag] = {"status": "ПРОЙДЕНО" if res.get("pass") else "ПРОВАЛ", **res}
+                if qmode == "onnx":
+                    onnx_path = export_onnx_only(pt)
+                    results[tag] = {"status": "ПРОЙДЕНО" if onnx_path else "ПРОВАЛ"}
+                else:
+                    convert_args = argparse.Namespace(
+                        model=name,
+                        quantize=qmode,
+                        test=True,
+                        deploy=False,
+                    )
+                    res = cmd_convert(convert_args)
+                    results[tag] = {"status": "ПРОЙДЕНО" if res.get("pass") else "ПРОВАЛ", **res}
             except Exception as e:
                 log(f"ОШИБКА: {e}")
                 results[tag] = {"status": "ПРОВАЛ", "error": str(e)}
