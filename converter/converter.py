@@ -1007,41 +1007,51 @@ def load_model_list(path):
     return names
 
 
+QUANT_MODES = ["none", "int8", "int8-calib"]
+
+
 def cmd_test_all(args):
-    """Универсальное тестирование моделей по списку."""
+    """Универсальное тестирование моделей по списку.
+
+    Каждая модель тестируется во всех режимах квантизации:
+    none (FP32), int8 (без калибровки), int8-calib (с калибровкой).
+    """
     models = load_model_list(args.model_list)
     if not models:
-        log(f"Список моделей не найден: {args.model_list}")
+        log(f'Список моделей не найден: {args.model_list}')
         return {}
 
+    quant_modes = QUANT_MODES
     results = {}
     for name in models:
-        log(f"{'='*60}")
-        log(f"Тестирование {name}...")
-        try:
-            pt = resolve_pt(name)
-            convert_args = argparse.Namespace(
-                model=name,
-                quantize=getattr(args, "quantize", "none"),
-                test=True,
-                deploy=False,
-            )
-            res = cmd_convert(convert_args)
-            results[name] = {"status": "ПРОЙДЕНО" if res.get("pass") else "ПРОВАЛ", **res}
-        except Exception as e:
-            log(f"ОШИБКА: {e}")
-            results[name] = {"status": "ПРОВАЛ", "error": str(e)}
-        print()
+        for qmode in quant_modes:
+            tag = f"{name} [{qmode}]"
+            log(f"{'='*60}")
+            log(f"Тестирование {tag}...")
+            try:
+                pt = resolve_pt(name)
+                convert_args = argparse.Namespace(
+                    model=name,
+                    quantize=qmode,
+                    test=True,
+                    deploy=False,
+                )
+                res = cmd_convert(convert_args)
+                results[tag] = {"status": "ПРОЙДЕНО" if res.get("pass") else "ПРОВАЛ", **res}
+            except Exception as e:
+                log(f"ОШИБКА: {e}")
+                results[tag] = {"status": "ПРОВАЛ", "error": str(e)}
+            print()
 
-    print(f"\n{'='*60}")
+    print(f"\n{'='*70}")
     print("ИТОГИ")
-    print(f"{'='*60}")
-    print(f"{'Модель':<25} {'Статус':<8} {'max_diff':<10} {'iou_avg':<10}")
-    print("-" * 55)
-    for name, res in results.items():
+    print(f"{'='*70}")
+    print(f"{'Модель':<40} {'Статус':<8} {'max_diff':<10} {'iou_avg':<10}")
+    print("-" * 68)
+    for tag, res in results.items():
         md = res.get("max_diff_avg", "-")
         iou = res.get("iou_avg", "-")
-        print(f"{name:<25} {res['status']:<8} {md:<10} {iou:<10}")
+        print(f"{tag:<40} {res['status']:<8} {md:<10} {iou:<10}")
 
     return results
 
