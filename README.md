@@ -6,7 +6,7 @@
 
 **Архитектура**: `CameraSource` → `VideoLoop` (capture → Pipeline) → Flask HTTP + WebSocket → браузер.
 
-**Целевое железо**: Orange Pi 3B (RK3588S), 4 ГБ RAM, NPU 6 TOPS.
+**Целевое железо**: Orange Pi 5 Pro (RK3588S), NPU 6 TOPS.
 
 ## Статус
 
@@ -16,7 +16,7 @@
 | Инференс на CPU (ONNX) | Работает |
 | Конвертация YOLO → RKNN | Конвертируются все задачи |
 | COCO mAP валидация | Для det/seg/pose (5000 изображений) |
-| FPS бенчмарк | 111 моделей (FP32 + INT8) |
+| FPS бенчмарк | 111 моделей (ONNX/FP32/INT8/INT8-calib) + per-core CPU/NPU |
 | Веб-интерфейс | Live viewer + тестовая галерея |
 | Камеры: USB/UVC | Работает |
 | Камеры: GigE Vision (Basler) | Работает |
@@ -27,7 +27,7 @@
 | Камеры: GStreamer | Нестабильно |
 | Полная русификация кода | ✅ Завершена |
 | Стресс-тест NPU/CPU/RAM | ✅ bash + python |
-| INT8 калибровка (5000 COCO) | Автозагрузка датасета при деплое |
+| INT8 калибровка | Автозагрузка датасета (COCO/DOTA/Cityscapes/ImageNet) |
 
 ## Требования
 
@@ -180,6 +180,10 @@ sudo systemctl daemon-reload
 ./deploy.sh yolo11n --int8            # COCO val2017 (~19 GB)
 ./deploy.sh yolo26n-obb --int8        # DOTAv1 (~1.9 GB)
 ./deploy.sh yolo26n-sem --int8        # Cityscapes val
+./deploy.sh yolo26n-cls --int8        # ImageNet val (~6.3 GB)
+
+# INT8 с калибровкой (точнее, но нужен датасет)
+./deploy.sh yolo26n-cls --int8-calib  # ImageNet val (~6.3 GB)
 
 # Конвертация + FPS бенчмарк + запуск
 ./deploy.sh yolo26n-pose --full-test
@@ -239,32 +243,36 @@ docker compose run --rm converter convert my-model.pt
 Можно загрузить вручную:
 
 ```bash
-# Все три датасета
-python3 setup_datasets.py
+# Все датасеты
+python3 setup_datasets.py --all
 
 # Только нужный
-python3 setup_datasets.py --coco        # COCO val2017 (~19 GB) — detect, seg, cls, pose
+python3 setup_datasets.py --coco        # COCO val2017 (~19 GB) — detect, seg, pose
 python3 setup_datasets.py --dota        # DOTAv1 (~1.9 GB) — obb
 python3 setup_datasets.py --cityscapes  # Cityscapes val — semantic
+python3 setup_datasets.py --imagenet    # ImageNet val (~6.3 GB) — classify
 ```
 
 Для FP32-моделей датасеты **не нужны** — калибровка не выполняется.
 
-## Бенчмарк (3 фазы)
+## Бенчмарк (4 фазы)
 
-Три независимые фазы, можно запускать по отдельности:
+Четыре независимые фазы, можно запускать по отдельности:
 
 ```bash
 cd benchmark
 
-# Фаза 1: конвертация .pt → .onnx + _none.rknn + _int8.rknn (x86 ПК)
+# Фаза 1: конвертация .pt → .onnx + _none.rknn + _int8.rknn + _int8-calib.rknn
 python benchmark.py --phase convert
 
-# Фаза 2: валидация ONNX vs RKNN FP32+INT8 (x86 ПК, RKNN simulator)
+# Фаза 2: валидация ONNX vs RKNN FP32+INT8 (RKNN simulator)
 python benchmark.py --phase validate
 
-# Фаза 3: FPS + нагрузка CPU/NPU (ARM железо)
+# Фаза 3: FPS + нагрузка CPU/NPU per-core (ARM железо)
 python benchmark.py --phase bench
+
+# Фаза 4: accuracy (yolo val: top1/top5 для cls, mAP для det/seg/pose/obb)
+python benchmark.py --phase eval
 ```
 
 ### Мульти-фазы
@@ -290,9 +298,11 @@ python benchmark.py --phase convert validate --clean
 
 | `--quantize` | Описание |
 |-------------|----------|
+| `onnx` | Только ONNX CPU |
 | `none` | Только FP32 RKNN |
-| `int8` | Только INT8 RKNN |
-| `both` | Оба варианта (по умолчанию) |
+| `int8` | Только INT8 RKNN (без калибровки) |
+| `int8-calib` | INT8 с калибровкой на датасете |
+| `all` | Все варианты (по умолчанию) |
 
 ### Resume
 
@@ -424,7 +434,7 @@ test/                        # Тестовые изображения
 start.sh                     # Запуск сервера
 stop.sh                      # Остановка сервера
 deploy.sh                    # Деплой модели (конвертация + запуск, --int8 для калибровки)
-setup_datasets.py            # Загрузка датасетов (--coco, --dota, --cityscapes, --all)
+setup_datasets.py            # Загрузка датасетов (--coco, --dota, --cityscapes, --imagenet, --all)
 oc_manager.sh                # Менеджер разгона (test/apply/revert/monitor/set)
 oc_test.sh                   # Тест разгона (пошаговый переход по частотам)
 stress_test.sh               # Стресс-тест NPU/CPU/RAM (bash, Ctrl+C)
@@ -433,19 +443,17 @@ bench_overclock.sh           # Бенчмарк с разгоном CPU/NPU/GPU 
 overclock/
 └── rk3588-opi5pro-oc.dts    # Device tree overlay для разгона Orange Pi 5 Pro
 benchmark/
-├── benchmark.py             # Оркестратор: --phase convert|validate|bench|all
+├── benchmark.py             # Оркестратор: --phase convert|validate|bench|eval|all
 ├── convert_bench.py         # Фаза 1: экспорт + компиляция (4 файла на модель)
 ├── validate_bench.py        # Фаза 2: ONNX vs RKNN FP32+INT8 валидация
-├── fps_bench.py             # Фаза 3: FPS + CPU/NPU нагрузка
-├── models.py                # Списки моделей (FULL: 111, PILOT: 10)
+├── fps_bench.py             # Фаза 3: FPS + per-core CPU/NPU нагрузка
+├── eval_bench.py            # Фаза 4: accuracy (yolo val)
+├── models.py                # Списки моделей (FULL: 111, PILOT: 21)
 ├── run.sh                   # Обёртка для benchmark.py
-├── setup_datasets.py        # Загрузка датасетов для бенчмарка
 ├── temp_models/             # Временные файлы конвертации (создаётся при запуске)
 └── results/                 # Результаты (results.json, summary.tsv, benchmark.log)
 converter/
-├── converter.py             # Конвертер YOLO → ONNX → RKNN
-├── postprocess.py           # Постпроцесс (NMS, scale, decode)
-├── eval_coco.py             # COCO mAP валидация
+├── converter.py             # Конвертер YOLO → ONNX → RKNN (все 4 квантизации)
 ├── templates/               # Шаблоны постпроцесса (7 задач: det/seg/cls/pose/obb/sem/detr)
 ├── patches/                 # RKNN-патчи
 ├── weights/                 # Исходные .pt
@@ -453,9 +461,10 @@ converter/
 ├── Dockerfile               # Образ конвертера (python:3.11-slim, x86/ARM)
 └── model/                   # Скомпилированные модели
 datasets/                    # Датасеты (скачиваются on-demand)
-├── coco_val2017/            # COCO val2017 — detect, seg, cls, pose (~19 GB)
+├── coco_val2017/            # COCO val2017 — detect, seg, pose (~19 GB)
 ├── dotav1/                  # DOTAv1 — obb (~1.9 GB)
-└── cityscapes/              # Cityscapes — semantic
+├── cityscapes/              # Cityscapes — semantic
+└── imagenet/                # ImageNet val — classify (~6.3 GB)
 ```
 
 ## Конфигурация
@@ -574,6 +583,9 @@ watch -n1 'cat /sys/class/devfreq/fdab0000.npu/load'
 - Сервис в docker-compose: `percept` (не `webcam`)
 - `benchmark/run.sh` передаёт `"$@"` в benchmark.py, останавливает percept перед запуском
 - TSV-суммаризация в `benchmark/results/summary.tsv`
+- 4 варианта квантизации: onnx/none/int8/int8-calib
+- Фаза eval: accuracy через yolo val (top1/top5 для cls, mAP для det/seg/pose/obb)
+- Per-core CPU/NPU нагрузка в fps_bench.py
 
 ### Результаты yolo26x-seg (FP32)
 | Бэкенд | FPS | Latency | NPU load | Время конвертации | max_diff |
@@ -589,12 +601,14 @@ watch -n1 'cat /sys/class/devfreq/fdab0000.npu/load'
 ### deploy.sh
 Переписан в однокомандный деплой:
 ```bash
-./deploy.sh yolo26n-pose       # конвертация INT8 + запуск
+./deploy.sh yolo26n-pose       # конвертация FP32 + запуск
+./deploy.sh yolo26n-pose --int8       # конвертация INT8 + запуск
+./deploy.sh yolo26n-cls --int8-calib  # INT8 с калибровкой (ImageNet)
 ./deploy.sh                    # только запуск (использует .rknn из /model)
 ./deploy.sh yolo26n-pose --full-test  # конвертация + FPS тест
 ```
-Автозагрузка COCO val2017 при первом запуске (если датасет отсутствует).
-Переменные окружения: `MODEL`, `WEB_MODE`. Авто-переименование `.rknn` файлов под `MODEL`.
+Автозагрузка нужного датасета при первом запуске (COCO/DOTA/Cityscapes/ImageNet).
+Переменные окружения: `MODEL`, `WEB_MODE`.
 
 ### Стресс-тест
 - `stress_test.sh` — bash-скрипт: NPU (через Python rknnlite) + CPU/RAM (stress), мониторинг температур, NPU load, CPU load
