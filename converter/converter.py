@@ -27,6 +27,8 @@ DOTA_VAL_DIR = Path("/app/dotav1")
 DOTA_VAL_IMG_DIR = DOTA_VAL_DIR / "images" / "val"
 CITYSCAPES_VAL_DIR = Path("/app/cityscapes")
 CITYSCAPES_VAL_IMG_DIR = CITYSCAPES_VAL_DIR / "images" / "val"
+IMAGENET_VAL_DIR = Path("/app/imagenet")
+IMAGENET_VAL_IMG_DIR = IMAGENET_VAL_DIR / "val"
 MODEL_DIR = Path("/app/converter/model")
 WEIGHTS_DIR = Path("/app/converter/weights")
 
@@ -86,7 +88,7 @@ def _dataset_name(task: str) -> str:
     return {
         "detect": "COCO val2017",
         "segment": "COCO val2017",
-        "classify": "COCO val2017",
+        "classify": "ImageNet val",
         "pose": "COCO val2017",
         "obb": "DOTAv1",
         "semantic": "Cityscapes",
@@ -113,6 +115,17 @@ def _ensure_dataset(task: str = "detect") -> Path:
             f"Cityscapes val не найдена в {CITYSCAPES_VAL_DIR}. "
             f"Скачайте: python3 setup_datasets.py --cityscapes"
         )
+    elif task == "classify":
+        if IMAGENET_VAL_IMG_DIR.exists():
+            n_classes = len([d for d in IMAGENET_VAL_IMG_DIR.iterdir() if d.is_dir()])
+            n_images = sum(1 for _ in IMAGENET_VAL_IMG_DIR.rglob("*.JPEG"))
+            if n_classes >= 999 and n_images >= 49000:
+                log(f"ImageNet val готова: {n_images} изображений, {n_classes} классов")
+                return IMAGENET_VAL_DIR
+        raise RuntimeError(
+            f"ImageNet val не найдена в {IMAGENET_VAL_IMG_DIR}. "
+            f"Скачайте: python3 setup_datasets.py --imagenet"
+        )
     else:
         if COCO_VAL_IMG_DIR.exists() and any(COCO_VAL_IMG_DIR.glob("*.jpg")):
             n = len(list(COCO_VAL_IMG_DIR.glob("*.jpg")))
@@ -132,6 +145,8 @@ def _make_calib_yaml(task: str = "detect") -> str:
         return _make_dota_calib_yaml(data_dir)
     elif task == "semantic":
         return _make_cityscapes_calib_yaml(data_dir)
+    elif task == "classify":
+        return _make_imagenet_calib_yaml(data_dir)
     else:
         return _make_coco_calib_yaml(data_dir, task)
 
@@ -235,6 +250,27 @@ def _make_cityscapes_calib_yaml(data_dir: Path) -> str:
     calib_yaml = Path("/tmp/calib.yaml")
     calib_yaml.write_text("\n".join(lines) + "\n")
     log(f"Калибровочный YAML: {calib_yaml} (задача=semantic)")
+    return str(calib_yaml)
+
+
+def _make_imagenet_calib_yaml(data_dir: Path) -> str:
+    """Калибровочный YAML для ImageNet val (classify)."""
+    val_dir = data_dir / "val"
+    n_classes = len([d for d in val_dir.iterdir() if d.is_dir()]) if val_dir.exists() else 0
+    n_images = sum(1 for _ in val_dir.rglob("*.JPEG")) if val_dir.exists() else 0
+    log(f"Калибровочный набор: ImageNet val — {n_images} изображений, {n_classes} классов")
+
+    lines = [
+        f"path: {data_dir}",
+        "train: val",
+        "val: val",
+        f"nc: {n_classes}",
+        "names:",
+    ]
+
+    calib_yaml = Path("/tmp/calib.yaml")
+    calib_yaml.write_text("\n".join(lines) + "\n")
+    log(f"Калибровочный YAML: {calib_yaml} (задача=classify)")
     return str(calib_yaml)
 
 
@@ -519,6 +555,63 @@ def eval_coco(model_path, task="detect", data_yaml=COCO_VAL_YAML):
                 pass
 
     log(f"Метрики: {json.dumps(metrics)}")
+    return metrics
+
+
+def eval_cls(model_path, data_dir=None):
+    """Запустить yolo val task=classify на ImageNet val и вернуть метрики top-1/top-5.
+
+    Возвращает dict с top1, top5, accuracy.
+    """
+    model_path = str(model_path)
+    if data_dir is None:
+        data_dir = str(IMAGENET_VAL_DIR)
+    else:
+        data_dir = str(data_dir)
+
+    cmd = f"yolo val task=classify model={model_path} data={data_dir}"
+    log(f"Запуск: {cmd}")
+    t0 = time.time()
+
+    proc = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=7200)
+    elapsed = time.time() - t0
+    log(f"yolo val classify завершён за {elapsed:.0f}с")
+
+    stdout = proc.stdout
+    stderr = proc.stderr
+    log(f"stdout ({len(stdout)} байт), stderr ({len(stderr)} байт)")
+
+    metrics = {"model": model_path, "task": "classify", "elapsed_s": round(elapsed, 1)}
+
+    for line in stdout.splitlines():
+        line_s = line.strip()
+        if "top1" in line_s.lower() or "accuracy" in line_s.lower():
+            parts = line_s.split()
+            for i, p in enumerate(parts):
+                p_lower = p.lower()
+                if "top1" in p_lower or p_lower == "top-1":
+                    try:
+                        metrics["top1"] = float(parts[i + 1].rstrip("%"))
+                    except (ValueError, IndexError):
+                        pass
+                elif "top5" in p_lower or p_lower == "top-5":
+                    try:
+                        metrics["top5"] = float(parts[i + 1].rstrip("%"))
+                    except (ValueError, IndexError):
+                        pass
+        if '"top1_acc"' in line_s or '"top5_acc"' in line_s:
+            try:
+                data = json.loads(line_s)
+                if isinstance(data, dict):
+                    for k, v in data.items():
+                        if "top1" in k.lower():
+                            metrics["top1"] = v
+                        if "top5" in k.lower():
+                            metrics["top5"] = v
+            except (json.JSONDecodeError, TypeError):
+                pass
+
+    log(f"Метрики classify: {json.dumps(metrics)}")
     return metrics
 
 
@@ -1292,9 +1385,12 @@ def cmd_convert_all(args):
 
 
 def cmd_eval_coco(args):
-    """Запустить yolo val на COCO val 2017 и вывести метрики."""
+    """Запустить yolo val на COCO val 2017 или ImageNet val и вывести метрики."""
     model_path = resolve_pt(args.model) if args.model.endswith(".pt") else args.model
-    result = eval_coco(model_path, task=args.task, data_yaml=args.data)
+    if args.task == "classify":
+        result = eval_cls(model_path, data_dir=args.data if args.data != str(COCO_VAL_YAML) else None)
+    else:
+        result = eval_coco(model_path, task=args.task, data_yaml=args.data)
     print(json.dumps(result, indent=2))
 
 

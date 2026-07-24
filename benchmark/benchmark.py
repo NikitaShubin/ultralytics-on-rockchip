@@ -51,6 +51,9 @@ DOTA_VAL_CONTAINER = '/app/dotav1'
 CITYSCAPES_VAL_DIR = PROJECT_DIR / 'datasets' / 'cityscapes'
 CITYSCAPES_VAL_CONTAINER = '/app/cityscapes'
 
+IMAGENET_VAL_DIR = PROJECT_DIR / 'datasets' / 'imagenet'
+IMAGENET_VAL_CONTAINER = '/app/imagenet'
+
 WARMUP_S = int(os.environ.get('BENCH_WARMUP', '10'))
 MEASURE_S = int(os.environ.get('BENCH_MEASURE', '20'))
 CONVERT_TIMEOUT = int(os.environ.get('BENCH_CONVERT_TIMEOUT', '7200'))
@@ -133,6 +136,8 @@ def _container_data_path(data_dir: Path) -> str:
         return f'{DOTA_VAL_CONTAINER}/images/val'
     if data_dir.name == 'cityscapes' or data_dir == CITYSCAPES_VAL_DIR:
         return f'{CITYSCAPES_VAL_CONTAINER}/images/val'
+    if data_dir.name == 'imagenet' or data_dir == IMAGENET_VAL_DIR:
+        return f'{IMAGENET_VAL_CONTAINER}/val'
     return f'/app/benchmark/data/{data_dir.name}'
 
 
@@ -149,6 +154,7 @@ def run_converter(model_name: str, task: str, output_dir: Path, data_dir: Path) 
         '-v', f'{COCO_VAL_DIR}:{COCO_VAL_CONTAINER}:ro',
         '-v', f'{DOTA_VAL_DIR}:{DOTA_VAL_CONTAINER}:ro',
         '-v', f'{CITYSCAPES_VAL_DIR}:{CITYSCAPES_VAL_CONTAINER}:ro',
+        '-v', f'{IMAGENET_VAL_DIR}:{IMAGENET_VAL_CONTAINER}:ro',
         '-e', f'CONVERT_QUANTIZE={QUANTIZE}',
         '-e', 'KEEP_MODELS=1',
         '--entrypoint', 'python',
@@ -200,6 +206,7 @@ def run_validate(model_name: str, task: str, temp_dir: Path, data_dir: Path, inp
         '-v', f'{COCO_VAL_DIR}:{COCO_VAL_CONTAINER}:ro',
         '-v', f'{DOTA_VAL_DIR}:{DOTA_VAL_CONTAINER}:ro',
         '-v', f'{CITYSCAPES_VAL_DIR}:{CITYSCAPES_VAL_CONTAINER}:ro',
+        '-v', f'{IMAGENET_VAL_DIR}:{IMAGENET_VAL_CONTAINER}:ro',
         '--entrypoint', 'python',
         'converter',
         '/app/benchmark/validate_bench.py',
@@ -250,6 +257,7 @@ def run_fps(model_name: str, task: str, temp_dir: Path, data_dir: Path,
         '-v', f'{COCO_VAL_DIR}:{COCO_VAL_CONTAINER}:ro',
         '-v', f'{DOTA_VAL_DIR}:{DOTA_VAL_CONTAINER}:ro',
         '-v', f'{CITYSCAPES_VAL_DIR}:{CITYSCAPES_VAL_CONTAINER}:ro',
+        '-v', f'{IMAGENET_VAL_DIR}:{IMAGENET_VAL_CONTAINER}:ro',
         '-e', 'TEST_MODE=1',
         '-e', 'WEB_MODE=0',
         '-e', 'CAM_MODE=file',
@@ -293,6 +301,56 @@ def run_fps(model_name: str, task: str, temp_dir: Path, data_dir: Path,
 
 
 # ---------------------------------------------------------------------------
+# Фаза: eval (accuracy)
+# ---------------------------------------------------------------------------
+
+def run_eval(model_name: str, task: str, model_dir: Path, data_dir: Path) -> dict | None:
+    """Запустить yolo val для оценки accuracy модели."""
+    data_path = _container_data_path(data_dir)
+    cmd = [
+        'docker', 'compose', '-f', str(CONVERTER_COMPOSE), 'run', '--rm',
+        '-v', f'{BENCHMARK_DIR}:/app/benchmark',
+        '-v', f'{COCO_VAL_DIR}:{COCO_VAL_CONTAINER}:ro',
+        '-v', f'{DOTA_VAL_DIR}:{DOTA_VAL_CONTAINER}:ro',
+        '-v', f'{CITYSCAPES_VAL_DIR}:{CITYSCAPES_VAL_CONTAINER}:ro',
+        '-v', f'{IMAGENET_VAL_DIR}:{IMAGENET_VAL_CONTAINER}:ro',
+        '--entrypoint', 'python',
+        'converter',
+        '/app/benchmark/eval_bench.py',
+        model_name, task, str(model_dir), data_path,
+    ]
+    log(f'ЗАПУСК eval: {" ".join(cmd[-4:])} ...')
+    t0 = time.time()
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=7200)
+        elapsed = time.time() - t0
+        log(f'[ТАЙМИНГ] eval завершён за {elapsed:.0f}с')
+    except subprocess.TimeoutExpired:
+        log(f'[ОШИБКА] eval превысил таймаут 7200с')
+        return None
+
+    if result.stdout:
+        for line in result.stdout.strip().split('\n'):
+            log(f'[eval stdout] {line}')
+    if result.stderr:
+        for line in result.stderr.strip().split('\n'):
+            log(f'[eval stderr] {line}')
+
+    if result.returncode != 0:
+        log(f'[ОШИБКА] eval завершился с кодом {result.returncode}')
+        return None
+
+    for line in reversed(result.stdout.strip().split('\n')):
+        line = line.strip()
+        if line.startswith('{'):
+            try:
+                return json.loads(line)
+            except json.JSONDecodeError:
+                continue
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Утилиты
 # ---------------------------------------------------------------------------
 
@@ -309,7 +367,7 @@ def cleanup_temp(model_name: str) -> None:
 
 
 def model_is_complete(result: dict) -> bool:
-    """Проверить, завершены ли все фазы для модели (convert + validate + bench)."""
+    """Проверить, завершены ли все фазы для модели (convert + validate + bench + eval)."""
     if result.get('conversion_status') != 'OK':
         return False
     v = result.get('validation', {})
@@ -320,9 +378,14 @@ def model_is_complete(result: dict) -> bool:
     fps = result.get('fps', {})
     has_fps = any(
         fps.get(k, {}).get('fps', -1) > 0
-        for k in ['cpu', 'npu_none', 'npu_int8']
+        for k in ['cpu', 'npu_none', 'npu_int8', 'npu_int8-calib']
     )
-    return has_fps
+    if not has_fps:
+        return False
+    eval_result = result.get('eval', {})
+    if not eval_result or eval_result.get('elapsed_s', 0) <= 0:
+        return False
+    return True
 
 
 def load_results() -> list[dict]:
@@ -353,6 +416,8 @@ def write_tsv(results: list[dict]) -> None:
             'CPU_fps', 'CPU_fps_std',
             'NPU_FP32_fps', 'NPU_FP32_fps_std', 'NPU_FP32_load', 'CPU_load_fp32',
             'NPU_INT8_fps', 'NPU_INT8_fps_std', 'NPU_INT8_load', 'CPU_load_int8',
+            'NPU_INT8cal_fps', 'NPU_INT8cal_fps_std', 'NPU_INT8cal_load', 'CPU_load_int8cal',
+            'top1', 'top5', 'map50', 'map50_95',
             'max_diff_avg', 'max_diff_max',
             'Статус',
         ])
@@ -365,12 +430,19 @@ def write_tsv(results: list[dict]) -> None:
             cpu = (r.get('fps', {}) or {}).get('cpu', {}) or {}
             npu_fp32 = (r.get('fps', {}) or {}).get('npu_none', {}) or {}
             npu_int8 = (r.get('fps', {}) or {}).get('npu_int8', {}) or {}
+            npu_int8cal = (r.get('fps', {}) or {}).get('npu_int8-calib', {}) or {}
 
             v = r.get('validation', {})
             v_fp32 = v.get('fp32', {}) or {}
             v_int8 = v.get('int8', {}) or {}
             max_diff = v_fp32.get('max_diff_avg', v_int8.get('max_diff_avg', -1))
             max_diff_max = v_fp32.get('max_diff_max', v_int8.get('max_diff_max', -1))
+
+            ev = r.get('eval', {}) or {}
+            top1 = ev.get('top1', '')
+            top5 = ev.get('top5', '')
+            map50 = ev.get('map50', '')
+            map50_95 = ev.get('map50_95', '')
 
             writer.writerow([
                 model, task, input_size,
@@ -379,6 +451,9 @@ def write_tsv(results: list[dict]) -> None:
                 npu_fp32.get('npu_load_avg', ''), npu_fp32.get('cpu_load_avg', ''),
                 npu_int8.get('fps', -1), npu_int8.get('fps_std', 0),
                 npu_int8.get('npu_load_avg', ''), npu_int8.get('cpu_load_avg', ''),
+                npu_int8cal.get('fps', -1), npu_int8cal.get('fps_std', 0),
+                npu_int8cal.get('npu_load_avg', ''), npu_int8cal.get('cpu_load_avg', ''),
+                top1, top5, map50, map50_95,
                 max_diff, max_diff_max,
                 r.get('status', '?'),
             ])
@@ -398,10 +473,10 @@ def main() -> None:
     import argparse
     parser = argparse.ArgumentParser(description="Оркестратор YOLO бенчмарка")
     parser.add_argument("--phase", nargs='+', default=['convert', 'validate'],
-                        choices=['convert', 'validate', 'bench', 'all'],
+                        choices=['convert', 'validate', 'bench', 'eval', 'all'],
                         help="Фазы бенчмарка (можно перечислить несколько)")
-    parser.add_argument("--quantize", choices=["none", "int8", "both"], default="both",
-                        help="Какие варианты RKNN тестировать (по умолчанию: оба)")
+    parser.add_argument("--quantize", choices=["onnx", "none", "int8", "int8-calib", "all"], default="all",
+                        help="Какие варианты RKNN тестировать: onnx=CPU only, none=FP32, int8=INT8, int8-calib=INT8 с калибровкой, all=все")
     parser.add_argument("--model", default=None,
                         help="Запуск для одной модели (напр. yolo26x-seg)")
     parser.add_argument("--pilot", action="store_true",
@@ -542,7 +617,7 @@ def main() -> None:
                     if r['model'] == model.name:
                         fps_existing = r.get('fps', {})
                         if any(fps_existing.get(k, {}).get('fps', -1) > 0
-                               for k in ['cpu', 'npu_none', 'npu_int8']):
+                               for k in ['cpu', 'npu_none', 'npu_int8', 'npu_int8-calib']):
                             log(f'[ПРОПУСК] bench: уже замерено (results.json)')
                             bench_done = True
                         break
@@ -565,14 +640,16 @@ def main() -> None:
                             fps = {}
                         else:
                             fps = {}
-                            for key in ['cpu', 'npu_none', 'npu_int8']:
+                            for key in ['cpu', 'npu_none', 'npu_int8', 'npu_int8-calib']:
                                 b = fps_result.get(key, {}) or {}
                                 fps[key] = {
                                     'fps': b.get('fps', -1),
                                     'fps_std': b.get('fps_std', 0),
                                     'n_frames': b.get('n_frames', 0),
                                     'npu_load_avg': b.get('npu_load_avg'),
+                                    'npu_load_per_core': b.get('npu_load_per_core', {}),
                                     'cpu_load_avg': b.get('cpu_load_avg'),
+                                    'cpu_load_per_core': b.get('cpu_load_per_core', {}),
                                     'error': b.get('error'),
                                 }
 
@@ -581,7 +658,7 @@ def main() -> None:
                                 existing[j]['fps'] = fps
                                 has_data = any(
                                     fps.get(k, {}).get('fps', -1) > 0
-                                    for k in ['cpu', 'npu_none', 'npu_int8']
+                                    for k in ['cpu', 'npu_none', 'npu_int8', 'npu_int8-calib']
                                 )
                                 if has_data:
                                     existing[j]['status'] = 'ПРОЙДЕНО'
@@ -593,7 +670,41 @@ def main() -> None:
                         cpu_fps = fps.get('cpu', {}).get('fps', -1)
                         npu_fp32_fps = fps.get('npu_none', {}).get('fps', -1)
                         npu_int8_fps = fps.get('npu_int8', {}).get('fps', -1)
-                        log(f'[ГОТОВО] {model.name}: CPU={cpu_fps} FP32={npu_fp32_fps} INT8={npu_int8_fps}')
+                        npu_int8c_fps = fps.get('npu_int8-calib', {}).get('fps', -1)
+                        log(f'[ГОТОВО] {model.name}: CPU={cpu_fps} FP32={npu_fp32_fps} INT8={npu_int8_fps} INT8-calib={npu_int8c_fps}')
+
+            # --- Фаза: eval (accuracy) ---
+            if phase_is(phases, 'eval'):
+                eval_done = False
+                for r in existing:
+                    if r['model'] == model.name:
+                        eval_existing = r.get('eval', {})
+                        if eval_existing and eval_existing.get('elapsed_s', 0) > 0:
+                            log(f'[ПРОПУСК] eval: уже выполнено (results.json)')
+                            eval_done = True
+                        break
+
+                if not eval_done:
+                    # Найти лучшую модель для eval: .rknn > .onnx > .pt
+                    eval_model = None
+                    for suffix in ['_none.rknn', '_int8.rknn', '_int8-calib.rknn', '.onnx']:
+                        candidate = model_temp_dir / f'{model.name}{suffix}'
+                        if candidate.exists():
+                            eval_model = candidate
+                            break
+                    if eval_model is None:
+                        log(f'[ПРОПУСК] eval: нет модели для {model.name}')
+                    else:
+                        eval_result = run_eval(model.name, model.task, eval_model.parent, model_data_dir)
+                        if eval_result is None:
+                            log(f'[ОШИБКА] eval не удался для {model.name}')
+                            eval_result = {}
+                        for j, r in enumerate(existing):
+                            if r['model'] == model.name:
+                                existing[j]['eval'] = eval_result
+                                break
+                        save_results(existing)
+                        log(f'[ГОТОВО] eval {model.name}: {json.dumps(eval_result)}')
 
             # --- Авто-очистка после завершения всех фаз ---
             if phase_is(phases, 'all') or (phase_is(phases, 'convert') and phase_is(phases, 'validate') and phase_is(phases, 'bench')):

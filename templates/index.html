@@ -82,7 +82,7 @@ async function poll() {
       ctx.drawImage(img, 0, 0);
       URL.revokeObjectURL(url);
       ctx.globalAlpha = 0.5;
-      for (const obj of (objData.objects || [])) drawObject(obj);
+      for (const [idx, obj] of (objData.objects || []).entries()) drawObject(obj, idx);
       ctx.globalAlpha = 1.0;
     };
     img.src = url;
@@ -104,7 +104,7 @@ function updateClientFps() {
   clientFps = clientFpsHistory.length > 1 ? clientFpsHistory.length / 2.0 : 0;
 }
 
-function drawObject(obj) {
+function drawObject(obj, idx) {
   const color = colorForClass(obj.class_name || '');
   const label = `${obj.class_name || ''} ${(obj.score || 0).toFixed(2)}`;
 
@@ -140,14 +140,17 @@ function drawObject(obj) {
     ctx.lineWidth = 2;
     ctx.strokeRect(x1, y1, x2 - x1, y2 - y1);
     if (!obj.polygon) {
-      ctx.font = 'bold 14px sans-serif';
-      ctx.textBaseline = 'bottom';
+      ctx.font = 'bold 20px sans-serif';
+      ctx.textBaseline = 'top';
       ctx.strokeStyle = '#000';
       ctx.lineWidth = 3;
       ctx.lineJoin = 'round';
-      ctx.strokeText(label, x1, y1 - 2);
+      ctx.textAlign = 'left';
+      const lx = x1 + 10;
+      const ly = y1 + 10 + idx * 28;
+      ctx.strokeText(label, lx, ly);
       ctx.fillStyle = '#fff';
-      ctx.fillText(label, x1, y1 - 2);
+      ctx.fillText(label, lx, ly);
     }
   }
 

@@ -15,7 +15,7 @@ cd "$(dirname "$0")"
 # Docker создаёт mount-точки от root, если их нет.
 # Создаём заранее, чтобы монтировались user-owned директории.
 ensure_mountpoints() {
-    mkdir -p datasets/coco_val2017 datasets/dotav1 datasets/cityscapes model
+    mkdir -p datasets/coco_val2017 datasets/dotav1 datasets/cityscapes datasets/imagenet model
 }
 
 MODEL="${1:-}"
@@ -36,6 +36,7 @@ detect_dataset() {
     case "$model" in
         *-obb)       echo "dota" ;;
         *-sem)       echo "cityscapes" ;;
+        *-cls)       echo "imagenet" ;;
         *)           echo "coco" ;;
     esac
 }
@@ -64,6 +65,12 @@ if [ "$QUANTIZE" = "int8-calib" ] && [ -n "$MODEL" ]; then
         if [ ! -d "$CS_DIR" ] || [ -z "$(ls "$CS_DIR"/*.png 2>/dev/null)" ]; then
             echo "=== Загрузка Cityscapes val для калибровки INT8 Semantic ==="
             python3 setup_datasets.py --cityscapes
+        fi
+    elif [ "$DATASET" = "imagenet" ]; then
+        IMAGENET_DIR="datasets/imagenet/val"
+        if [ ! -d "$IMAGENET_DIR" ] || [ -z "$(ls "$IMAGENET_DIR"/*.JPEG 2>/dev/null)" ]; then
+            echo "=== Загрузка ImageNet val (~6.3 GB) для калибровки INT8 Classify ==="
+            python3 setup_datasets.py --imagenet
         fi
     fi
 fi

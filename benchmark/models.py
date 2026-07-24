@@ -20,7 +20,7 @@ class Model(NamedTuple):
             'detect': 'coco_val2017',
             'seg': 'coco_val2017',
             'pose': 'coco_val2017',
-            'cls': 'coco_val2017',
+            'cls': 'imagenet',
             'obb': 'dotav1',
             'sem': 'cityscapes',
         }[self.task]

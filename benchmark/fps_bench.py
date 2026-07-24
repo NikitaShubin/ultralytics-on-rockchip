@@ -31,19 +31,74 @@ NPU_LOAD_PATH = '/sys/kernel/debug/rknpu/load'
 
 
 def _sample_npu_load(samples: list[float], stop_event: threading.Event) -> None:
-    """Сэмплирование загрузки NPU из sysfs."""
-    pattern = re.compile(r'Core\d+:\s*(\d+)%')
+    """Сэмплирование загрузки NPU из sysfs (per-core)."""
+    pattern = re.compile(r'Core(\d+):\s*(\d+)%')
     while not stop_event.is_set():
         try:
             with open(NPU_LOAD_PATH) as f:
                 content = f.read()
             matches = pattern.findall(content)
             if matches:
-                avg_load = sum(int(m) for m in matches) / len(matches)
+                avg_load = sum(int(m) for _, m in matches) / len(matches)
                 samples.append(avg_load)
         except (FileNotFoundError, PermissionError, OSError):
             pass
         stop_event.wait(0.2)
+
+
+def _sample_npu_load_per_core(samples_per_core: dict[int, list[float]], stop_event: threading.Event) -> None:
+    """Сэмплирование загрузки NPU per-core из sysfs."""
+    pattern = re.compile(r'Core(\d+):\s*(\d+)%')
+    while not stop_event.is_set():
+        try:
+            with open(NPU_LOAD_PATH) as f:
+                content = f.read()
+            matches = pattern.findall(content)
+            for core_id, load in matches:
+                cid = int(core_id)
+                if cid not in samples_per_core:
+                    samples_per_core[cid] = []
+                samples_per_core[cid].append(int(load))
+        except (FileNotFoundError, PermissionError, OSError):
+            pass
+        stop_event.wait(0.2)
+
+
+def _read_cpu_stat_per_core() -> dict[int, tuple[int, int]]:
+    """Прочитать время CPU per-core из /proc/stat. Возвращает {core: (idle, total)}."""
+    stats = {}
+    try:
+        with open('/proc/stat') as f:
+            for line in f:
+                if line.startswith('cpu') and not line.startswith('cpu '):
+                    parts = line.split()
+                    core_id = int(parts[0][3:])
+                    values = [int(x) for x in parts[1:9]]
+                    idle = values[3] + values[4]
+                    total = sum(values)
+                    stats[core_id] = (idle, total)
+    except (OSError, ValueError):
+        pass
+    return stats
+
+
+def _sample_cpu_load_per_core(samples_per_core: dict[int, list[float]], stop_event: threading.Event) -> None:
+    """Сэмплирование загрузки CPU per-core из /proc/stat."""
+    prev_stats = _read_cpu_stat_per_core()
+    while not stop_event.is_set():
+        stop_event.wait(0.5)
+        cur_stats = _read_cpu_stat_per_core()
+        for core_id, (cur_idle, cur_total) in cur_stats.items():
+            if core_id in prev_stats:
+                prev_idle, prev_total = prev_stats[core_id]
+                d_idle = cur_idle - prev_idle
+                d_total = cur_total - prev_total
+                if d_total > 0:
+                    usage = (1.0 - d_idle / d_total) * 100.0
+                    if core_id not in samples_per_core:
+                        samples_per_core[core_id] = []
+                    samples_per_core[core_id].append(round(usage, 1))
+        prev_stats = cur_stats
 
 
 def _read_cpu_stat() -> tuple[int, int]:
@@ -136,7 +191,8 @@ def benchmark_backend(
         n_warmup += 1
 
     npu_load_samples: list[float] = []
-    cpu_load_samples: list[float] = []
+    npu_load_per_core: dict[int, list[float]] = {}
+    cpu_load_per_core: dict[int, list[float]] = {}
     stop_event = threading.Event()
     sampler_threads: list[threading.Thread] = []
 
@@ -144,9 +200,12 @@ def benchmark_backend(
         t = threading.Thread(target=_sample_npu_load, args=(npu_load_samples, stop_event), daemon=True)
         t.start()
         sampler_threads.append(t)
+        t2 = threading.Thread(target=_sample_npu_load_per_core, args=(npu_load_per_core, stop_event), daemon=True)
+        t2.start()
+        sampler_threads.append(t2)
 
     if collect_cpu_load:
-        t = threading.Thread(target=_sample_cpu_load, args=(cpu_load_samples, stop_event), daemon=True)
+        t = threading.Thread(target=_sample_cpu_load_per_core, args=(cpu_load_per_core, stop_event), daemon=True)
         t.start()
         sampler_threads.append(t)
 
@@ -175,7 +234,17 @@ def benchmark_backend(
         pipe._backend.rknn.release()
 
     npu_load_avg = round(float(np.mean(npu_load_samples)), 1) if npu_load_samples else None
-    cpu_load_avg = round(float(np.mean(cpu_load_samples)), 1) if cpu_load_samples else None
+    cpu_load_avg = round(float(np.mean([v for cores in cpu_load_per_core.values() for v in cores])), 1) if cpu_load_per_core else None
+
+    npu_per_core = {}
+    for cid in sorted(npu_load_per_core.keys()):
+        vals = npu_load_per_core[cid]
+        npu_per_core[str(cid)] = round(float(np.mean(vals)), 1) if vals else 0
+
+    cpu_per_core = {}
+    for cid in sorted(cpu_load_per_core.keys()):
+        vals = cpu_load_per_core[cid]
+        cpu_per_core[str(cid)] = round(float(np.mean(vals)), 1) if vals else 0
 
     return {
         'backend': backend.value,
@@ -188,7 +257,9 @@ def benchmark_backend(
         'warmup_s': warmup_sec,
         'input_size': pipe.input_size,
         'npu_load_avg': npu_load_avg,
+        'npu_load_per_core': npu_per_core,
         'cpu_load_avg': cpu_load_avg,
+        'cpu_load_per_core': cpu_per_core,
     }
 
 
@@ -201,8 +272,8 @@ def main() -> None:
     parser.add_argument('--data-dir', default='/app/coco_val2017/images/val2017', help='Директория тестовых изображений')
     parser.add_argument('--warmup', type=int, default=10, help='Секунды прогрева')
     parser.add_argument('--measure', type=int, default=20, help='Секунды измерения')
-    parser.add_argument('--quantize', choices=['none', 'int8', 'both'], default='both',
-                        help='Какие варианты RKNN тестировать (по умолчанию: оба)')
+    parser.add_argument('--quantize', choices=['onnx', 'none', 'int8', 'int8-calib', 'all'], default='all',
+                        help='Какие варианты тестировать: onnx=только CPU, none=FP32, int8=INT8, int8-calib=INT8 с калибровкой, all=все')
     args = parser.parse_args()
 
     images = load_test_images(args.data_dir)
@@ -223,20 +294,25 @@ def main() -> None:
 
     # Определяем какие RKNN варианты тестировать
     rknn_variants = []
-    if args.quantize in ('none', 'both'):
+    if args.quantize in ('none', 'all'):
         if (temp_dir / f'{args.model_name}_none.rknn').exists():
             rknn_variants.append(('none', 'NPU FP32'))
         else:
             sys.stderr.write(f'[ПРОПУСК] {args.model_name}_none.rknn не найден\n')
-    if args.quantize in ('int8', 'both'):
+    if args.quantize in ('int8', 'all'):
         if (temp_dir / f'{args.model_name}_int8.rknn').exists():
             rknn_variants.append(('int8', 'NPU INT8'))
         else:
             sys.stderr.write(f'[ПРОПУСК] {args.model_name}_int8.rknn не найден\n')
+    if args.quantize in ('int8-calib', 'all'):
+        if (temp_dir / f'{args.model_name}_int8-calib.rknn').exists():
+            rknn_variants.append(('int8-calib', 'NPU INT8-calib'))
+        else:
+            sys.stderr.write(f'[ПРОПУСК] {args.model_name}_int8-calib.rknn не найден\n')
 
-    # ONNX на CPU (всегда)
+    # ONNX на CPU (если запрошен)
     has_onnx = (temp_dir / f'{args.model_name}.onnx').exists()
-    if has_onnx:
+    if has_onnx and args.quantize in ('onnx', 'all'):
         try:
             sys.stderr.write(f'[ИНФО] бенчмарк ONNX CPU...\n')
             bench = benchmark_backend(
@@ -276,6 +352,11 @@ def main() -> None:
             sys.stderr.write(f'[ОШИБКА] {label}: {e}\n')
             sys.stderr.write(traceback.format_exc() + '\n')
             results[f'npu_{suffix}'] = {'backend': 'npu', 'rknn_suffix': suffix, 'error': str(e), 'fps': -1}
+
+    # Если all — также запускаем onnx-only, none, int8, int8-calib по отдельности
+    if args.quantize == 'all':
+        # Уже запущены все варианты выше
+        pass
 
     print(json.dumps(results))
 

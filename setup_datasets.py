@@ -14,6 +14,8 @@ DATASETS_DIR = Path(__file__).parent / 'datasets'
 
 DOTAV1_URL = 'https://github.com/ultralytics/assets/releases/download/v0.0.0/DOTAv1.zip'
 CITYSCAPES_HF_REPO = 'Chris1/cityscapes'
+IMAGENET_VAL_URL = 'https://image-net.org/data/ILSVRC/2012/ILSVRC2012_img_val.tar'
+IMAGENET_VALPREP_URL = 'https://raw.githubusercontent.com/soumith/imagenetloader.torch/master/valprep.sh'
 
 
 def ensure_dir(path: Path) -> None:
@@ -27,15 +29,22 @@ def ensure_dir(path: Path) -> None:
 
 
 def download_file(url: str, dest: Path) -> None:
-    """Загрузка файла: сначала в .tmp, потом rename (защита от битых загрузок)."""
+    """Загрузка файла: сначала в .tmp, потом rename (защита от битых загрузок).
+
+    Поддерживает докачку: если .tmp существует и больше нуля, curl -C - продолжит.
+    """
     if dest.exists() and dest.stat().st_size > 0:
         print(f'Файл уже существует: {dest}')
         return
     tmp = dest.with_suffix('.tmp')
-    tmp.unlink(missing_ok=True)
+    # Не удаляем .tmp если он большой — возможно это частичная загрузка (докачка)
+    if tmp.exists() and tmp.stat().st_size > 1_000_000:
+        print(f'Докачка {tmp} ({tmp.stat().st_size // (1024*1024)} MB)...')
+    else:
+        tmp.unlink(missing_ok=True)
     print(f'Загрузка {url}...')
     subprocess.run(
-        ['curl', '-fSL', '--progress-bar', '-o', str(tmp), url],
+        ['curl', '-fSL', '--progress-bar', '-C', '-', '-o', str(tmp), url],
         check=True,
     )
     if tmp.stat().st_size == 0:
@@ -55,6 +64,24 @@ def validate_zip(path: Path) -> None:
         path.unlink(missing_ok=True)
         raise RuntimeError(
             f'{path.name} — битый архив. Содержимое файла:\n{content}\n'
+            f'Удалён. Попробуйте снова.'
+        )
+
+
+def validate_tar(path: Path) -> None:
+    """Проверить что файл — валидный tar-архив (первые 3 блока)."""
+    import tarfile
+    try:
+        with tarfile.open(path, 'r:*') as tar:
+            # Читаем первые 3 записи для быстрой проверки
+            for i, _ in enumerate(tar):
+                if i >= 2:
+                    break
+    except (tarfile.TarError, EOFError, OSError) as e:
+        size_mb = path.stat().st_size // (1024 * 1024)
+        path.unlink(missing_ok=True)
+        raise RuntimeError(
+            f'{path.name} ({size_mb} MB) — битый tar-архив: {e}\n'
             f'Удалён. Попробуйте снова.'
         )
 
@@ -284,6 +311,64 @@ def setup_cityscapes_val() -> None:
     print(f'  Директория: {cs_dir}')
 
 
+def setup_imagenet_val() -> None:
+    """Загрузка ImageNet val split (50000 изображений, 1000 классов)."""
+    imagenet_dir = DATASETS_DIR / 'imagenet'
+    val_dir = imagenet_dir / 'val'
+    ensure_dir(imagenet_dir)
+
+    # Всё уже на месте
+    if val_dir.exists():
+        n_classes = len([d for d in val_dir.iterdir() if d.is_dir()])
+        n_images = sum(1 for _ in val_dir.rglob('*.JPEG'))
+        if n_classes >= 999 and n_images >= 49000:
+            print(f'ImageNet val уже загружена: {n_images} изображений, {n_classes} классов')
+            return
+
+    # Если val_dir есть но неполный — удаляем и начинаем заново
+    if val_dir.exists():
+        import shutil
+        n = sum(1 for _ in val_dir.rglob('*'))
+        print(f'Неполная распаковка ({n} файлов), удаление...')
+        shutil.rmtree(val_dir)
+
+    # Удаляем flat JPEG если есть (остаток неполной распаковки в корне)
+    for f in imagenet_dir.glob('ILSVRC*.JPEG'):
+        f.unlink()
+
+    # Скачивание tar (curl -C - докачивает с места прерывания)
+    tar_path = DATASETS_DIR / 'ILSVRC2012_img_val.tar'
+    if not tar_path.exists() or tar_path.stat().st_size < 5_000_000_000:
+        print('Загрузка ImageNet val (~6.3 GB)...')
+        download_file(IMAGENET_VAL_URL, tar_path)
+
+    # Распаковка
+    val_dir.mkdir(parents=True, exist_ok=True)
+    print('Распаковка ImageNet val...')
+    import tarfile
+    with tarfile.open(tar_path, 'r:*') as tar:
+        tar.extractall(val_dir)
+    print('Распаковка завершена')
+
+    # Организация по классам
+    valprep_sh = imagenet_dir / 'valprep.sh'
+    if not valprep_sh.exists():
+        print('Скачивание valprep.sh...')
+        subprocess.run(
+            ['curl', '-fSL', '-o', str(valprep_sh), IMAGENET_VALPREP_URL],
+            check=True,
+        )
+    flat_in_val = list(val_dir.glob('ILSVRC*.JPEG'))
+    if flat_in_val:
+        print('Организация по поддиректориям классов...')
+        subprocess.run(['bash', str(valprep_sh)], cwd=str(val_dir), check=True)
+
+    n_classes = len([d for d in val_dir.iterdir() if d.is_dir()])
+    n_images = sum(1 for _ in val_dir.rglob('*.JPEG'))
+    print(f'ImageNet val готова: {n_images} изображений, {n_classes} классов')
+    print(f'  Директория: {imagenet_dir}')
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description='Загрузка датасетов для калибровки и валидации',
@@ -291,11 +376,12 @@ def main() -> None:
     parser.add_argument('--coco', action='store_true', help='Загрузить COCO val2017')
     parser.add_argument('--dota', action='store_true', help='Загрузить DOTAv1 val')
     parser.add_argument('--cityscapes', action='store_true', help='Загрузить Cityscapes val')
+    parser.add_argument('--imagenet', action='store_true', help='Загрузить ImageNet val (6.3 GB, 1000 классов)')
     parser.add_argument('--all', action='store_true', help='Загрузить все датасеты (по умолчанию)')
     args = parser.parse_args()
 
     # Если ничего не указано — загружаем всё
-    if not (args.coco or args.dota or args.cityscapes or args.all):
+    if not (args.coco or args.dota or args.cityscapes or args.imagenet or args.all):
         args.all = True
 
     DATASETS_DIR.mkdir(parents=True, exist_ok=True)
@@ -313,6 +399,10 @@ def main() -> None:
 
     if args.all or args.cityscapes:
         setup_cityscapes_val()
+        print()
+
+    if args.all or args.imagenet:
+        setup_imagenet_val()
         print()
 
     print('=== Все датасеты готовы ===')
