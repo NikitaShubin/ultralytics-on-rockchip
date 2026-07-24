@@ -30,6 +30,7 @@ services:
       - ./datasets/coco_val2017:/app/coco_val2017:ro
       - ./datasets/dotav1:/app/dotav1:ro
       - ./datasets/cityscapes:/app/cityscapes:ro
+      - ./datasets/imagenet:/app/imagenet:ro
     environment:
       - BACKEND=${BACKEND:-npu}
       - MODEL=${MODEL:-yolo11n}

@@ -15,7 +15,6 @@ CONTAINER="percept"
 require_root() {
     [[ $EUID -ne 0 ]] && { echo "[ОШИБКА] Запустите через: sudo $0 $*"; exit 1; }
 }
-TASK="detect"
 OC_DTB="/boot/dtb/rockchip/rk3588s-orangepi-5-pro.dtb"
 OC_DTB_BAK="/boot/dtb/rockchip/rk3588s-orangepi-5-pro.dtb.bak"
 OC_DTS="/tmp/oc_base.dts"
@@ -35,7 +34,33 @@ detect_model() {
 }
 MODEL="${MODEL:-$(detect_model)}"
 
-FPS_CMD="python3 /app/benchmark/fps_bench.py $MODEL $TASK --temp-dir /app/model --data-dir /app/coco_val2017/images/val2017 --warmup 10 --measure 20 --quantize none"
+# Автоопределение задачи по суффиксу модели
+detect_task() {
+    case "$1" in
+        *-obb)       echo "obb" ;;
+        *-seg)       echo "segment" ;;
+        *-cls)       echo "classify" ;;
+        *-pose)      echo "pose" ;;
+        *-sem)       echo "semantic" ;;
+        *)           echo "detect" ;;
+    esac
+}
+TASK="${TASK:-$(detect_task "$MODEL")}"
+
+# Автоопределение данных по задаче
+detect_data_dir() {
+    case "$1" in
+        obb)         echo "/app/dotav1/images/val" ;;
+        segment)     echo "/app/coco_val2017/images/val2017" ;;
+        classify)    echo "/app/coco_val2017/images/val2017" ;;
+        pose)        echo "/app/coco_val2017/images/val2017" ;;
+        semantic)    echo "/app/cityscapes/images/val" ;;
+        *)           echo "/app/coco_val2017/images/val2017" ;;
+    esac
+}
+DATA_DIR="${DATA_DIR:-$(detect_data_dir "$TASK")}"
+
+FPS_CMD="python3 /app/benchmark/fps_bench.py $MODEL $TASK --temp-dir /app/model --data-dir $DATA_DIR --warmup 10 --measure 20 --quantize none"
 
 FPS_ONLY=0
 OC_SETUP_ONLY=0

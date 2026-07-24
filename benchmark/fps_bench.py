@@ -150,6 +150,8 @@ def _load_input_size(model_name: str, temp_dir: str) -> int:
     """Загрузить input_size из файла постпроцесса."""
     import importlib.util
     post_path = Path(temp_dir) / f'{model_name}_postprocess.py'
+    if not post_path.exists():
+        post_path = Path(temp_dir) / 'postprocess.py'
     if post_path.exists():
         spec = importlib.util.spec_from_file_location('_pp', str(post_path))
         if spec and spec.loader:
@@ -292,26 +294,34 @@ def main() -> None:
         'task': args.task,
     }
 
+    def _has_rknn(suffix: str) -> bool:
+        """Проверить наличие RKNN модели: именованный файл или model.rknn."""
+        if suffix:
+            named = temp_dir / f'{args.model_name}{suffix}.rknn'
+            if named.exists():
+                return True
+        return (temp_dir / 'model.rknn').exists()
+
     # Определяем какие RKNN варианты тестировать
     rknn_variants = []
     if args.quantize in ('none', 'all'):
-        if (temp_dir / f'{args.model_name}_none.rknn').exists():
+        if _has_rknn('_none'):
             rknn_variants.append(('none', 'NPU FP32'))
         else:
-            sys.stderr.write(f'[ПРОПУСК] {args.model_name}_none.rknn не найден\n')
+            sys.stderr.write(f'[ПРОПУСК] {_has_rknn.__name__}: none.rknn не найден\n')
     if args.quantize in ('int8', 'all'):
-        if (temp_dir / f'{args.model_name}_int8.rknn').exists():
+        if _has_rknn('_int8'):
             rknn_variants.append(('int8', 'NPU INT8'))
         else:
-            sys.stderr.write(f'[ПРОПУСК] {args.model_name}_int8.rknn не найден\n')
+            sys.stderr.write(f'[ПРОПУСК] int8.rknn не найден\n')
     if args.quantize in ('int8-calib', 'all'):
-        if (temp_dir / f'{args.model_name}_int8-calib.rknn').exists():
+        if _has_rknn('_int8-calib'):
             rknn_variants.append(('int8-calib', 'NPU INT8-calib'))
         else:
-            sys.stderr.write(f'[ПРОПУСК] {args.model_name}_int8-calib.rknn не найден\n')
+            sys.stderr.write(f'[ПРОПУСК] int8-calib.rknn не найден\n')
 
     # ONNX на CPU (если запрошен)
-    has_onnx = (temp_dir / f'{args.model_name}.onnx').exists()
+    has_onnx = (temp_dir / f'{args.model_name}.onnx').exists() or (temp_dir / 'model.onnx').exists()
     if has_onnx and args.quantize in ('onnx', 'all'):
         try:
             sys.stderr.write(f'[ИНФО] бенчмарк ONNX CPU...\n')

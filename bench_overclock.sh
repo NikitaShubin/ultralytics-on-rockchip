@@ -76,6 +76,32 @@ done
 
 MODEL="${MODEL:-$(detect_model)}"
 
+# Автоопределение задачи по суффиксу модели
+detect_task() {
+    case "$1" in
+        *-obb)       echo "obb" ;;
+        *-seg)       echo "segment" ;;
+        *-cls)       echo "classify" ;;
+        *-pose)      echo "pose" ;;
+        *-sem)       echo "semantic" ;;
+        *)           echo "detect" ;;
+    esac
+}
+TASK="${TASK:-$(detect_task "$MODEL")}"
+
+# Автоопределение данных по задаче
+detect_data_dir() {
+    case "$1" in
+        obb)         echo "/app/dotav1/images/val" ;;
+        segment)     echo "/app/coco_val2017/images/val2017" ;;
+        classify)    echo "/app/coco_val2017/images/val2017" ;;
+        pose)        echo "/app/coco_val2017/images/val2017" ;;
+        semantic)    echo "/app/cityscapes/images/val" ;;
+        *)           echo "/app/coco_val2017/images/val2017" ;;
+    esac
+}
+DATA_DIR="${DATA_DIR:-$(detect_data_dir "$TASK")}"
+
 # ─── Утилиты ────────────────────────────────────────────────────────────────
 
 require_root() {
@@ -206,7 +232,7 @@ restore_governors() {
 # ─── Замер FPS ──────────────────────────────────────────────────────────────
 
 # Замер FPS инференса (файлы с диска, воспроизводимо) — через pause/unpause
-FPS_CMD="python3 /app/benchmark/fps_bench.py $MODEL $TASK --temp-dir /app/benchmark/temp_models/$MODEL --data-dir /app/coco_val2017/images/val2017 --warmup $WARMUP --measure $MEASURE"
+FPS_CMD="python3 /app/benchmark/fps_bench.py $MODEL $TASK --temp-dir /app/model --data-dir $DATA_DIR --warmup $WARMUP --measure $MEASURE"
 
 measure_fps_inference() {
     local quantize_flag=""
