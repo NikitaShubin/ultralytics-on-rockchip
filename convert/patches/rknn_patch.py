@@ -1,3 +1,14 @@
+"""
+Патчи Detect.head для RKNN-экспорта.
+
+Основан на airockchip/ultralytics_yolov8:
+https://github.com/airockchip/ultralytics_yolov8
+
+Выход модели: 9 тензоров [box, cls, score_sum] × 3 strides.
+DFL-декодирование, grid-декодирование и NMS — на CPU
+(см. cache/<model>/<model>_postprocess.py).
+"""
+
 import torch
 import torch.nn as nn
 

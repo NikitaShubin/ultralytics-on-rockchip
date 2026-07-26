@@ -101,35 +101,6 @@ def _sample_cpu_load_per_core(samples_per_core: dict[int, list[float]], stop_eve
         prev_stats = cur_stats
 
 
-def _read_cpu_stat() -> tuple[int, int]:
-    """Прочитать время CPU из /proc/stat. Возвращает (idle, total)."""
-    try:
-        with open('/proc/stat') as f:
-            line = f.readline()
-        parts = line.split()
-        # user nice system idle iowait irq softirq steal
-        values = [int(x) for x in parts[1:9]]
-        idle = values[3] + values[4]  # idle + iowait
-        total = sum(values)
-        return idle, total
-    except (OSError, ValueError, IndexError):
-        return 0, 0
-
-
-def _sample_cpu_load(samples: list[float], stop_event: threading.Event) -> None:
-    """Сэмплирование загрузки CPU из /proc/stat."""
-    prev_idle, prev_total = _read_cpu_stat()
-    while not stop_event.is_set():
-        stop_event.wait(0.5)
-        idle, total = _read_cpu_stat()
-        d_idle = idle - prev_idle
-        d_total = total - prev_total
-        if d_total > 0:
-            usage = (1.0 - d_idle / d_total) * 100.0
-            samples.append(round(usage, 1))
-        prev_idle, prev_total = idle, total
-
-
 def load_test_images(data_dir: str, limit: int = 100) -> list[np.ndarray]:
     """Загрузить тестовые изображения из директории."""
     data_dir = Path(data_dir)
@@ -271,7 +242,7 @@ def main() -> None:
     parser.add_argument('model_name', help='Имя модели (напр. yolo11n)')
     parser.add_argument('task', help='Тип задачи (detect, segment, pose, obb, classify, semantic)')
     parser.add_argument('--temp-dir', default='/app/benchmark/temp_models', help='Директория с моделями')
-    parser.add_argument('--data-dir', default='/app/coco_val2017/images/val2017', help='Директория тестовых изображений')
+    parser.add_argument('--data-dir', default='/app/datasets/coco_val2017/images/val2017', help='Директория тестовых изображений')
     parser.add_argument('--warmup', type=int, default=10, help='Секунды прогрева')
     parser.add_argument('--measure', type=int, default=20, help='Секунды измерения')
     parser.add_argument('--quantize', choices=['onnx', 'none', 'int8', 'int8-calib', 'all'], default='all',
@@ -305,10 +276,10 @@ def main() -> None:
     # Определяем какие RKNN варианты тестировать
     rknn_variants = []
     if args.quantize in ('none', 'all'):
-        if _has_rknn('_none'):
-            rknn_variants.append(('none', 'NPU FP32'))
+        if _has_rknn('_fp16'):
+            rknn_variants.append(('none', 'NPU FP16'))
         else:
-            sys.stderr.write(f'[ПРОПУСК] {_has_rknn.__name__}: none.rknn не найден\n')
+            sys.stderr.write(f'[ПРОПУСК] {_has_rknn.__name__}: fp16.rknn не найден\n')
     if args.quantize in ('int8', 'all'):
         if _has_rknn('_int8'):
             rknn_variants.append(('int8', 'NPU INT8'))
@@ -349,7 +320,7 @@ def main() -> None:
             sys.stderr.write(f'[ИНФО] бенчмарк {label}...\n')
             bench = benchmark_backend(
                 args.model_name, args.temp_dir, images, Backend.NPU,
-                rknn_suffix=f'_{suffix}' if suffix else '',
+                rknn_suffix={'none': '_fp16', 'int8': '_int8', 'int8-calib': '_int8-calib'}.get(suffix, ''),
                 warmup_sec=args.warmup, measure_sec=args.measure,
                 collect_npu_load=True, collect_cpu_load=True,
             )

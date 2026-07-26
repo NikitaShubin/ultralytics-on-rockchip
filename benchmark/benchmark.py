@@ -2,7 +2,7 @@
 """Оркестратор бенчмарка — запускается на HOST.
 
 Три фазы:
-  convert  — конвертация .pt → .onnx + _none.rknn + _int8.rknn (x86 ПК)
+  convert  — конвертация .pt → .onnx + _fp16.rknn + _int8.rknn (x86 ПК)
   validate — валидация ONNX vs RKNN (x86 ПК)
   bench    — FPS + нагрузка на CPU/NPU (ARM железо)
 
@@ -12,9 +12,8 @@
     python3 benchmark.py --phase bench                      # FPS (ARM)
     python3 benchmark.py --phase convert validate           # конвертация + валидация (ПК)
     python3 benchmark.py --phase all                        # всё (convert → validate → bench)
-    python3 benchmark.py --phase all --clean                # всё с авто-очисткой temp_models
     python3 benchmark.py --phase bench --quantize int8      # только INT8 FPS
-    python3 benchmark.py --phase bench --clean --model yolo11n
+    python3 benchmark.py --phase bench --model yolo11n
 """
 
 from __future__ import annotations
@@ -22,7 +21,6 @@ from __future__ import annotations
 import csv
 import json
 import os
-import shutil
 import subprocess
 import sys
 import time
@@ -33,38 +31,60 @@ from models import FULL as MODELS, PILOT as PILOT_MODELS
 
 BENCHMARK_DIR = Path(__file__).parent.resolve()
 PROJECT_DIR = BENCHMARK_DIR.parent
-TEMP_DIR = BENCHMARK_DIR / 'temp_models'
+CACHE_DIR = PROJECT_DIR / 'cache'
 DATA_DIR = BENCHMARK_DIR / 'data'
 RESULTS_DIR = BENCHMARK_DIR / 'results'
-CONVERTER_COMPOSE = PROJECT_DIR / 'converter' / 'docker-compose.yml'
+CONVERT_COMPOSE = PROJECT_DIR / 'convert' / 'docker-compose.yml'
 WEB_COMPOSE = PROJECT_DIR / 'docker-compose.yml'
 RESULTS_FILE = RESULTS_DIR / 'results.json'
 SUMMARY_TSV = RESULTS_DIR / 'summary.tsv'
 LOG_FILE = RESULTS_DIR / 'benchmark.log'
 
 COCO_VAL_DIR = PROJECT_DIR / 'datasets' / 'coco_val2017'
-COCO_VAL_CONTAINER = '/app/coco_val2017'
+COCO_VAL_CONTAINER = '/app/datasets/coco_val2017'
 
 DOTA_VAL_DIR = PROJECT_DIR / 'datasets' / 'dotav1'
-DOTA_VAL_CONTAINER = '/app/dotav1'
+DOTA_VAL_CONTAINER = '/app/datasets/dotav1'
 
 CITYSCAPES_VAL_DIR = PROJECT_DIR / 'datasets' / 'cityscapes'
-CITYSCAPES_VAL_CONTAINER = '/app/cityscapes'
+CITYSCAPES_VAL_CONTAINER = '/app/datasets/cityscapes'
 
 IMAGENET_VAL_DIR = PROJECT_DIR / 'datasets' / 'imagenet'
-IMAGENET_VAL_CONTAINER = '/app/imagenet'
+IMAGENET_VAL_CONTAINER = '/app/datasets/imagenet'
 
 WARMUP_S = int(os.environ.get('BENCH_WARMUP', '10'))
 MEASURE_S = int(os.environ.get('BENCH_MEASURE', '20'))
 CONVERT_TIMEOUT = int(os.environ.get('BENCH_CONVERT_TIMEOUT', '7200'))
-QUANTIZE = os.environ.get('BENCH_QUANTIZE', 'none')
+QUANTIZE = os.environ.get('BENCH_QUANTIZE', 'all')
 PERCEPT_CONTAINER = 'percept'
+
+SETUP_SCRIPT = PROJECT_DIR / 'setup_datasets.py'
+DATASET_FLAG = {
+    'coco_val2017': '--coco',
+    'dotav1': '--dota',
+    'cityscapes': '--cityscapes',
+    'imagenet': '--imagenet',
+}
+
+
+def ensure_dataset(model) -> None:
+    """Убедиться что датасет для модели доступен (скачать если нужно)."""
+    flag = DATASET_FLAG.get(model.dataset)
+    if not flag:
+        return
+    log(f'[DATASET] Проверяю {model.dataset}...')
+    subprocess.run(
+        [sys.executable, str(SETUP_SCRIPT), flag],
+        cwd=str(PROJECT_DIR),
+        timeout=7200,
+    )
 
 
 def log(msg: str) -> None:
     ts = datetime.now().strftime('%H:%M:%S')
     line = f'[{ts}] {msg}'
     print(line, flush=True)
+    LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
     with open(LOG_FILE, 'a') as f:
         f.write(line + '\n')
 
@@ -149,18 +169,15 @@ def run_converter(model_name: str, task: str, output_dir: Path, data_dir: Path) 
     output_dir.mkdir(parents=True, exist_ok=True)
     data_path = _container_data_path(data_dir)
     cmd = [
-        'docker', 'compose', '-f', str(CONVERTER_COMPOSE), 'run', '--rm',
+        'docker', 'compose', '-f', str(CONVERT_COMPOSE), 'run', '--rm',
         '-v', f'{BENCHMARK_DIR}:/app/benchmark',
-        '-v', f'{COCO_VAL_DIR}:{COCO_VAL_CONTAINER}:ro',
-        '-v', f'{DOTA_VAL_DIR}:{DOTA_VAL_CONTAINER}:ro',
-        '-v', f'{CITYSCAPES_VAL_DIR}:{CITYSCAPES_VAL_CONTAINER}:ro',
-        '-v', f'{IMAGENET_VAL_DIR}:{IMAGENET_VAL_CONTAINER}:ro',
+        '-v', f'{PROJECT_DIR / "datasets"}:/app/datasets',
         '-e', f'CONVERT_QUANTIZE={QUANTIZE}',
         '-e', 'KEEP_MODELS=1',
         '--entrypoint', 'python',
-        'converter',
+        'convert',
         '/app/benchmark/convert_bench.py',
-        model_name, task, f'/app/benchmark/temp_models/{model_name}',
+        model_name, task, f'/app/cache/{model_name}',
         data_path,
     ]
     log(f'ЗАПУСК: {" ".join(cmd[:-6])} ...')
@@ -175,10 +192,10 @@ def run_converter(model_name: str, task: str, output_dir: Path, data_dir: Path) 
 
     if result.stdout:
         for line in result.stdout.strip().split('\n'):
-            log(f'[converter stdout] {line}')
+            log(f'[convert stdout] {line}')
     if result.stderr:
         for line in result.stderr.strip().split('\n'):
-            log(f'[converter stderr] {line}')
+            log(f'[convert stderr] {line}')
 
     if result.returncode != 0:
         log(f'[ОШИБКА] конвертер завершился с кодом {result.returncode}')
@@ -201,16 +218,13 @@ def run_converter(model_name: str, task: str, output_dir: Path, data_dir: Path) 
 def run_validate(model_name: str, task: str, temp_dir: Path, data_dir: Path, input_size: int = 640) -> dict | None:
     data_path = _container_data_path(data_dir)
     cmd = [
-        'docker', 'compose', '-f', str(CONVERTER_COMPOSE), 'run', '--rm',
+        'docker', 'compose', '-f', str(CONVERT_COMPOSE), 'run', '--rm',
         '-v', f'{BENCHMARK_DIR}:/app/benchmark',
-        '-v', f'{COCO_VAL_DIR}:{COCO_VAL_CONTAINER}:ro',
-        '-v', f'{DOTA_VAL_DIR}:{DOTA_VAL_CONTAINER}:ro',
-        '-v', f'{CITYSCAPES_VAL_DIR}:{CITYSCAPES_VAL_CONTAINER}:ro',
-        '-v', f'{IMAGENET_VAL_DIR}:{IMAGENET_VAL_CONTAINER}:ro',
+        '-v', f'{PROJECT_DIR / "datasets"}:/app/datasets',
         '--entrypoint', 'python',
-        'converter',
+        'convert',
         '/app/benchmark/validate_bench.py',
-        model_name, task, f'/app/benchmark/temp_models/{model_name}',
+        model_name, task, f'/app/cache/{model_name}',
         data_path, str(input_size),
     ]
     log(f'ЗАПУСК: {" ".join(cmd[:-6])} ...')
@@ -248,16 +262,14 @@ def run_validate(model_name: str, task: str, temp_dir: Path, data_dir: Path, inp
 # Фаза: bench
 # ---------------------------------------------------------------------------
 
-def run_fps(model_name: str, task: str, temp_dir: Path, data_dir: Path,
+def run_fps(model_name: str, task: str, cache_dir: Path, data_dir: Path,
             quantize: str = 'both') -> dict | None:
     data_path = _container_data_path(data_dir)
     cmd = [
         'docker', 'compose', '-f', str(WEB_COMPOSE), 'run', '--rm',
         '-v', f'{BENCHMARK_DIR}:/app/benchmark',
-        '-v', f'{COCO_VAL_DIR}:{COCO_VAL_CONTAINER}:ro',
-        '-v', f'{DOTA_VAL_DIR}:{DOTA_VAL_CONTAINER}:ro',
-        '-v', f'{CITYSCAPES_VAL_DIR}:{CITYSCAPES_VAL_CONTAINER}:ro',
-        '-v', f'{IMAGENET_VAL_DIR}:{IMAGENET_VAL_CONTAINER}:ro',
+        '-v', f'{CACHE_DIR}:/app/cache',
+        '-v', f'{PROJECT_DIR / "datasets"}:/app/datasets',
         '-e', 'TEST_MODE=1',
         '-e', 'WEB_MODE=0',
         '-e', 'CAM_MODE=file',
@@ -266,7 +278,7 @@ def run_fps(model_name: str, task: str, temp_dir: Path, data_dir: Path,
         '-e', f'BENCH_MEASURE={MEASURE_S}',
         'percept', 'python3', '/app/benchmark/fps_bench.py',
         model_name, task,
-        '--temp-dir', f'/app/benchmark/temp_models/{model_name}',
+        '--temp-dir', f'/app/cache/{model_name}',
         '--data-dir', data_path,
         '--warmup', str(WARMUP_S),
         '--measure', str(MEASURE_S),
@@ -304,20 +316,19 @@ def run_fps(model_name: str, task: str, temp_dir: Path, data_dir: Path,
 # Фаза: eval (accuracy)
 # ---------------------------------------------------------------------------
 
-def run_eval(model_name: str, task: str, model_dir: Path, data_dir: Path) -> dict | None:
+def run_eval(model_name: str, task: str, model_file: Path, data_dir: Path) -> dict | None:
     """Запустить yolo val для оценки accuracy модели."""
     data_path = _container_data_path(data_dir)
+    # Конвертировать хост-путь модели в контейнерный (cache/ → /app/cache/)
+    container_model = str(model_file).replace(str(PROJECT_DIR / 'cache'), '/app/cache')
     cmd = [
-        'docker', 'compose', '-f', str(CONVERTER_COMPOSE), 'run', '--rm',
+        'docker', 'compose', '-f', str(CONVERT_COMPOSE), 'run', '--rm',
         '-v', f'{BENCHMARK_DIR}:/app/benchmark',
-        '-v', f'{COCO_VAL_DIR}:{COCO_VAL_CONTAINER}:ro',
-        '-v', f'{DOTA_VAL_DIR}:{DOTA_VAL_CONTAINER}:ro',
-        '-v', f'{CITYSCAPES_VAL_DIR}:{CITYSCAPES_VAL_CONTAINER}:ro',
-        '-v', f'{IMAGENET_VAL_DIR}:{IMAGENET_VAL_CONTAINER}:ro',
+        '-v', f'{PROJECT_DIR / "datasets"}:/app/datasets',
         '--entrypoint', 'python',
-        'converter',
+        'convert',
         '/app/benchmark/eval_bench.py',
-        model_name, task, str(model_dir), data_path,
+        model_name, task, container_model, data_path,
     ]
     log(f'ЗАПУСК eval: {" ".join(cmd[-4:])} ...')
     t0 = time.time()
@@ -353,18 +364,6 @@ def run_eval(model_name: str, task: str, model_dir: Path, data_dir: Path) -> dic
 # ---------------------------------------------------------------------------
 # Утилиты
 # ---------------------------------------------------------------------------
-
-def cleanup_temp(model_name: str) -> None:
-    """Удалить temp_models/<model_name>/ на хосте."""
-    model_dir = TEMP_DIR / model_name
-    if not model_dir.exists():
-        return
-    shutil.rmtree(model_dir, ignore_errors=True)
-    if not model_dir.exists():
-        log(f'[ОЧИСТКА] удалено temp_models/{model_name}')
-    else:
-        log(f'[ОЧИСТКА] не удалось удалить temp_models/{model_name}')
-
 
 def model_is_complete(result: dict) -> bool:
     """Проверить, завершены ли все фазы для модели (convert + validate + bench + eval)."""
@@ -407,20 +406,58 @@ def upsert_result(results: list[dict], entry: dict) -> None:
     results.append(entry)
 
 
+def _per_core_cols(fps_data: dict) -> list:
+    """Извлечь per-core колонки: NPU + CPU для одного варианта."""
+    npu_pc = fps_data.get('npu_load_per_core', {})
+    cpu_pc = fps_data.get('cpu_load_per_core', {})
+    cols = []
+    for i in sorted(int(k) for k in npu_pc.keys()):
+        cols.append(npu_pc.get(str(i), ''))
+    for i in sorted(int(k) for k in cpu_pc.keys()):
+        cols.append(cpu_pc.get(str(i), ''))
+    return cols
+
+
 def write_tsv(results: list[dict]) -> None:
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     with open(SUMMARY_TSV, 'w', newline='') as f:
         writer = csv.writer(f, delimiter='\t')
-        writer.writerow([
+
+        # Определяем количество ядер из первого замера
+        n_npu_cores = 0
+        n_cpu_cores = 0
+        for r in results:
+            for key in ('npu_none', 'npu_int8', 'npu_int8-calib'):
+                d = (r.get('fps', {}) or {}).get(key, {}) or {}
+                n_npu_cores = max(n_npu_cores, len(d.get('npu_load_per_core', {})))
+                n_cpu_cores = max(n_cpu_cores, len(d.get('cpu_load_per_core', {})))
+            if n_npu_cores and n_cpu_cores:
+                break
+        if not n_npu_cores:
+            n_npu_cores = 3
+        if not n_cpu_cores:
+            n_cpu_cores = 8
+
+        # Заголовок
+        header = [
             'Модель', 'Задача', 'Разрешение',
             'CPU_fps', 'CPU_fps_std',
-            'NPU_FP32_fps', 'NPU_FP32_fps_std', 'NPU_FP32_load', 'CPU_load_fp32',
-            'NPU_INT8_fps', 'NPU_INT8_fps_std', 'NPU_INT8_load', 'CPU_load_int8',
-            'NPU_INT8cal_fps', 'NPU_INT8cal_fps_std', 'NPU_INT8cal_load', 'CPU_load_int8cal',
+        ]
+        for variant in ('FP16', 'INT8', 'INT8cal'):
+            header += [
+                f'NPU_{variant}_fps', f'NPU_{variant}_fps_std',
+                f'NPU_{variant}_load', f'CPU_load_{variant.lower()}',
+            ]
+            header += [f'NPU_{variant}_core{i}' for i in range(n_npu_cores)]
+            header += [f'CPU_{variant}_core{i}' for i in range(n_cpu_cores)]
+        header += [
             'top1', 'top5', 'map50', 'map50_95',
             'max_diff_avg', 'max_diff_max',
             'Статус',
-        ])
+        ]
+        writer.writerow(header)
+
+        # Строки
         for r in results:
             model = r.get('model', '?')
             task = r.get('task', '?')
@@ -444,19 +481,22 @@ def write_tsv(results: list[dict]) -> None:
             map50 = ev.get('map50', '')
             map50_95 = ev.get('map50_95', '')
 
-            writer.writerow([
+            row = [
                 model, task, input_size,
                 cpu.get('fps', -1), cpu.get('fps_std', 0),
-                npu_fp32.get('fps', -1), npu_fp32.get('fps_std', 0),
-                npu_fp32.get('npu_load_avg', ''), npu_fp32.get('cpu_load_avg', ''),
-                npu_int8.get('fps', -1), npu_int8.get('fps_std', 0),
-                npu_int8.get('npu_load_avg', ''), npu_int8.get('cpu_load_avg', ''),
-                npu_int8cal.get('fps', -1), npu_int8cal.get('fps_std', 0),
-                npu_int8cal.get('npu_load_avg', ''), npu_int8cal.get('cpu_load_avg', ''),
+            ]
+            for variant_data in (npu_fp32, npu_int8, npu_int8cal):
+                row += [
+                    variant_data.get('fps', -1), variant_data.get('fps_std', 0),
+                    variant_data.get('npu_load_avg', ''), variant_data.get('cpu_load_avg', ''),
+                ]
+                row += _per_core_cols(variant_data)
+            row += [
                 top1, top5, map50, map50_95,
                 max_diff, max_diff_max,
                 r.get('status', '?'),
-            ])
+            ]
+            writer.writerow(row)
     log(f'[ГОТОВО] TSV-сводка записана в {SUMMARY_TSV}')
 
 
@@ -481,15 +521,15 @@ def main() -> None:
                         help="Запуск для одной модели (напр. yolo26x-seg)")
     parser.add_argument("--pilot", action="store_true",
                         help="Только PILOT-модели (минимальные размеры)")
-    parser.add_argument("--clean", action="store_true",
-                        help="Удалить temp_models после завершения")
     cli_args, _ = parser.parse_known_args()
 
     global QUANTIZE
     QUANTIZE = cli_args.quantize
 
+    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+
     phases = cli_args.phase
-    log(f'Фазы: {phases}, квантизация: {QUANTIZE}, clean: {cli_args.clean}')
+    log(f'Фазы: {phases}, квантизация: {QUANTIZE}')
 
     # Фильтрация моделей
     models = MODELS
@@ -500,8 +540,6 @@ def main() -> None:
         if not models:
             log(f'[ОШИБКА] модель {cli_args.model!r} не найдена в models.py')
             sys.exit(1)
-
-    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     log(f'Бенчмарк начат: {datetime.now().isoformat()}')
     log(f'Mоделей={len(models)}, Warmup={WARMUP_S}с, Measure={MEASURE_S}с')
 
@@ -526,24 +564,37 @@ def main() -> None:
             else:
                 model_data_dir = DATA_DIR / model.dataset
 
-            model_temp_dir = TEMP_DIR / model.name
+            model_cache_dir = CACHE_DIR / model.name
+
+            # Убедиться что датасет готов (скачивание если нужно)
+            ensure_dataset(model)
 
             # Полный skip если все фазы уже завершены
             existing_entry = next((r for r in existing if r['model'] == model.name), None)
             if existing_entry and model_is_complete(existing_entry):
                 log(f'[ПРОПУСК] все фазы завершены')
-                cleanup_temp(model.name)
                 continue
 
             # --- Фаза: convert ---
             if phase_is(phases, 'convert'):
-                # Resume: пропускаем если уже сконвертировано (есть _none.rknn)
-                if (model_temp_dir / f'{model.name}_none.rknn').exists():
+                # Resume: пропускаем если уже сконвертировано (есть _fp16.rknn)
+                if (model_cache_dir / f'{model.name}_fp16.rknn').exists():
                     log(f'[ПРОПУСК] convert: уже сконвертировано')
+                    if model.name not in {r['model'] for r in existing}:
+                        existing.append({
+                            'model': model.name,
+                            'task': model.task,
+                            'conversion_status': 'OK',
+                            'input_size': model.input_size,
+                            'validation': {},
+                            'fps': {},
+                            'status': 'ОЖИДАНИЕ',
+                        })
+                        save_results(existing)
                 elif model.name in {r['model'] for r in existing if r.get('conversion_status') == 'OK'}:
                     log(f'[ПРОПУСК] convert: уже сконвертировано (results.json)')
                 else:
-                    conv_result = run_converter(model.name, model.task, model_temp_dir, model_data_dir)
+                    conv_result = run_converter(model.name, model.task, model_cache_dir, model_data_dir)
                     if conv_result is None or conv_result.get('status') != 'OK':
                         log(f'[ПРОВАЛ] конвертация не удалась для {model.name}')
                         result_entry = {
@@ -585,20 +636,44 @@ def main() -> None:
                                   if r.get('validation', {}).get('fp32', {}).get('max_diff_avg', -1) >= 0
                                   or r.get('validation', {}).get('int8', {}).get('max_diff_avg', -1) >= 0}:
                     log(f'[ПРОПУСК] validate: уже валидировано')
-                elif not (model_temp_dir / f'{model.name}_none.rknn').exists():
+                elif not (model_cache_dir / f'{model.name}_fp16.rknn').exists():
                     log(f'[ПРОПУСК] validate: нет сконвертированных моделей')
                 else:
-                    val_result = run_validate(model.name, model.task, model_temp_dir, model_data_dir,
+                    val_result = run_validate(model.name, model.task, model_cache_dir, model_data_dir,
                                              input_size=model.input_size)
                     if val_result is None:
                         log(f'[ПРОВАЛ] валидация не удалась для {model.name}')
+                        if model.name not in {r['model'] for r in existing}:
+                            existing.append({
+                                'model': model.name,
+                                'task': model.task,
+                                'conversion_status': 'OK',
+                                'input_size': model.input_size,
+                                'validation': {},
+                                'fps': {},
+                                'status': 'ПРОВАЛ',
+                            })
                     else:
                         validations = val_result.get('validations', {})
-                        # Обновляем results.json
+                        found = False
                         for j, r in enumerate(existing):
                             if r['model'] == model.name:
                                 existing[j]['validation'] = validations
-                                # Определяем статус по max_diff
+                                found = True
+                                break
+                        if not found:
+                            existing.append({
+                                'model': model.name,
+                                'task': model.task,
+                                'conversion_status': 'OK',
+                                'input_size': model.input_size,
+                                'validation': validations,
+                                'fps': {},
+                                'status': 'ОЖИДАНИЕ',
+                            })
+                        # Определяем статус по max_diff
+                        for j, r in enumerate(existing):
+                            if r['model'] == model.name:
                                 max_diffs = []
                                 for vk, vv in validations.items():
                                     md = vv.get('max_diff_avg', -1)
@@ -608,10 +683,24 @@ def main() -> None:
                                     worst = max(max_diffs)
                                     existing[j]['status'] = 'ПРОЙДЕНО' if worst < 0.5 else 'ПРОВАЛ'
                                 break
-                        save_results(existing)
+                    save_results(existing)
 
             # --- Фаза: bench ---
             if phase_is(phases, 'bench'):
+                # Создать запись если модели нет в results.json
+                if model.name not in {r['model'] for r in existing}:
+                    existing.append({
+                        'model': model.name,
+                        'task': model.task,
+                        'input_size': model.input_size,
+                        'conversion_status': 'N/A',
+                        'validation': {},
+                        'fps': {},
+                        'eval': {},
+                        'status': 'ОЖИДАНИЕ',
+                    })
+                    save_results(existing)
+
                 bench_done = False
                 for r in existing:
                     if r['model'] == model.name:
@@ -623,9 +712,9 @@ def main() -> None:
                         break
 
                 if not bench_done:
-                    if not (model_temp_dir / f'{model.name}.onnx').exists() and \
-                       not (model_temp_dir / f'{model.name}_none.rknn').exists():
-                        log(f'[ПРОВАЛ] bench: нет моделей в temp_models/ и нет результатов')
+                    if not (model_cache_dir / f'{model.name}.onnx').exists() and \
+                       not (model_cache_dir / f'{model.name}_fp16.rknn').exists():
+                        log(f'[ПРОВАЛ] bench: нет моделей в cache/ и нет результатов')
                         for j, r in enumerate(existing):
                             if r['model'] == model.name:
                                 existing[j]['fps'] = {}
@@ -633,7 +722,7 @@ def main() -> None:
                                 break
                         save_results(existing)
                     else:
-                        fps_result = run_fps(model.name, model.task, model_temp_dir, model_data_dir,
+                        fps_result = run_fps(model.name, model.task, model_cache_dir, model_data_dir,
                                              quantize=QUANTIZE)
                         if fps_result is None:
                             log(f'[ПРОВАЛ] FPS-тест не удалась для {model.name}')
@@ -675,6 +764,20 @@ def main() -> None:
 
             # --- Фаза: eval (accuracy) ---
             if phase_is(phases, 'eval'):
+                # Создать запись если модели нет в results.json
+                if model.name not in {r['model'] for r in existing}:
+                    existing.append({
+                        'model': model.name,
+                        'task': model.task,
+                        'input_size': model.input_size,
+                        'conversion_status': 'N/A',
+                        'validation': {},
+                        'fps': {},
+                        'eval': {},
+                        'status': 'ОЖИДАНИЕ',
+                    })
+                    save_results(existing)
+
                 eval_done = False
                 for r in existing:
                     if r['model'] == model.name:
@@ -685,17 +788,17 @@ def main() -> None:
                         break
 
                 if not eval_done:
-                    # Найти лучшую модель для eval: .rknn > .onnx > .pt
+                    # Найти лучшую модель для eval: .pt (PyTorch) > .onnx (если .pt нет)
                     eval_model = None
-                    for suffix in ['_none.rknn', '_int8.rknn', '_int8-calib.rknn', '.onnx']:
-                        candidate = model_temp_dir / f'{model.name}{suffix}'
+                    for suffix in ['.pt', '.onnx']:
+                        candidate = model_cache_dir / f'{model.name}{suffix}'
                         if candidate.exists():
                             eval_model = candidate
                             break
                     if eval_model is None:
                         log(f'[ПРОПУСК] eval: нет модели для {model.name}')
                     else:
-                        eval_result = run_eval(model.name, model.task, eval_model.parent, model_data_dir)
+                        eval_result = run_eval(model.name, model.task, eval_model, model_data_dir)
                         if eval_result is None:
                             log(f'[ОШИБКА] eval не удался для {model.name}')
                             eval_result = {}
@@ -705,12 +808,6 @@ def main() -> None:
                                 break
                         save_results(existing)
                         log(f'[ГОТОВО] eval {model.name}: {json.dumps(eval_result)}')
-
-            # --- Авто-очистка после завершения всех фаз ---
-            if phase_is(phases, 'all') or (phase_is(phases, 'convert') and phase_is(phases, 'validate') and phase_is(phases, 'bench')):
-                cleanup_temp(model.name)
-            elif cli_args.clean:
-                cleanup_temp(model.name)
 
     except (KeyboardInterrupt, Exception) as e:
         if isinstance(e, KeyboardInterrupt):

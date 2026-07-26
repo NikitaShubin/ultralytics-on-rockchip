@@ -128,16 +128,16 @@ if [[ -n "$STRESS_MODEL" ]]; then
 elif [[ -f "$SCRIPT_DIR/model/stress_model.rknn" ]]; then
     STRESS_MODEL_PATH="$SCRIPT_DIR/model/stress_model.rknn"
 else
-    # Автогенерация: ONNX через synth_stress.py → RKNN через converter
+    # Автогенерация: ONNX через synth_stress.py → RKNN через convert
     echo "[NPU] Стресс-модель не найдена, генерирую..."
     ONNX_PATH="$SCRIPT_DIR/model/synth_stress.onnx"
     RKNN_PATH="$SCRIPT_DIR/model/stress_model.rknn"
     if [[ ! -f "$ONNX_PATH" ]]; then
-        python3 "$SCRIPT_DIR/converter/synth_stress.py" -o "$ONNX_PATH" 2>&1 || {
+        python3 "$SCRIPT_DIR/convert/synth_stress.py" -o "$ONNX_PATH" 2>&1 || {
             echo "[ОШИБКА] synth_stress.py не удался"; exit 1
         }
     fi
-    # Конвертация ONNX → RKNN через converter контейнер
+    # Конвертация ONNX → RKNN через convert контейнер
     if [[ ! -f "$RKNN_PATH" ]]; then
         _py_code=$(mktemp /tmp/rknn_build_XXXXXX.py)
         cat > "$_py_code" <<'INNEREOF'
@@ -153,9 +153,9 @@ rknn.export_rknn(rknn_path)
 rknn.release()
 print('OK')
 INNEREOF
-        docker compose -f "$SCRIPT_DIR/converter/docker-compose.yml" run --rm \
+        docker compose -f "$SCRIPT_DIR/convert/docker-compose.yml" run --rm \
             -e "ONNX_PATH=$ONNX_PATH" -e "RKNN_PATH=$RKNN_PATH" \
-            --entrypoint python converter "$_py_code" 2>&1 \
+            --entrypoint python convert "$_py_code" 2>&1 \
             || { echo "[ОШИБКА] RKNN конвертация не удалась"; rm -f "$_py_code"; exit 1; }
         rm -f "$_py_code"
     fi

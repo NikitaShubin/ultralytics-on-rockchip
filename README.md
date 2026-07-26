@@ -231,11 +231,11 @@ curl "http://localhost:5000/reload?model=yolo11n-pose&rknn_suffix=_int8"
 
 ## Конвертация новой модели
 
-Скопировать `.pt` в `converter/weights/` и запустить:
+Скопировать `.pt` в `convert/weights/` и запустить:
 
 ```bash
-cd converter
-docker compose run --rm converter convert my-model.pt
+cd convert
+docker compose run --rm convert my-model.pt
 ```
 
 Конвертер (мультиарх образ `python:3.11-slim`, работает на x86 и ARM):
@@ -324,8 +324,8 @@ python benchmark.py --phase convert validate --clean
 ### COCO mAP валидация
 
 ```bash
-cd converter
-docker compose run --rm converter python eval_coco.py
+cd convert
+docker compose run --rm convert python eval_coco.py
 ```
 
 Валидация на 5000 изображений COCO val2017 для задач det/seg/pose.
@@ -428,9 +428,6 @@ camera_source.py             # Абстракция камеры (USB/GigE/RTSP/
 video_loop.py                # Async capture → detect → notify loop
 websocket_server.py          # WebSocket push для live viewer
 detector_frame.py            # DetectorFrame dataclass
-utils.py                     # Обратная совместимость (переэкспорт из percept/)
-camtest.py                   # Утилита тестирования камеры
-validate_npu.py              # Утилита валидации NPU
 docker-compose.yml           # Сервис webcam
 Dockerfile                   # Образ (rknn-toolkit-lite2 + OpenCV + pypylon)
 model/                       # Активная модель (.rknn/.onnx + _postprocess.py + model_name.txt + quantize.txt)
@@ -456,17 +453,17 @@ benchmark/
 ├── fps_bench.py             # Фаза 3: FPS + per-core CPU/NPU нагрузка
 ├── eval_bench.py            # Фаза 4: accuracy (yolo val)
 ├── models.py                # Списки моделей (FULL: 111, PILOT: 21)
-├── run.sh                   # Обёртка для benchmark.py
-├── temp_models/             # Временные файлы конвертации (создаётся при запуске)
+├── bench.sh                 # Обёртка для benchmark.py
 └── results/                 # Результаты (results.json, summary.tsv, benchmark.log)
-converter/
-├── converter.py             # Конвертер YOLO → ONNX → RKNN (все 4 квантизации)
+convert/
+├── convert.py               # Конвертер YOLO → ONNX → RKNN (с кешем)
 ├── templates/               # Шаблоны постпроцесса (7 задач: det/seg/cls/pose/obb/sem/detr)
 ├── patches/                 # RKNN-патчи
 ├── weights/                 # Исходные .pt
 ├── docker-compose.yml       # Docker compose конвертера
 ├── Dockerfile               # Образ конвертера (python:3.11-slim, x86/ARM)
 └── model/                   # Скомпилированные модели
+cache/                       # Кеш конвертера (модели в различных форматах)
 datasets/                    # Датасеты (скачиваются on-demand)
 ├── coco_val2017/            # COCO val2017 — detect, seg, pose (~19 GB)
 ├── dotav1/                  # DOTAv1 — obb (~1.9 GB)
@@ -554,25 +551,33 @@ watch -n1 'cat /sys/class/devfreq/fdab0000.npu/load'
 
 ---
 
+## Источники
+
+Патч Detect.head (выход 9 тензоров `[box, cls, score_sum] × 3 strides`, DFL/decode/NMS на CPU) взят из форков airockchip:
+
+- **airockchip/ultralytics_yolov8** — форк ultralytics с RKNN-экспортом для всего семейства YOLO (v5/v8/v9/v10/v11/v12). Основной источник патча Detect.head и конфигурации конвертера (mean=[0,0,0], std=[255,255,255]). См. [RKOPT_README.md](https://github.com/airockchip/ultralytics_yolov8/blob/main/RKOPT_README.md)
+- **airockchip/rknn_model_zoo** — референсные постпроцессы (Python + C++) и eval-пайплайн для RKNN-моделей (pycocotools mAP). Источник `score_sum` ранней фильтрации и архитектуры C++ постобработки
+- **airockchip/rknn-toolkit2** — конвертер ONNX→RKNN и RKNNLite runtime. Уже используется в проекте для установки `librknnrt.so` и `rknn_server` (см. раздел «Предустановка»)
+
 ## Что сделано (июль 2026)
 
 ### Полная русификация проекта
 Все пользовательские сообщения, логи, docstrings, RuntimeError переведены на русский:
-- `converter/converter.py` — конвертер, INT8 калибровка, dataset.txt логирование
+- `convert/convert.py` — конвертер, INT8 калибровка, dataset.txt логирование
 - `percept/inference/__init__.py` — пайплайн NPU/CPU
 - `pipeline.py`, `main.py`, `video_loop.py`, `camera_source.py`
 - `websocket_server.py`, `detector_frame.py`
-- `converter/patches/rknn_patch.py` — патч RKNN toolkit2
+- `convert/patches/rknn_patch.py` — патч Detect.head для RKNN (по [airockchip/ultralytics_yolov8](https://github.com/airockchip/ultralytics_yolov8))
 - `benchmark/convert_bench.py`, `benchmark/fps_bench.py`
 
 **Не переводили:** HTTP ответы в `app.py`, `argparse` help, логи библиотек (ultralytics, RKNN toolkit, waitress).
 
 ### Docker
-- Образ конвертера: `percept-converter:latest` (был `webcam-converter`)
+- Образ конвертера: `percept-converter:latest`
 - Конвертер: мультиарх `python:3.11-slim` (работает на x86 и ARM)
 - Образ прод: `webcam-percept` (имя в docker-compose.yml оставлено для совместимости)
 - `docker-compose.yml`: сервис `percept`, переменные `MODEL`, `WEB_MODE`
-- `converter/docker-compose.yml`: `image: percept-converter:latest`
+- `convert/docker-compose.yml`: `image: percept-converter:latest`, сервис `convert`
 - `config.py` читает `model/model_name.txt` если `MODEL` не задан
 
 ### Калибровка INT8
@@ -581,7 +586,7 @@ watch -n1 'cat /sys/class/devfreq/fdab0000.npu/load'
 - Исправлен баг: для segment/semantic теперь добавляются `nc` и `names` (раньше было `key missing ❌`)
 - Ультралитикс `get_int8_calibration_dataloader()` читает **все** изображения из `data[split]`, без лимита, `fraction=1.0`, `batch=16`
 - Прогресс-бар RKNN toolkit2 (`270/270`) — это внутренние шаги квантования, **не** количество изображений
-- Добавлено логирование `dataset.txt` в `converter.py` (`_log_dataset_txt()`): ищет в `/tmp/dataset.txt`, `dataset.txt`, `calib_dataset.txt`, `*.txt` в рабочей директории — для проверки списка файлов, используемых при калибровке
+- Добавлено логирование `dataset.txt` в `convert.py` (`_log_dataset_txt()`): ищет в `/tmp/dataset.txt`, `dataset.txt`, `calib_dataset.txt`, `*.txt` в рабочей директории — для проверки списка файлов, используемых при калибровке
 
 ### Бенчмарк
 - Переписан `benchmark/benchmark.py` с флагом `--model` для запуска одной модели
@@ -589,7 +594,7 @@ watch -n1 'cat /sys/class/devfreq/fdab0000.npu/load'
 - Лог-файл в режиме `'a'` (сохраняется история)
 - Статусы: ПРОЙДЕНО / ПРОВАЛ
 - Сервис в docker-compose: `percept` (не `webcam`)
-- `benchmark/run.sh` передаёт `"$@"` в benchmark.py, останавливает percept перед запуском
+- `benchmark/bench.sh` передаёт `"$@"` в benchmark.py, останавливает percept перед запуском
 - TSV-суммаризация в `benchmark/results/summary.tsv`
 - 4 варианта квантизации: onnx/none/int8/int8-calib
 - Фаза eval: accuracy через yolo val (top1/top5 для cls, mAP для det/seg/pose/obb)
@@ -604,7 +609,7 @@ watch -n1 'cat /sys/class/devfreq/fdab0000.npu/load'
 > **Примечание**: max_diff > 1.0 из-за специфики RKNN постпроцессинга сегментации (mask proto). Детекция боксов корректна.
 
 ### INT8 yolo26x-seg — в процессе
-Квантовка 385 фаз (layers/tensors), ~3 мин/фаза → **~19 часов**. Контейнер `converter-converter-run-64ba7b2cfdab` работает в фоне.
+Квантовка 385 фаз (layers/tensors), ~3 мин/фаза → **~19 часов**. Контейнер `convert-convert-run-...` работает в фоне.
 
 ### deploy.sh
 Переписан в однокомандный деплой:

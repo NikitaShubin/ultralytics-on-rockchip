@@ -14,11 +14,11 @@ def letterbox(
     """Resize and pad image to new_size with aspect ratio preservation."""
     h, w = img.shape[:2]
     scale = new_size / max(h, w)
-    new_w, new_h = int(w * scale), int(h * scale)
+    new_w, new_h = round(w * scale), round(h * scale)
     pad_w = new_size - new_w
     pad_h = new_size - new_h
-    pad_left = pad_w // 2
-    pad_top = pad_h // 2
+    pad_left = round(pad_w / 2 - 0.1)
+    pad_top = round(pad_h / 2 - 0.1)
     resized = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
     canvas = cv2.copyMakeBorder(
         resized,

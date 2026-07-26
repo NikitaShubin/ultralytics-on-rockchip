@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Оценка accuracy модели (yolo val).
 
-Запускается внутри контейнера converter.
+Запускается внутри контейнера convert.
 Использование: python3 eval_bench.py <model_name> <task> <model_path> [data_dir]
 
 Для classify: top1, top5 accuracy.
@@ -11,147 +11,14 @@
 from __future__ import annotations
 
 import json
-import subprocess
+import os
 import sys
 import time
 from pathlib import Path
 
-sys.path.insert(0, '/app/converter')
-import converter  # noqa: E402
+os.environ.setdefault('YOLO_CONFIG_DIR', '/tmp/Ultralytics')
 
-
-def main() -> dict:
-    """Основная функция: eval модели."""
-    model_name = sys.argv[1]
-    task = sys.argv[2]
-    model_path = sys.argv[3]
-    data_dir = sys.argv[4] if len(sys.argv) > 4 else None
-
-    sys.stderr.write(json.dumps({'phase': 'eval_start', 'model': model_name, 'task': task}) + '\n')
-
-    t_start = time.time()
-
-    if task == 'classify':
-        result = _eval_cls(model_name, model_path, data_dir)
-    elif task in ('detect', 'segment', 'pose', 'obb', 'semantic'):
-        result = _eval_map(model_name, task, model_path, data_dir)
-    else:
-        result = {'error': f'задача {task!r} не поддерживается для eval'}
-
-    total_elapsed = time.time() - t_start
-    result['elapsed'] = round(total_elapsed, 1)
-    result['model'] = model_name
-    result['task'] = task
-
-    sys.stderr.write(json.dumps({'phase': 'eval_done', 'elapsed': round(total_elapsed, 1)}) + '\n')
-    print(json.dumps(result))
-    return result
-
-
-def _eval_cls(model_name: str, model_path: str, data_dir: str | None) -> dict:
-    """Оценка classification модели."""
-    if data_dir is None:
-        data_dir = '/app/imagenet'
-
-    cmd = f'yolo val task=classify model={model_path} data={data_dir}'
-    sys.stderr.write(f'[EVAL] {cmd}\n')
-
-    t0 = time.time()
-    proc = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=7200)
-    elapsed = time.time() - t0
-    sys.stderr.write(f'[EVAL] yolo val classify завершён за {elapsed:.0f}с\n')
-
-    result = {}
-    stdout = proc.stdout
-    stderr = proc.stderr
-    sys.stderr.write(f'[EVAL] stdout ({len(stdout)} байт)\n')
-    sys.stderr.write(f'[EVAL] stderr ({len(stderr)} байт)\n')
-
-    for line in stdout.splitlines():
-        line_s = line.strip()
-        if 'top1' in line_s.lower() or 'accuracy' in line_s.lower():
-            parts = line_s.split()
-            for i, p in enumerate(parts):
-                p_lower = p.lower()
-                if 'top1' in p_lower or p_lower == 'top-1':
-                    try:
-                        result['top1'] = float(parts[i + 1].rstrip('%'))
-                    except (ValueError, IndexError):
-                        pass
-                elif 'top5' in p_lower or p_lower == 'top-5':
-                    try:
-                        result['top5'] = float(parts[i + 1].rstrip('%'))
-                    except (ValueError, IndexError):
-                        pass
-        if '"top1_acc"' in line_s or '"top5_acc"' in line_s:
-            try:
-                data = json.loads(line_s)
-                if isinstance(data, dict):
-                    for k, v in data.items():
-                        if 'top1' in k.lower():
-                            result['top1'] = v
-                        if 'top5' in k.lower():
-                            result['top5'] = v
-            except (json.JSONDecodeError, TypeError):
-                pass
-
-    return result
-
-
-def _eval_map(model_name: str, task: str, model_path: str, data_dir: str | None) -> dict:
-    """Оценка detect/segment/pose/obb модели (mAP)."""
-    if task == 'semantic':
-        task_yolo = 'segment'
-    else:
-        task_yolo = task
-
-    if data_dir is None:
-        data_yaml = str(converter.COCO_VAL_YAML)
-    else:
-        data_yaml = _make_eval_yaml(task, data_dir)
-
-    cmd = f'yolo val task={task_yolo} model={model_path} data={data_yaml}'
-    sys.stderr.write(f'[EVAL] {cmd}\n')
-
-    t0 = time.time()
-    proc = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=7200)
-    elapsed = time.time() - t0
-    sys.stderr.write(f'[EVAL] yolo val завершён за {elapsed:.0f}с\n')
-
-    result = {}
-    stdout = proc.stdout
-    stderr = proc.stderr
-    sys.stderr.write(f'[EVAL] stdout ({len(stdout)} байт)\n')
-    sys.stderr.write(f'[EVAL] stderr ({len(stderr)} байт)\n')
-
-    for line in stdout.splitlines():
-        line_s = line.strip()
-        if line_s.startswith('all') and len(line_s.split()) >= 6:
-            parts = line_s.split()
-            try:
-                result['precision'] = float(parts[2]) if len(parts) > 2 else None
-                result['recall'] = float(parts[3]) if len(parts) > 3 else None
-                result['map50'] = float(parts[4]) if len(parts) > 4 else None
-                result['map50_95'] = float(parts[5]) if len(parts) > 5 else None
-            except (ValueError, IndexError):
-                pass
-        if '"map50"' in line_s or '"metrics/mAP50(B)"' in line_s:
-            try:
-                data = json.loads(line_s)
-                if isinstance(data, dict):
-                    for k, v in data.items():
-                        if 'map50' in k.lower():
-                            result['map50'] = v
-                        if 'map50' in k.lower() and '95' in k.lower():
-                            result['map50_95'] = v
-                        if k == 'precision' or 'precision' in k.lower():
-                            result['precision'] = v
-                        if k == 'recall' or 'recall' in k.lower():
-                            result['recall'] = v
-            except (json.JSONDecodeError, TypeError):
-                pass
-
-    return result
+from ultralytics import YOLO
 
 
 def _make_eval_yaml(task: str, data_dir: str) -> str:
@@ -159,7 +26,6 @@ def _make_eval_yaml(task: str, data_dir: str) -> str:
     data_path = Path(data_dir)
 
     if task == 'obb':
-        n = len(list((data_path / 'images' / 'val').glob('*.png'))) if (data_path / 'images' / 'val').exists() else 0
         lines = [
             f"path: {data_dir}",
             "train: images/val",
@@ -221,6 +87,150 @@ def _make_eval_yaml(task: str, data_dir: str) -> str:
     yaml_path = Path(f"/tmp/eval_{task}.yaml")
     yaml_path.write_text("\n".join(lines) + "\n")
     return str(yaml_path)
+
+
+def _ensure_yolo_labels(data_dir: str, task: str) -> None:
+    """Конвертировать COCO annotations → YOLO labels если labels/ не существует."""
+    data_path = Path(data_dir)
+
+    # data_dir может быть images/val2017 — подняться к корню датасета
+    if data_path.name in ('val2017', 'val', 'train') and data_path.parent.name == 'images':
+        root = data_path.parent.parent
+    else:
+        root = data_path
+
+    labels_dir = root / 'labels' / 'val2017'
+    ann_file = root / 'annotations' / 'instances_val2017.json'
+
+    if labels_dir.exists() and any(labels_dir.glob('*.txt')):
+        sys.stderr.write(f'[EVAL] Labels already exist: {labels_dir}\n')
+        sys.stderr.flush()
+        return
+
+    if not ann_file.exists():
+        sys.stderr.write(f'[EVAL] No COCO annotations found: {ann_file}\n')
+        sys.stderr.flush()
+        return
+
+    sys.stderr.write(f'[EVAL] Converting COCO annotations → YOLO labels...\n')
+    sys.stderr.flush()
+
+    import json as json_mod
+
+    with open(ann_file) as f:
+        coco = json_mod.load(f)
+
+    from ultralytics.data.converter import coco91_to_coco80_class
+    coco91to80 = coco91_to_coco80_class()
+    cat_map = {cat['id']: coco91to80[cat['id'] - 1] if 1 <= cat['id'] <= 90 else 0 for cat in coco['categories']}
+
+    # Image id → size
+    img_info = {}
+    for img in coco['images']:
+        img_info[img['id']] = (img['width'], img['height'])
+
+    # Collect annotations per image
+    ann_by_img = {}
+    for ann in coco['annotations']:
+        if 'bbox' not in ann:
+            continue
+        img_id = ann['image_id']
+        if img_id not in ann_by_img:
+            ann_by_img[img_id] = []
+        ann_by_img[img_id].append(ann)
+
+    labels_dir.mkdir(parents=True, exist_ok=True)
+    converted = 0
+    for img in coco['images']:
+        img_id = img['id']
+        w, h = img_info[img_id]
+        fname = Path(img['file_name']).stem + '.txt'
+        lines = []
+        for ann in ann_by_img.get(img_id, []):
+            cls_id = cat_map.get(ann['category_id'], 0)
+            bbox = ann['bbox']  # [x, y, w, h] absolute
+            x_center = (bbox[0] + bbox[2] / 2) / w
+            y_center = (bbox[1] + bbox[3] / 2) / h
+            bw = bbox[2] / w
+            bh = bbox[3] / h
+            lines.append(f'{cls_id} {x_center:.6f} {y_center:.6f} {bw:.6f} {bh:.6f}')
+        (labels_dir / fname).write_text('\n'.join(lines) + '\n')
+        converted += 1
+
+    sys.stderr.write(f'[EVAL] Converted {converted} labels → {labels_dir}\n')
+    sys.stderr.flush()
+
+
+def _resolve_data(data_dir: str, task: str) -> str:
+    """Определить data: если это YAML — вернуть, если директория — сгенерировать YAML."""
+    p = Path(data_dir)
+    if p.suffix in ('.yaml', '.yml') and p.exists():
+        return str(p)
+    # Если data_dir указывает на images subdir — подняться к корню датасета
+    if p.name in ('val2017', 'val', 'train') and p.parent.name == 'images':
+        root = str(p.parent.parent)
+    else:
+        root = data_dir
+    return _make_eval_yaml(task, root)
+
+
+def main() -> dict:
+    model_name = sys.argv[1]
+    task = sys.argv[2]
+    model_path = sys.argv[3]
+    data_dir = sys.argv[4] if len(sys.argv) > 4 else None
+
+    sys.stderr.write(json.dumps({'phase': 'eval_start', 'model': model_name, 'task': task, 'path': model_path, 'data': data_dir}) + '\n')
+    sys.stderr.flush()
+
+    t_start = time.time()
+
+    if task == 'classify':
+        data_path = data_dir or '/app/datasets/imagenet'
+    else:
+        if data_dir:
+            _ensure_yolo_labels(data_dir, task)
+        data_path = _resolve_data(data_dir, task) if data_dir else None
+
+    yolo_task = 'classify' if task == 'classify' else 'detect' if task == 'detect' else 'segment' if task in ('segment', 'semantic') else task
+
+    sys.stderr.write(f'[EVAL] Loading model: {model_path} (task={yolo_task})\n')
+    sys.stderr.flush()
+
+    model = YOLO(model_path)
+
+    val_kwargs = {'imgsz': 640, 'verbose': False}
+    if data_path:
+        val_kwargs['data'] = data_path
+
+    sys.stderr.write(f'[EVAL] Running yolo val with data={data_path}\n')
+    sys.stderr.flush()
+
+    results = model.val(task=yolo_task, **val_kwargs)
+
+    total_elapsed = time.time() - t_start
+    result = {}
+
+    if task == 'classify':
+        result['top1'] = float(results.top1) if hasattr(results, 'top1') and results.top1 is not None else None
+        result['top5'] = float(results.top5) if hasattr(results, 'top5') and results.top5 is not None else None
+    else:
+        result['map50'] = float(results.box.map50) if hasattr(results, 'box') and results.box.map50 is not None else None
+        result['map50_95'] = float(results.box.map) if hasattr(results, 'box') and results.box.map is not None else None
+        if hasattr(results, 'box') and results.box.mp is not None:
+            result['precision'] = float(results.box.mp)
+            result['recall'] = float(results.box.mr)
+
+    result['elapsed'] = round(total_elapsed, 1)
+    result['model'] = model_name
+    result['task'] = task
+
+    metrics_summary = {k: v for k, v in result.items() if k not in ("elapsed", "model", "task") and v is not None}
+    sys.stderr.write(f'[EVAL] Done in {total_elapsed:.0f}s: {json.dumps(metrics_summary)}\n')
+    sys.stderr.flush()
+
+    print(json.dumps(result))
+    return result
 
 
 if __name__ == '__main__':

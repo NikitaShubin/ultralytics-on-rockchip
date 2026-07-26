@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Валидация ONNX vs RKNN для одной модели.
 
-Запускается внутри контейнера converter.
+Запускается внутри контейнера convert.
 Использование: python3 validate_bench.py <model_name> <task> <model_dir> [test_data_dir]
 
 Сравнивает выходы ONNX vs RKNN FP32 и ONNX vs RKNN INT8 на тестовых изображениях.
@@ -17,8 +17,8 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-sys.path.insert(0, '/app/converter')
-import converter  # noqa: E402
+sys.path.insert(0, '/app/convert')
+import convert as converter  # noqa: E402
 
 
 def load_test_images(data_dir: str | Path, limit: int = 16) -> list[np.ndarray]:
@@ -113,13 +113,13 @@ def main() -> dict:
     model_name = sys.argv[1]
     task = sys.argv[2]
     model_dir = Path(sys.argv[3])
-    test_data_dir = sys.argv[4] if len(sys.argv) > 4 else '/app/coco_val2017/images/val2017'
+    test_data_dir = sys.argv[4] if len(sys.argv) > 4 else '/app/datasets/coco_val2017/images/val2017'
     input_size = int(sys.argv[5]) if len(sys.argv) > 5 else 640
 
     sys.stderr.write(json.dumps({'phase': 'start', 'model': model_name, 'task': task}) + '\n')
 
     onnx_path = model_dir / f'{model_name}.onnx'
-    rknn_none_path = model_dir / f'{model_name}_none.rknn'
+    rknn_fp16_path = model_dir / f'{model_name}_fp16.rknn'
     rknn_int8_path = model_dir / f'{model_name}_int8.rknn'
 
     if not onnx_path.exists():
@@ -142,10 +142,10 @@ def main() -> dict:
     t_start = time.time()
     results = {'model': model_name, 'task': task, 'validations': {}}
 
-    if rknn_none_path.exists():
-        sys.stderr.write(f'[ВАЛИДАЦИЯ] FP32: ONNX vs {rknn_none_path.name}...\n')
+    if rknn_fp16_path.exists():
+        sys.stderr.write(f'[ВАЛИДАЦИЯ] FP32: ONNX vs {rknn_fp16_path.name}...\n')
         t0 = time.time()
-        v_fp32 = run_validation(str(onnx_path), str(rknn_none_path), images, input_size=input_size)
+        v_fp32 = run_validation(str(onnx_path), str(rknn_fp16_path), images, input_size=input_size)
         elapsed = time.time() - t0
         v_fp32['elapsed'] = round(elapsed, 1)
         results['validations']['fp32'] = v_fp32
@@ -153,7 +153,7 @@ def main() -> dict:
                          f'max={v_fp32["max_diff_max"]:.4f} ({v_fp32["validation_mode"]}) '
                          f'за {elapsed:.0f}с\n')
     else:
-        sys.stderr.write(f'[ПРОПУСК] FP32: {rknn_none_path.name} не найден\n')
+        sys.stderr.write(f'[ПРОПУСК] FP32: {rknn_fp16_path.name} не найден\n')
 
     if rknn_int8_path.exists():
         sys.stderr.write(f'[ВАЛИДАЦИЯ] INT8: ONNX vs {rknn_int8_path.name}...\n')

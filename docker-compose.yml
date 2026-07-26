@@ -19,7 +19,6 @@ services:
       - ./main.py:/app/main.py
       - ./app.py:/app/app.py
       - ./pipeline.py:/app/pipeline.py
-      - ./utils.py:/app/utils.py
       - ./detector_frame.py:/app/detector_frame.py
       - ./config.py:/app/config.py
       - ./camera_source.py:/app/camera_source.py
@@ -27,10 +26,7 @@ services:
       - ./websocket_server.py:/app/websocket_server.py
       - ./templates:/app/templates:ro
       - ./benchmark:/app/benchmark:rw
-      - ./datasets/coco_val2017:/app/coco_val2017:ro
-      - ./datasets/dotav1:/app/dotav1:ro
-      - ./datasets/cityscapes:/app/cityscapes:ro
-      - ./datasets/imagenet:/app/imagenet:ro
+      - ./datasets:/app/datasets:ro
     environment:
       - BACKEND=${BACKEND:-npu}
       - MODEL=${MODEL:-}

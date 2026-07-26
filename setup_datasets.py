@@ -311,6 +311,51 @@ def setup_cityscapes_val() -> None:
     print(f'  Директория: {cs_dir}')
 
 
+def normalize_image_extensions(root: Path) -> int:
+    """Привести расширения изображений к нижнему регистру (.JPEG → .jpg).
+
+    rknn-toolkit2 поддерживает только .jpg .jpeg .png .bmp (нижний регистр).
+    Возвращает количество переименованных файлов.
+    """
+    renamed = 0
+    for p in root.rglob('*'):
+        if not p.is_file():
+            continue
+        ext = p.suffix
+        if ext and ext != ext.lower():
+            new_path = p.with_suffix(ext.lower())
+            # Если файл с таким именем уже есть — удаляем текущий (дубликат)
+            if new_path.exists() and new_path != p:
+                p.unlink()
+            else:
+                p.rename(new_path)
+            renamed += 1
+    return renamed
+
+
+def fix_imagenet10_extensions() -> None:
+    """Нормализовать расширения в imagenet10 (внутренний датасет ultralytics).
+
+    ultralytics скачивает imagenet10 с .JPEG файлами, но rknn-toolkit2
+    поддерживает только .jpg (нижний регистр). Вызывается перед сборкой.
+    """
+    # imagenet10 может быть в нескольких местах
+    search_dirs = [
+        DATASETS_DIR / 'imagenet10',
+        Path(__file__).parent / 'convert' / 'datasets' / 'imagenet10',
+    ]
+    for d in search_dirs:
+        if not d.exists():
+            continue
+        n = normalize_image_extensions(d)
+        if n:
+            print(f'  Нормализовано {n} расширений в {d}')
+        # Удаляем дубликаты с " copy" в имени (артефакты скачивания)
+        for f in list(d.rglob('* copy*')):
+            if f.is_file():
+                f.unlink()
+
+
 def setup_imagenet_val() -> None:
     """Загрузка ImageNet val split (50000 изображений, 1000 классов)."""
     imagenet_dir = DATASETS_DIR / 'imagenet'
@@ -323,6 +368,7 @@ def setup_imagenet_val() -> None:
         n_images = sum(1 for _ in val_dir.rglob('*.JPEG'))
         if n_classes >= 999 and n_images >= 49000:
             print(f'ImageNet val уже загружена: {n_images} изображений, {n_classes} классов')
+            normalize_image_extensions(val_dir)
             return
 
     # Если val_dir есть но неполный — удаляем и начинаем заново
@@ -363,13 +409,20 @@ def setup_imagenet_val() -> None:
         print('Организация по поддиректориям классов...')
         subprocess.run(['bash', str(valprep_sh)], cwd=str(val_dir), check=True)
 
+    # Нормализуем расширения (.JPEG → .jpg)
+    renamed = normalize_image_extensions(val_dir)
+    if renamed:
+        print(f'  Нормализовано {renamed} расширений (.JPEG → .jpg)')
+
     n_classes = len([d for d in val_dir.iterdir() if d.is_dir()])
-    n_images = sum(1 for _ in val_dir.rglob('*.JPEG'))
+    n_images = sum(1 for _ in val_dir.rglob('*.jpg'))
     print(f'ImageNet val готова: {n_images} изображений, {n_classes} классов')
     print(f'  Директория: {imagenet_dir}')
 
 
 def main() -> None:
+    global DATASETS_DIR
+
     parser = argparse.ArgumentParser(
         description='Загрузка датасетов для калибровки и валидации',
     )
@@ -378,7 +431,12 @@ def main() -> None:
     parser.add_argument('--cityscapes', action='store_true', help='Загрузить Cityscapes val')
     parser.add_argument('--imagenet', action='store_true', help='Загрузить ImageNet val (6.3 GB, 1000 классов)')
     parser.add_argument('--all', action='store_true', help='Загрузить все датасеты (по умолчанию)')
+    parser.add_argument('--data-dir', default=None,
+                        help='Куда скачивать датасеты (по умолчанию: datasets/ рядом со скриптом)')
     args = parser.parse_args()
+
+    if args.data_dir:
+        DATASETS_DIR = Path(args.data_dir)
 
     # Если ничего не указано — загружаем всё
     if not (args.coco or args.dota or args.cityscapes or args.imagenet or args.all):
@@ -404,6 +462,10 @@ def main() -> None:
     if args.all or args.imagenet:
         setup_imagenet_val()
         print()
+
+    # Нормализация расширений imagenet10 (rknn-toolkit2 совместимость)
+    fix_imagenet10_extensions()
+    print()
 
     print('=== Все датасеты готовы ===')
     print(f'Директория: {DATASETS_DIR}')

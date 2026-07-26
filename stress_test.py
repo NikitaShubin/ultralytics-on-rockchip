@@ -575,15 +575,15 @@ def main():
             rknn_path = PROJECT_DIR / 'model' / 'stress_model.rknn'
             if not onnx_path.exists():
                 subprocess.run(
-                    ['python3', str(PROJECT_DIR / 'converter' / 'synth_stress.py'),
+                    ['python3', str(PROJECT_DIR / 'convert' / 'synth_stress.py'),
                      '-o', str(onnx_path)],
                     check=True,
                 )
             if not rknn_path.exists():
                 subprocess.run(
                     ['docker', 'compose', '-f',
-                     str(PROJECT_DIR / 'converter' / 'docker-compose.yml'),
-                     'run', '--rm', '--entrypoint', 'python', 'converter', '-c',
+                     str(PROJECT_DIR / 'convert' / 'docker-compose.yml'),
+                     'run', '--rm', '--entrypoint', 'python', 'convert', '-c',
                      f'from rknn.api import RKNN; rknn=RKNN(); '
                      f'rknn.config(mean_values=[[0,0,0]],std_values=[[255,255,255]],target_platform="rk3588"); '
                      f'rknn.load_onnx(model="{onnx_path}"); '

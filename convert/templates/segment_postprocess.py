@@ -122,8 +122,8 @@ def reconstruct_masks(proto, coeffs, boxes, orig_shape, scale, pad):
     raw_masks = 1.0 / (1.0 + np.exp(-coeffs @ proto_flat))
     raw_masks = raw_masks.reshape(-1, ph, pw)
 
-    new_w = int(orig_w * scale)
-    new_h = int(orig_h * scale)
+    new_w = round(orig_w * scale)
+    new_h = round(orig_h * scale)
 
     box_masks = []
     for i in range(len(boxes)):

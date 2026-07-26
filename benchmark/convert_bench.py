@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """Конвертация одной модели для бенчмарка.
 
-Запускается внутри контейнера converter.
+Запускается внутри контейнера convert.
 Использование: python3 convert_bench.py <model_name> <task> <output_dir> [test_data_dir]
 
 Создаёт в output_dir:
   {model_name}.onnx           — ONNX (для CPU FPS)
-  {model_name}_none.rknn      — FP32 RKNN (для NPU FPS)
+  {model_name}_fp16.rknn       — FP16 RKNN (для NPU FPS)
   {model_name}_int8.rknn      — INT8 RKNN (для NPU FPS)
   {model_name}_postprocess.py — Постпроцесс
 """
@@ -20,15 +20,15 @@ import sys
 import time
 from pathlib import Path
 
-sys.path.insert(0, '/app/converter')
-import converter  # noqa: E402
+sys.path.insert(0, '/app/convert')
+import convert as converter  # noqa: E402
 
 ULTRALYTICS_CACHE = Path.home() / '.cache' / 'ultralytics' / 'models'
 
 
 def cleanup_model(model_name: str) -> None:
     """Очистить промежуточные файлы модели."""
-    for base in [Path('.'), converter.WEIGHTS_DIR, converter.MODEL_DIR, Path('/app/converter')]:
+    for base in [Path('.'), converter.WEIGHTS_DIR, converter.MODEL_DIR, Path('/app/convert')]:
         if base.exists():
             for f in base.glob(f'{model_name}*'):
                 if f.is_dir():
@@ -63,7 +63,7 @@ def main() -> dict:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     pt_path = converter.resolve_pt(model_name)
-    sys.stderr.write(json.dumps({'phase': 'resolve_pt', 'pt_path': pt_path}) + '\n')
+    sys.stderr.write(json.dumps({'phase': 'resolve_pt', 'pt_path': str(pt_path)}) + '\n')
 
     info = converter._detect_model_info(pt_path)
 
@@ -77,39 +77,50 @@ def main() -> dict:
     phase('model_info', task=info.get('task', task), classes=info['num_classes'], strides=info['strides'])
 
     phase('export_compile_all')
-    onnx_path, rknn_none, rknn_int8 = converter.export_and_compile_all(pt_path, info)
+    onnx_path, rknn_none, rknn_int8, rknn_int8cal = converter.export_and_compile_all(pt_path, info)
     phase('export_compile_all_done',
-          onnx=onnx_path or '',
-          rknn_none=rknn_none or '',
-          rknn_int8=rknn_int8 or '')
+          onnx=str(onnx_path) if onnx_path else '',
+          rknn_none=str(rknn_none) if rknn_none else '',
+          rknn_int8=str(rknn_int8) if rknn_int8 else '',
+          rknn_int8cal=str(rknn_int8cal) if rknn_int8cal else '')
 
     postprocess_path = converter._generate_postprocess(info, str(output_dir))
     sys.stderr.write(json.dumps({'phase': 'postprocess', 'path': postprocess_path or ''}) + '\n')
 
     copied = []
 
+    def safe_copy(src, dst):
+        src_abs = Path(src).resolve()
+        dst_abs = Path(dst).resolve()
+        if src_abs == dst_abs:
+            sys.stderr.write(f'[КОПИРОВАНИЕ] пропущено (один и тот же файл): {src}\n')
+            return
+        shutil.copy2(src, dst)
+        sys.stderr.write(f'[КОПИРОВАНИЕ] {src} -> {dst}\n')
+
     if onnx_path and os.path.exists(onnx_path):
         dst = output_dir / f'{model_name}.onnx'
-        shutil.copy2(onnx_path, dst)
-        sys.stderr.write(f'[КОПИРОВАНИЕ] {onnx_path} -> {dst}\n')
+        safe_copy(onnx_path, dst)
         copied.append('onnx')
 
     if rknn_none and os.path.exists(rknn_none):
-        dst = output_dir / f'{model_name}_none.rknn'
-        shutil.copy2(rknn_none, dst)
-        sys.stderr.write(f'[КОПИРОВАНИЕ] {rknn_none} -> {dst}\n')
+        dst = output_dir / f'{model_name}_fp16.rknn'
+        safe_copy(rknn_none, dst)
         copied.append('rknn_none')
 
     if rknn_int8 and os.path.exists(rknn_int8):
         dst = output_dir / f'{model_name}_int8.rknn'
-        shutil.copy2(rknn_int8, dst)
-        sys.stderr.write(f'[КОПИРОВАНИЕ] {rknn_int8} -> {dst}\n')
+        safe_copy(rknn_int8, dst)
         copied.append('rknn_int8')
+
+    if rknn_int8cal and os.path.exists(rknn_int8cal):
+        dst = output_dir / f'{model_name}_int8-calib.rknn'
+        safe_copy(rknn_int8cal, dst)
+        copied.append('rknn_int8cal')
 
     if postprocess_path and os.path.exists(postprocess_path):
         dst = output_dir / f'{model_name}_postprocess.py'
-        shutil.copy2(postprocess_path, dst)
-        sys.stderr.write(f'[КОПИРОВАНИЕ] {postprocess_path} -> {dst}\n')
+        safe_copy(postprocess_path, dst)
         copied.append('postprocess')
 
     status = 'OK' if len(copied) >= 3 else 'FAIL'

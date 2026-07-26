@@ -1,0 +1,17 @@
+services:
+  convert:
+    build: .
+    image: percept-converter:latest
+    network_mode: host
+    devices:
+      - /dev/dri:/dev/dri
+    volumes:
+      - ../model:/app/convert/model
+      - ../cache:/app/cache
+      - ./weights:/app/convert/weights
+      - .:/app/convert
+      - ../datasets:/app/datasets
+      - ../setup_datasets.py:/app/convert/setup_datasets.py:ro
+      - ../pipeline.py:/app/pipeline.py:ro
+      - ../percept:/app/percept:ro
+      - ../benchmark:/app/benchmark:ro

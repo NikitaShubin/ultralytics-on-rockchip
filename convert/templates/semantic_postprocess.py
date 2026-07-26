@@ -25,8 +25,8 @@ def postprocess(outputs, scale, pad, orig_shape):
         class_map = logits.argmax(axis=0).astype(np.int32)
 
     pad_left, pad_top = pad[0] // 2, pad[1] // 2
-    new_w = int(orig_w * scale)
-    new_h = int(orig_h * scale)
+    new_w = round(orig_w * scale)
+    new_h = round(orig_h * scale)
     class_map = cv2.resize(
         class_map.astype(np.float32),
         (INPUT_SIZE, INPUT_SIZE),

@@ -14,17 +14,22 @@ __pycache__
 .DS_Store
 
 # Converter artifacts — large generated files
-converter/*.onnx
-converter/*.rknn
-converter/*.pt
-converter/*_rknn_model*/
-converter/model/
-converter/weights/
-converter/check0_*/
-converter/check1_*/
-converter/check2_*/
-converter/core.*
-converter/postprocess.py
+convert/*.onnx
+convert/*.rknn
+convert/*.pt
+convert/*_rknn_model*/
+convert/model/
+convert/weights/
+convert/check0_*/
+convert/check1_*/
+convert/check2_*/
+convert/core.*
+convert/postprocess.py
+convert/runs/
+convert/datasets/
+
+# Model cache (converter cache, large files)
+cache/
 
 # Benchmark temp files (large RKNN conversion artifacts)
 benchmark/temp_models/
@@ -57,9 +62,12 @@ datasets/dotav1/
 datasets/cityscapes/
 datasets/imagenet/
 datasets/ILSVRC2012_img_val.tar
+datasets/coco8
+datasets/coco8.yaml
 
 # Overclock binaries
 overclock/*.dtbo
+overclock/oc_state.conf
 
 # OpenCode internal
 .opencode/
