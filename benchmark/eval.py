@@ -23,7 +23,7 @@ import numpy as np
 # Dataset Loaders
 # ---------------------------------------------------------------------------
 
-def load_coco(ann_file: str):
+def load_coco(ann_file: str, task: str = 'detect'):
     """Загрузить COCO аннотации."""
     from pycocotools.coco import COCO
     coco = COCO(ann_file)
@@ -43,6 +43,9 @@ def load_coco(ann_file: str):
     for ann_id in coco.getAnnIds():
         ann = coco.loadAnns(ann_id)[0]
         img_id = ann['image_id']
+        # Skip non-keypoint annotations for pose eval
+        if task == 'pose' and ann.get('num_keypoints', 0) == 0:
+            continue
         if img_id not in ann_by_img:
             ann_by_img[img_id] = []
         ann_by_img[img_id].append({
@@ -129,7 +132,10 @@ def load_yolo_as_coco(data_dir: str):
 def load_imagenet(val_dir: str):
     """Загрузить ImageNet val."""
     val_path = Path(val_dir)
-    class_dirs = sorted(d for d in val_path.iterdir() if d.is_dir())
+    # Handle both imagenet/ and imagenet/val/ structures
+    if not any(d.is_dir() and d.name.startswith('n') for d in val_path.iterdir()):
+        val_path = val_path / 'val'
+    class_dirs = sorted(d for d in val_path.iterdir() if d.is_dir() and d.name.startswith('n'))
     class_map = {d.name: i for i, d in enumerate(class_dirs)}
     images, labels = [], []
     for name, cid in class_map.items():
@@ -214,7 +220,8 @@ def detections_to_coco(detections: list[dict], image_id: int, cat_ids: list[int]
             flat = []
             for kp in kpts:
                 if isinstance(kp, (list, tuple)) and len(kp) >= 3:
-                    flat.extend([float(kp[0]), float(kp[1]), int(kp[2])])
+                    v = int(kp[2]) if kp[2] >= 1 else (2 if kp[2] > 0 else 0)
+                    flat.extend([float(kp[0]), float(kp[1]), v])
                 elif isinstance(kp, (list, tuple)) and len(kp) == 2:
                     flat.extend([float(kp[0]), float(kp[1]), 2])
             entry['keypoints'] = flat
@@ -228,10 +235,12 @@ def detections_to_coco(detections: list[dict], image_id: int, cat_ids: list[int]
 # Metrics
 # ---------------------------------------------------------------------------
 
-def compute_coco_map(coco_results: list[dict], ann_file: str, task: str = 'detect') -> dict:
+def compute_coco_map(coco_results: list[dict], ann_file: str, task: str = 'detect',
+                      eval_img_ids: list = None) -> dict:
     """Вычислить mAP через pycocotools."""
     from pycocotools.coco import COCO
     from pycocotools.cocoeval import COCOeval
+    import json as _json
 
     coco_gt = COCO(ann_file)
     if not coco_results:
@@ -240,7 +249,34 @@ def compute_coco_map(coco_results: list[dict], ann_file: str, task: str = 'detec
     coco_dt = coco_gt.loadRes(coco_results)
     eval_type = {'segment': 'segm', 'pose': 'keypoints'}.get(task, 'bbox')
 
+    if task == 'pose':
+        import tempfile
+        with open(ann_file) as f:
+            coco_data = _json.load(f)
+        # Filter GT to only keep annotations with keypoints
+        coco_data['annotations'] = [
+            a for a in coco_data['annotations']
+            if a.get('num_keypoints', 0) > 0
+        ]
+        # Filter GT to only evaluated images
+        if eval_img_ids is not None:
+            eval_set = set(eval_img_ids)
+            coco_data['images'] = [
+                img for img in coco_data['images'] if img['id'] in eval_set
+            ]
+            coco_data['annotations'] = [
+                a for a in coco_data['annotations'] if a['image_id'] in eval_set
+            ]
+        tmp = tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False, prefix='kp_')
+        _json.dump(coco_data, tmp)
+        tmp.close()
+        coco_gt = COCO(tmp.name)
+    elif eval_img_ids is not None:
+        pass  # handled below after coco_eval is created
+
     coco_eval = COCOeval(coco_gt, coco_dt, eval_type)
+    if eval_img_ids is not None:
+        coco_eval.params.imgIds = eval_img_ids
     coco_eval.evaluate()
     coco_eval.accumulate()
     coco_eval.summarize()
@@ -266,7 +302,7 @@ def compute_imagenet_accuracy(predictions: list[int], ground_truth: list[int]) -
 # ---------------------------------------------------------------------------
 
 def evaluate(task: str, data_dir: str, model_dir: str = '/app/model',
-             backend: str = '', model_name: str = '') -> dict:
+             backend: str = '', model_name: str = '', limit: int = 0) -> dict:
     """Eval через Pipeline — тот же пайплайн что в продакшене."""
     import sys as _sys
     # Добавляем /app в путь чтобы найти pipeline.py и percept/
@@ -320,16 +356,17 @@ def evaluate(task: str, data_dir: str, model_dir: str = '/app/model',
         img_paths, gt_labels = load_imagenet(data_dir)
         sys.stderr.write(f'[EVAL] ImageNet: {len(img_paths)} изображений\n')
     elif task in ('detect', 'segment', 'pose'):
+        ann_name = 'person_keypoints_val2017.json' if task == 'pose' else 'instances_val2017.json'
         for candidate in [
-            str(Path(data_dir).parent / 'annotations' / 'instances_val2017.json'),
-            str(Path(data_dir) / 'annotations' / 'instances_val2017.json'),
+            str(Path(data_dir).parent / 'annotations' / ann_name),
+            str(Path(data_dir) / 'annotations' / ann_name),
         ]:
             if Path(candidate).exists():
                 ann_file = candidate
                 break
 
         if ann_file:
-            images, ann_by_img, cat_ids = load_coco(ann_file)
+            images, ann_by_img, cat_ids = load_coco(ann_file, task)
             sys.stderr.write(f'[EVAL] COCO: {len(images)} изображений\n')
         else:
             try:
@@ -357,6 +394,8 @@ def evaluate(task: str, data_dir: str, model_dir: str = '/app/model',
 
     if task == 'classify':
         for img_path, gt_label in zip(img_paths, gt_labels):
+            if limit and total >= limit:
+                break
             frame = cv2.imread(img_path)
             if frame is None:
                 errors += 1
@@ -371,7 +410,10 @@ def evaluate(task: str, data_dir: str, model_dir: str = '/app/model',
         metrics['errors'] = errors
 
     elif task in ('detect', 'segment', 'pose'):
+        eval_img_ids = []
         for img_id, img_info in images.items():
+            if limit and total >= limit:
+                break
             img_path = find_img_path(img_info, data_dir)
             frame = cv2.imread(img_path)
             if frame is None:
@@ -379,12 +421,13 @@ def evaluate(task: str, data_dir: str, model_dir: str = '/app/model',
                 continue
             objects, _ = pipeline.detect(frame)
             coco_results.extend(detections_to_coco(objects, img_id, cat_ids))
+            eval_img_ids.append(img_id)
             total += 1
             if total % 500 == 0:
                 sys.stderr.write(f'[EVAL] {total}/{len(images)}\n')
 
         sys.stderr.write(f'[EVAL] mAP ({len(coco_results)} pred)...\n')
-        metrics = compute_coco_map(coco_results, ann_file, task)
+        metrics = compute_coco_map(coco_results, ann_file, task, eval_img_ids=eval_img_ids)
         metrics['total'] = total
         metrics['errors'] = errors
         metrics['predictions'] = len(coco_results)
@@ -414,6 +457,8 @@ def evaluate(task: str, data_dir: str, model_dir: str = '/app/model',
             coco_ann['categories'].append({'id': i, 'name': str(i)})
 
         for img_path in dota_images:
+            if limit and total >= limit:
+                break
             stem = Path(img_path).stem
             if stem not in img_id_map:
                 continue
@@ -458,6 +503,7 @@ def main():
     model_dir = '/app/model'
     backend = ''
     model_name = ''
+    limit = 0
     args = sys.argv[3:]
     i = 0
     while i < len(args):
@@ -470,10 +516,13 @@ def main():
         elif args[i] == '--model-name' and i + 1 < len(args):
             model_name = args[i + 1]
             i += 2
+        elif args[i] == '--limit' and i + 1 < len(args):
+            limit = int(args[i + 1])
+            i += 2
         else:
             i += 1
 
-    result = evaluate(task, data_dir, model_dir=model_dir, backend=backend, model_name=model_name)
+    result = evaluate(task, data_dir, model_dir=model_dir, backend=backend, model_name=model_name, limit=limit)
     print(json.dumps(result))
 
 
