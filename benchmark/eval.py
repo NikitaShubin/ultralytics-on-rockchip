@@ -297,6 +297,100 @@ def compute_imagenet_accuracy(predictions: list[int], ground_truth: list[int]) -
     return {'top1': correct / len(predictions)}
 
 
+def compute_obb_map(gt_boxes_xywha: list, pred_boxes_xywha: list,
+                    gt_classes: list, pred_classes: list,
+                    pred_scores: list, iou_threshold: float = 0.5,
+                    num_classes: int = 15) -> dict:
+    """Вычислить mAP для OBB через rotated IoU (batch_probiou).
+
+    Args:
+        gt_boxes_xywha: list of np.array [cx, cy, w, h, angle] per image
+        pred_boxes_xywha: list of np.array [cx, cy, w, h, angle] per image
+        gt_classes: list of np.array [class_id] per image
+        pred_classes: list of np.array [class_id] per image
+        pred_scores: list of np.array [score] per image
+    """
+    from ultralytics.utils.metrics import batch_probiou
+    import torch
+
+    ap_per_class = []
+    for cls_id in range(num_classes):
+        all_tp = []
+        all_fp = []
+        all_scores = []
+
+        for img_idx in range(len(gt_boxes_xywha)):
+            gt_cls = gt_classes[img_idx]
+            pred_cls = pred_classes[img_idx]
+            gt_mask = gt_cls == cls_id
+            pred_mask = pred_cls == cls_id
+
+            gt_boxes = gt_boxes_xywha[img_idx][gt_mask] if gt_mask.any() else np.empty((0, 5))
+            pred_boxes = pred_boxes_xywha[img_idx][pred_mask] if pred_mask.any() else np.empty((0, 5))
+            scores = pred_scores[img_idx][pred_mask] if pred_mask.any() else np.empty(0)
+
+            n_gt = len(gt_boxes)
+            if len(pred_boxes) == 0:
+                continue
+
+            matched = np.zeros(n_gt, dtype=bool)
+
+            order = scores.argsort()[::-1]
+            for idx in order:
+                all_scores.append(scores[idx])
+                if n_gt == 0:
+                    all_tp.append(0)
+                    all_fp.append(1)
+                    continue
+
+                pred_t = torch.tensor(pred_boxes[idx:idx+1], dtype=torch.float32)
+                gt_t = torch.tensor(gt_boxes, dtype=torch.float32)
+                ious = batch_probiou(pred_t, gt_t).numpy().ravel()
+
+                best_iou = ious.max() if len(ious) > 0 else 0
+                best_idx = ious.argmax() if len(ious) > 0 else -1
+
+                if best_iou >= iou_threshold and not matched[best_idx]:
+                    all_tp.append(1)
+                    all_fp.append(0)
+                    matched[best_idx] = True
+                else:
+                    all_tp.append(0)
+                    all_fp.append(1)
+
+        if not all_scores:
+            ap_per_class.append(0.0)
+            continue
+
+        scores_arr = np.array(all_scores)
+        tp_arr = np.array(all_tp)
+        fp_arr = np.array(all_fp)
+
+        order = scores_arr.argsort()[::-1]
+        tp_cum = np.cumsum(tp_arr[order])
+        fp_cum = np.cumsum(fp_arr[order])
+
+        n_gt_total = sum(len(gt_boxes_xywha[i][gt_classes[i] == cls_id])
+                         for i in range(len(gt_boxes_xywha)))
+        if n_gt_total == 0:
+            ap_per_class.append(0.0)
+            continue
+
+        precision = tp_cum / (tp_cum + fp_cum)
+        recall = tp_cum / n_gt_total
+
+        # VOC AP: area under precision-recall curve (11-point)
+        ap = 0
+        for t in np.arange(0, 1.1, 0.1):
+            prec_at_recall = precision[recall >= t]
+            ap += prec_at_recall.max() / 11 if len(prec_at_recall) > 0 else 0
+        ap_per_class.append(ap)
+
+    ap_arr = np.array(ap_per_class)
+    map50 = float(ap_arr.mean()) if len(ap_arr) > 0 else 0.0
+    return {'map50': map50, 'map50_95': map50, 'ar100': map50}
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -433,51 +527,65 @@ def evaluate(task: str, data_dir: str, model_dir: str = '/app/model',
         metrics['predictions'] = len(coco_results)
 
     elif task == 'obb':
-        coco_ann = {'images': [], 'annotations': [], 'categories': []}
-        img_id_map = {}
-        for i, img_path in enumerate(dota_images):
-            img = cv2.imread(img_path)
-            if img is None:
-                continue
-            h, w = img.shape[:2]
-            stem = Path(img_path).stem
-            coco_ann['images'].append({'id': i, 'file_name': Path(img_path).name, 'width': w, 'height': h})
-            img_id_map[stem] = i
-            for poly in dota_labels.get(stem, []):
-                xs, ys = poly['polygon'][0::2], poly['polygon'][1::2]
-                x1, y1 = min(xs) * w, min(ys) * h
-                x2, y2 = max(xs) * w, max(ys) * h
-                coco_ann['annotations'].append({
-                    'id': len(coco_ann['annotations']), 'image_id': i,
-                    'category_id': poly['class_id'],
-                    'bbox': [x1, y1, x2 - x1, y2 - y1],
-                    'area': (x2 - x1) * (y2 - y1), 'iscrowd': 0,
-                })
-        for i in range(15):
-            coco_ann['categories'].append({'id': i, 'name': str(i)})
+        def poly_to_xywha(polygon, img_w, img_h):
+            """DOTA polygon [x1,y1,...,x4,y4] (normalized) → [cx, cy, w, h, angle_rad]."""
+            pts = np.array([[polygon[i]*img_w, polygon[i+1]*img_h] for i in range(0, 8, 2)], dtype=np.float32)
+            rect = cv2.minAreaRect(pts)
+            (cx, cy), (w, h), angle_deg = rect
+            angle_rad = angle_deg * np.pi / 180.0
+            return np.array([cx, cy, w, h, angle_rad], dtype=np.float32)
+
+        gt_boxes_per_img = []
+        gt_classes_per_img = []
+        pred_boxes_per_img = []
+        pred_classes_per_img = []
+        pred_scores_per_img = []
 
         for img_path in dota_images:
             if limit and total >= limit:
                 break
-            stem = Path(img_path).stem
-            if stem not in img_id_map:
-                continue
-            frame = cv2.imread(img_path)
-            if frame is None:
+            img = cv2.imread(img_path)
+            if img is None:
                 errors += 1
                 continue
-            objects, _ = pipeline.detect(frame)
-            coco_results.extend(detections_to_coco(objects, img_id_map[stem], cat_ids))
+            h, w = img.shape[:2]
+            stem = Path(img_path).stem
+
+            polys = dota_labels.get(stem, [])
+            if polys:
+                boxes = np.array([poly_to_xywha(p['polygon'], w, h) for p in polys])
+                classes = np.array([p['class_id'] for p in polys])
+            else:
+                boxes = np.empty((0, 5), dtype=np.float32)
+                classes = np.array([], dtype=np.int64)
+            gt_boxes_per_img.append(boxes)
+            gt_classes_per_img.append(classes)
+
+            objects, _ = pipeline.detect(img)
+            if objects:
+                bboxes = np.array([obj['bbox'] for obj in objects])
+                scores = np.array([obj['score'] for obj in objects])
+                cl = np.array([obj['class_id'] for obj in objects])
+                angles = np.array([obj.get('angle', 0.0) for obj in objects])
+                boxes_xywha = np.column_stack([bboxes, angles]).astype(np.float32)
+            else:
+                boxes_xywha = np.empty((0, 5), dtype=np.float32)
+                scores = np.array([], dtype=np.float32)
+                cl = np.array([], dtype=np.int64)
+            pred_boxes_per_img.append(boxes_xywha)
+            pred_classes_per_img.append(cl)
+            pred_scores_per_img.append(scores)
             total += 1
 
-        import tempfile
-        ann_file = tempfile.mktemp(suffix='.json')
-        with open(ann_file, 'w') as f:
-            json.dump(coco_ann, f)
-        metrics = compute_coco_map(coco_results, ann_file, 'detect')
+        sys.stderr.write(f'[EVAL] OBB: {total} images, computing rotated mAP...\n')
+        metrics = compute_obb_map(
+            gt_boxes_per_img, pred_boxes_per_img,
+            gt_classes_per_img, pred_classes_per_img, pred_scores_per_img,
+            num_classes=15,
+        )
         metrics['total'] = total
         metrics['errors'] = errors
-        metrics['predictions'] = len(coco_results)
+        metrics['predictions'] = sum(len(p) for p in pred_boxes_per_img)
 
     elapsed = time.time() - t_start
     metrics['elapsed_s'] = round(elapsed, 1)
