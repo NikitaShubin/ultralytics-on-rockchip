@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 """Eval скрипт: проверка пайплайна целиком (изображение → bboxes).
 
-Запускается внутри percept-контейнера:
-    docker exec percept python /app/benchmark/eval.py detect /app/datasets/coco8
-    docker exec percept python /app/benchmark/eval.py detect /app/datasets/coco_val2017
+Запускается внутри convert-контейнера (нужен ultralytics для метрик):
+    docker exec segsmoke python /app/benchmark/eval.py detect /app/datasets/coco_val2017
 
 Использует Pipeline.detect() — тот же пайплайн что и в продакшене.
 """
@@ -262,6 +261,12 @@ def find_img_path(img_info: dict, data_dir: str) -> str:
             p = candidate / img_info['file_name']
             if p.exists():
                 return str(p)
+    # Fallback: любая поддиректория images/ (мини-датасеты coco128/coco8-pose
+    # хранят изображения в images/train2017)
+    imgs_root = data_path / 'images'
+    if imgs_root.exists():
+        for hit in imgs_root.rglob(img_info['file_name']):
+            return str(hit)
     return str(data_path / img_info['file_name'])
 
 
@@ -876,7 +881,8 @@ def compute_obb_map(gt_boxes_xywha: list, pred_boxes_xywha: list,
 # ---------------------------------------------------------------------------
 
 def evaluate(task: str, data_dir: str, model_dir: str = '/app/model',
-             backend: str = '', model_name: str = '', limit: int = 0) -> dict:
+             backend: str = '', model_name: str = '', limit: int = 0,
+             rknn_suffix: str = '') -> dict:
     """Eval через Pipeline — тот же пайплайн что в продакшене."""
     import sys as _sys
     # Добавляем /app в путь чтобы найти pipeline.py и percept/
@@ -907,7 +913,8 @@ def evaluate(task: str, data_dir: str, model_dir: str = '/app/model',
             model_name = 'model'
 
     sys.stderr.write(f'[EVAL] Модель: {model_name} (backend={backend})\n')
-    pipeline = Pipeline(model_dir=str(model_path), model_name=model_name, backend=backend)
+    pipeline = Pipeline(model_dir=str(model_path), model_name=model_name, backend=backend,
+                        rknn_suffix=rknn_suffix)
 
     # Eval mode: минимальный порог чтобы pycocotools сам выбрал оптимальный
     import sys as _sys2
@@ -1223,7 +1230,7 @@ def evaluate(task: str, data_dir: str, model_dir: str = '/app/model',
 
 def main():
     if len(sys.argv) < 3:
-        print(json.dumps({'error': 'Использование: eval.py <task> <data_dir> [--model-dir DIR] [--backend npu|cpu] [--model-name NAME]'}))
+        print(json.dumps({'error': 'Использование: eval.py <task> <data_dir> [--model-dir DIR] [--backend npu|cpu] [--model-name NAME] [--limit N] [--rknn-suffix SUFFIX]'}))
         sys.exit(1)
 
     task = sys.argv[1]
@@ -1233,6 +1240,7 @@ def main():
     backend = ''
     model_name = ''
     limit = 0
+    rknn_suffix = ''
     args = sys.argv[3:]
     i = 0
     while i < len(args):
@@ -1248,10 +1256,14 @@ def main():
         elif args[i] == '--limit' and i + 1 < len(args):
             limit = int(args[i + 1])
             i += 2
+        elif args[i] == '--rknn-suffix' and i + 1 < len(args):
+            rknn_suffix = args[i + 1]
+            i += 2
         else:
             i += 1
 
-    result = evaluate(task, data_dir, model_dir=model_dir, backend=backend, model_name=model_name, limit=limit)
+    result = evaluate(task, data_dir, model_dir=model_dir, backend=backend,
+                      model_name=model_name, limit=limit, rknn_suffix=rknn_suffix)
     print(json.dumps(result))
 
 

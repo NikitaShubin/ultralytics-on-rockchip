@@ -15,8 +15,8 @@
 | Инференс на NPU (RKNN) | Работает |
 | Инференс на CPU (ONNX) | Работает |
 | Конвертация YOLO → RKNN | Конвертируются все задачи |
-| COCO mAP валидация | Для det/seg/pose (5000 изображений) |
-| FPS бенчмарк | 111 моделей (ONNX/FP32/INT8/INT8-calib) + per-core CPU/NPU |
+| Eval точности (eval.py) | Для всех 6 задач (det/seg/pose/cls/obb/sem), варианты ONNX/FP16/INT8/INT8-calib |
+| FPS бенчмарк | 111 моделей (ONNX/FP16/INT8/INT8-calib) + per-core CPU/NPU |
 | Веб-интерфейс | Live viewer + тестовая галерея |
 | Камеры: USB/UVC | Работает |
 | Камеры: GigE Vision (Basler) | Работает |
@@ -91,11 +91,11 @@ rknn_server &
 **Перед первым запуском** необходимо сконвертировать модель:
 
 ```bash
-# FP32 — быстрый старт, без калибровки и скачивания датасетов
+# FP16 — быстрый старт, без калибровки и скачивания датасетов
 ./deploy.sh yolo26n-pose
 ```
 
-Это сконвертирует модель в RKNN (FP32) и запустит сервис.
+Это сконвертирует модель в RKNN (FP16) и запустит сервис.
 
 После этого можно переключать уже сконвертированные модели без повторной конвертации:
 
@@ -225,7 +225,7 @@ curl "http://localhost:5000/reload?model=yolo11n-pose&rknn_suffix=_int8"
 
 - `?model=` ищет `<name>.rknn`, `<name>.onnx`, `<name>_postprocess.py` в `model/`
 - `?backend=cpu` — форсировать ONNX CPU (если RKNN не нужен)
-- `?rknn_suffix=_int8` — выбрать INT8 RKNN модель (по умолчанию `_none` или без суффикса)
+- `?rknn_suffix=_int8` — выбрать INT8 RKNN модель (`_int8`, `_int8-calib`, `_fp16` — суффикс файла в `model/`)
 - `?rknn_suffix=` — пустое значение, использовать модель без суффикса
 - Без параметров — загружает `model.rknn` / `model.onnx`
 
@@ -238,7 +238,9 @@ cd convert
 docker compose run --rm convert my-model.pt
 ```
 
-Конвертер (мультиарх образ `python:3.11-slim`, работает на x86 и ARM):
+Конвертер (образ `percept-converter:latest` — надстройка над `percept-percept:latest` с
+ultralytics/pycocotools/rknn-toolkit2/onnxruntime/onnxslim, работает на aarch64 Orange Pi 5 Pro,
+инференс RKNN на реальном NPU через rknnlite):
 1. Применяет RKNN-патчи (YOLO26, fuse bug)
 2. Экспортирует ONNX + компилирует RKNN
 3. Генерирует `postprocess.py` под задачу
@@ -260,45 +262,48 @@ python3 setup_datasets.py --cityscapes  # Cityscapes val — semantic
 python3 setup_datasets.py --imagenet    # ImageNet val (~6.3 GB) — classify
 ```
 
-Для FP32-моделей датасеты **не нужны** — калибровка не выполняется.
+Для FP16-моделей датасеты **не нужны** — калибровка не выполняется.
 
 ## Бенчмарк (4 фазы)
 
-Четыре независимые фазы, можно запускать по отдельности:
+Оркестратор `benchmark/benchmark.py` запускается на хосте (Orange Pi 5 Pro) и сам поднимает
+контейнеры (`convert` для convert/validate/eval, `percept` для bench). Четыре независимые
+фазы, можно запускать по отдельности:
 
 ```bash
 cd benchmark
 
-# Фаза 1: конвертация .pt → .onnx + _none.rknn + _int8.rknn + _int8-calib.rknn
+# Фаза 1: конвертация .pt → .onnx + _fp16.rknn + _int8.rknn + _int8-calib.rknn + _postprocess.py
 python benchmark.py --phase convert
 
-# Фаза 2: валидация ONNX vs RKNN FP32+INT8 (RKNN simulator)
+# Фаза 2: валидация ONNX vs RKNN FP16+INT8 (реальный NPU, fallback — симулятор)
 python benchmark.py --phase validate
 
 # Фаза 3: FPS + нагрузка CPU/NPU per-core (ARM железо)
 python benchmark.py --phase bench
 
-# Фаза 4: accuracy (yolo val: top1/top5 для cls, mAP для det/seg/pose/obb)
+# Фаза 4: точность (eval.py через Pipeline: top1/top5 для cls,
+#          mAP для det/seg/pose/obb, mIoU для sem), все 4 quantize-варианта
 python benchmark.py --phase eval
 ```
 
 ### Мульти-фазы
 
 ```bash
-# Конвертация + валидация на ПК
+# Конвертация + валидация
 python benchmark.py --phase convert validate
 
-# Всё сразу (convert → validate → bench)
+# Всё сразу (convert → validate → bench → eval)
 python benchmark.py --phase all
 
 # Только FPS, только INT8
 python benchmark.py --phase bench --quantize int8
 
 # Одна модель
-python benchmark.py --phase convert --model yolo26x-seg
+python benchmark.py --phase all --model yolo26n
 
-# С авто-очисткой temp_models
-python benchmark.py --phase convert validate --clean
+# Только PILOT-модели (по одной nano на линейку)
+python benchmark.py --phase all --pilot
 ```
 
 ### Квантизация
@@ -306,29 +311,38 @@ python benchmark.py --phase convert validate --clean
 | `--quantize` | Описание |
 |-------------|----------|
 | `onnx` | Только ONNX CPU |
-| `none` | Только FP32 RKNN |
+| `none` | Только FP16 RKNN |
 | `int8` | INT8 без калибровки (без скачивания датасета) |
 | `int8-calib` | INT8 с калибровкой на датасете |
 | `all` | Все варианты (по умолчанию) |
 
 ### Resume
 
-Результаты пишутся в `benchmark/results/results.json` по модели. При повторном запуске уже пройденные модели пропускаются.
+Результаты пишутся в `benchmark/results/results.json` по модели. При повторном запуске уже
+пройденные модели/фазы/варианты пропускаются (resume по файлам в `cache/<model>/` и по
+`results.json`).
 
 ### Результаты
 
-- `benchmark/results/results.json` — полные результаты по каждой модели
-- `benchmark/results/summary.tsv` — TSV-сводка для просмотра
+- `benchmark/results/results.json` — полные результаты по каждой модели (eval — dict по
+  quantize-вариантам: `['eval']['onnx']`, `['eval']['fp16']`, `['eval']['int8']`, `['eval']['int8-calib']`)
+- `benchmark/results/summary.tsv` — TSV-сводка для просмотра (метрики эталона берутся из onnx-варианта)
 - `benchmark/results/benchmark.log` — лог со всеми stdout/stderr
 
-### COCO mAP валидация
+### Точность (eval.py)
+
+eval.py гоняется в convert-контейнере на тех же кэш-файлах, что и FPS (onnx → `--backend cpu`,
+rknn → `--backend npu --rknn-suffix _fp16/_int8/_int8-calib`), и считает метрики тем же
+Pipeline (letterbox, постпроцесс, NMS), что и в продакшене. Вручную — одной моделью:
 
 ```bash
-cd convert
-docker compose run --rm convert python eval_coco.py
+cd benchmark
+python eval.py detect ../datasets/coco_val2017 \
+    --model-dir ../cache/yolo11n --model-name yolo11n --backend cpu
 ```
 
-Валидация на 5000 изображений COCO val2017 для задач det/seg/pose.
+Сопоставление задач (models.py → eval.py): `detect`→`detect`, `seg`→`segment`,
+`cls`→`classify`, `pose`→`pose`, `obb`→`obb`, `sem`→`semantic`.
 
 ## Стресс-тест
 
@@ -375,40 +389,6 @@ Ctrl+C корректно останавливает все процессы и 
 
 Также доступен Python-аналог: `python3 stress_test.py` (опции аналогичны).
 
-## Результаты
-
-### FPS (yolov8n-pose, 640×640)
-
-| Метрика | CPU (ONNX) | NPU (RKNN) | Ускорение |
-|---------|------------|------------|-----------|
-| FPS | 4.09 | 16.29 | **4.0×** |
-| FPS std | 0.55 | 2.20 | — |
-| NPU load | — | 11.8% | — |
-
-### COCO mAP (yolov8n-pose, 5000 изображений)
-
-| Метрика | CPU ONNX | NPU FP32 | NPU INT8 |
-|---------|----------|----------|----------|
-| AP@50:95 | **0.499** | **0.499** | 0.463 |
-| AP@50 | 0.786 | 0.787 | 0.773 |
-
-**Выводы**:
-- NPU FP32 **идентичен** CPU ONNX — потеря точности отсутствует
-- NPU INT8 **теряет 7.2%** AP@50:95 относительно FP32
-
-### Выборка FPS
-
-| Модель | Задача | Разрешение | CPU FPS | NPU FPS | Ускорение |
-|--------|--------|------------|---------|---------|-----------|
-| yolov8n | detect | 640 | 6.15 | 7.73 | 1.3× |
-| yolov8n-seg | seg | 640 | 3.12 | 9.92 | 3.2× |
-| yolov8n-cls | cls | 224 | 85.25 | 67.75 | 0.8× |
-| yolov8n-pose | pose | 640 | 5.88 | 7.64 | 1.3× |
-| yolov8m | detect | 640 | 0.96 | 3.87 | 4.0× |
-| yolo11n | detect | 640 | 7.33 | 7.28 | 1.0× |
-
-Полная таблица: `benchmark/results/summary.tsv`
-
 ## Структура
 
 ```
@@ -438,7 +418,7 @@ test/                        # Тестовые изображения
 start.sh                     # Запуск сервера
 stop.sh                      # Остановка сервера
 deploy.sh                    # Деплой модели (конвертация + запуск, --int8 для калибровки)
-setup_datasets.py            # Загрузка датасетов (--coco, --dota, --cityscapes, --imagenet, --all)
+setup_datasets.py            # Загрузка датасетов (task --mini/--full, или --coco/--dota/--cityscapes/--imagenet)
 oc_manager.sh                # Менеджер разгона (test/apply/revert/monitor/set)
 oc_test.sh                   # Тест разгона (пошаговый переход по частотам)
 stress_test.sh               # Стресс-тест NPU/CPU/RAM (bash, Ctrl+C)
@@ -448,11 +428,12 @@ overclock/
 └── rk3588-opi5pro-oc.dts    # Device tree overlay для разгона Orange Pi 5 Pro
 benchmark/
 ├── benchmark.py             # Оркестратор: --phase convert|validate|bench|eval|all
-├── convert_bench.py         # Фаза 1: экспорт + компиляция (4 файла на модель)
-├── validate_bench.py        # Фаза 2: ONNX vs RKNN FP32+INT8 валидация
+├── convert_bench.py         # Фаза 1: экспорт + компиляция (4 RKNN/ONNX + postprocess на модель)
+├── validate_bench.py        # Фаза 2: ONNX vs RKNN FP16+INT8 валидация (NPU/симулятор)
 ├── fps_bench.py             # Фаза 3: FPS + per-core CPU/NPU нагрузка
-├── eval_bench.py            # Фаза 4: accuracy (yolo val)
+├── eval.py                  # Фаза 4: точность (все quantize-варианты, все 6 задач)
 ├── models.py                # Списки моделей (FULL: 111, PILOT: 21)
+├── run_3way_eval.py         # Interleaved 3-way проверка: ultra-NMS vs std vs RK-opt постпроцесс
 ├── bench.sh                 # Обёртка для benchmark.py
 └── results/                 # Результаты (results.json, summary.tsv, benchmark.log)
 convert/
@@ -461,9 +442,9 @@ convert/
 ├── patches/                 # RKNN-патчи
 ├── weights/                 # Исходные .pt
 ├── docker-compose.yml       # Docker compose конвертера
-├── Dockerfile               # Образ конвертера (python:3.11-slim, x86/ARM)
-└── model/                   # Скомпилированные модели
-cache/                       # Кеш конвертера (модели в различных форматах)
+├── Dockerfile               # Образ конвертера (надстройка над percept-percept:latest)
+└── model/                   # Активная модель для сервиса (.rknn/.onnx + postprocess)
+cache/                       # Кеш конвертера: cache/<model>/{model}.pt|onnx|_fp16.rknn|_int8.rknn|_int8-calib.rknn|_postprocess.py
 datasets/                    # Датасеты (скачиваются on-demand)
 ├── coco_val2017/            # COCO val2017 — detect, seg, pose (~19 GB)
 ├── dotav1/                  # DOTAv1 — obb (~1.9 GB)
@@ -546,7 +527,7 @@ watch -n1 'cat /sys/class/devfreq/fdab0000.npu/load'
 - **RK3588S shared bus**: NPU инференс DMA может вызывать микро-глитчи USB камеры (~50мс). Код.camera_source.py` автоматически повторяет чтение при первом сбое перед закрытием камеры
 - **Питание**: слабый БП вызывает brownout при одновременной нагрузке CPU+NPU+камера → перезагрузка. Рекомендуется БП ≥5V/4A
 - **ONNX CPU на RK3588S**: инференс через CPU потребляет слишком много энергии и вызывает brownout. Используйте всегда `BACKEND=npu`
-- **Конвертер Docker**: запуск контейнера конвертера может вызвать перезагрузку на RK3588S (конфликт NPU). Решение: предварительно заполненные `benchmark/temp_models/`
+- **Конвертер Docker**: конвертация и eval в convert-контейнере идут на реальном NPU (`/dev/dri`), поэтому не запускайте их одновременно с работающим сервисом percept (конфликт NPU). Артефакты лежат в `cache/<model>/`, переносимы между сборками
 - **GPU stress**: Mali-G610 использует проприетарный Bifrost kernel driver (DDK g21p0) без userspace библиотеки. Vulkan ICD (Panthor/Panfrost) не работает с проприетарным ядром. EGL Mesa fallback-ит на llvmpipe (CPU). GPU stress недоступен без `libmali.so` от Rockchip той же DDK-версии. CPU+NPU стресс покрывают ~95% peak power по общим power rail'ам
 
 ---
@@ -573,11 +554,15 @@ watch -n1 'cat /sys/class/devfreq/fdab0000.npu/load'
 **Не переводили:** HTTP ответы в `app.py`, `argparse` help, логи библиотек (ultralytics, RKNN toolkit, waitress).
 
 ### Docker
-- Образ конвертера: `percept-converter:latest`
-- Конвертер: мультиарх `python:3.11-slim` (работает на x86 и ARM)
-- Образ прод: `webcam-percept` (имя в docker-compose.yml оставлено для совместимости)
+- Образ конвертера: `percept-converter:latest` — **надстройка над `percept-percept:latest`**
+  (наследует python 3.11, rknn-toolkit-lite2, cv2/numpy/ffmpeg), сверху только тестовые
+  зависимости: ultralytics, rknn-toolkit2, onnxruntime, onnxslim, pycocotools
+- Конвертер работает на aarch64 Orange Pi 5 Pro, RKNN-инференс на **реальном NPU** через rknnlite
+  (rknn-toolkit2-эмулятор — только fallback для x86)
+- Образ прод: `percept-percept:latest` (сервис `percept` в docker-compose.yml)
 - `docker-compose.yml`: сервис `percept`, переменные `MODEL`, `WEB_MODE`
-- `convert/docker-compose.yml`: `image: percept-converter:latest`, сервис `convert`
+- `convert/docker-compose.yml`: `image: percept-converter:latest`, сервис `convert`,
+  проброс `/dev/dri` + хостовых `librknnrt.so`/`librknn_api.so`
 - `config.py` читает `model/model_name.txt` если `MODEL` не задан
 
 ### Калибровка INT8
@@ -590,26 +575,15 @@ watch -n1 'cat /sys/class/devfreq/fdab0000.npu/load'
 
 ### Бенчмарк
 - Переписан `benchmark/benchmark.py` с флагом `--model` для запуска одной модели
-- Resume-логика: `results.json` апсертится по модели; при рестарте ПРОЙДЕНО пропускаются, ПРОВАЛ/нет результата — повторяются
+- Resume-логика: `results.json` апсертится по модели; при рестарте завершённые фазы/варианты пропускаются
 - Лог-файл в режиме `'a'` (сохраняется история)
 - Статусы: ПРОЙДЕНО / ПРОВАЛ
 - Сервис в docker-compose: `percept` (не `webcam`)
 - `benchmark/bench.sh` передаёт `"$@"` в benchmark.py, останавливает percept перед запуском
 - TSV-суммаризация в `benchmark/results/summary.tsv`
-- 4 варианта квантизации: onnx/none/int8/int8-calib
-- Фаза eval: accuracy через yolo val (top1/top5 для cls, mAP для det/seg/pose/obb)
+- 4 варианта квантизации: onnx/none(fp16)/int8/int8-calib
+- Фаза eval: точность через eval.py (top1/top5 для cls, mAP для det/seg/pose/obb, mIoU для sem), все 4 варианта, в convert-контейнере
 - Per-core CPU/NPU нагрузка в fps_bench.py
-
-### Результаты yolo26x-seg (FP32)
-| Бэкенд | FPS | Latency | NPU load | Время конвертации | max_diff |
-|--------|-----|---------|----------|-------------------|----------|
-| CPU | 0.19 | 5.3 с | — | 109 с | 4.94 (ПРОВАЛ валидации) |
-| NPU | 1.05 | 0.95 с | 32.4% | 109 с | 4.94 (ПРОВАЛ валидации) |
-
-> **Примечание**: max_diff > 1.0 из-за специфики RKNN постпроцессинга сегментации (mask proto). Детекция боксов корректна.
-
-### INT8 yolo26x-seg — в процессе
-Квантовка 385 фаз (layers/tensors), ~3 мин/фаза → **~19 часов**. Контейнер `convert-convert-run-...` работает в фоне.
 
 ### deploy.sh
 Переписан в однокомандный деплой:
@@ -677,32 +651,6 @@ sudo ./oc_manager.sh set cpu=2400 npu=1000 gpu=800  # установить ко�
 sudo ./oc_manager.sh monitor        # мониторинг + автооткат при нестабильности
 sudo ./oc_test.sh --compare         # FPS на всех частотах (до и после DTB OC)
 ```
-
-**Результаты (Orange Pi 5 Pro, RK3588S, yolo11n detect):**
-
-| Компонент | Сток макс. | OC макс. | FPS | Прирост |
-|-----------|-----------|----------|-----|---------|
-| CPU A76 (cpu6-7) | 2256 МГц | **2304 МГц** | 13.27 | **+17.2%** |
-| CPU A76 (cpu4-5) | 2256 МГц | **2304 МГц** | — | +17% |
-| NPU | 1000 МГц | 1000 МГц | 11.52 | +1.8% |
-| GPU | 1000 МГц | 1000 МГц | — | не тестировался |
-
-> **Вывод:** Разгон CPU даёт наибольший прирост (+17% FPS).
-> Разгон NPU бесполезен — частоты 600-1000 МГц дают линейное падение FPS.
-> NPU/GPU >1000 МГц в DTB нестабильны — FPS падает на 60%.
-> Рекомендуемый разгон: **CPU 2304 МГц** (стабильно, +17%).
-
-**Частоты CPU и FPS:**
-
-| Частота CPU | FPS | Отклонение |
-|------------|-----|------------|
-| 2208 МГц (сток) | 11.32 | baseline |
-| 2208 МГц (принудит.) | 13.13 | +16.0% |
-| 2304 МГц | 13.27 | +17.2% |
-| 2352 МГц | 13.03 | +15.1% |
-| 2400 МГц | 13.43 | +18.6%* |
-
-> *2400 МГц нестабилен под持久ной нагрузкой — система перезагружается.
 
 **Как работает проверка стабильности:**
 - Замеряет FPS на стоковых частотах

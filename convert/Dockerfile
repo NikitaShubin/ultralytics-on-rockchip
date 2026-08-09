@@ -1,4 +1,7 @@
-FROM python:3.11-slim
+# Надстройка над percept-образом: наследуем python 3.11, rknn-toolkit-lite2,
+# cv2/numpy/ffmpeg (реальный NPU через rknnlite), а сверху добавляем только
+# тестовые зависимости (ultralytics, pycocotools, onnxruntime, rknn-toolkit2).
+FROM percept-percept:latest
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     wget curl unzip libarchive-tools cmake build-essential \

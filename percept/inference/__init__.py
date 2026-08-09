@@ -49,9 +49,12 @@ class ModelBackend:
             self._load_rknn()
 
     def _load_rknn(self) -> None:
-        """Загрузка RKNN модели."""
-        from rknnlite.api import RKNNLite
+        """Загрузка RKNN модели.
 
+        RKNNLite на NPU-железе (ARM); если rknnlite недоступен (x86 ПК) —
+        fallback на rknn-toolkit2 (эмулятор), чтобы eval/validate можно было
+        гонять и без ARM.
+        """
         model_path = self.model_dir / f'{self.model_name}{self.rknn_suffix}.rknn'
         if not model_path.exists():
             model_path = self.model_dir / f'{self.model_name}.rknn'
@@ -59,15 +62,44 @@ class ModelBackend:
             model_path = self.model_dir / 'model.rknn'
         if not model_path.exists():
             raise RuntimeError(f'Модель RKNN не найдена: {model_path}')
-        self.rknn = RKNNLite()
-        ret = self.rknn.load_rknn(str(model_path))
-        if ret != 0:
-            raise RuntimeError(f'Не удалось загрузить модель RKNN: {ret}')
-        ret = self.rknn.init_runtime(core_mask=RKNNLite.NPU_CORE_0_1_2)
+        try:
+            from rknnlite.api import RKNNLite
+            self._lite = True
+        except ImportError:
+            from rknn.api import RKNN
+            self._lite = False
+
+        if self._lite:
+            self.rknn = RKNNLite()
+            ret = self.rknn.load_rknn(str(model_path))
+            if ret != 0:
+                raise RuntimeError(f'Не удалось загрузить модель RKNN: {ret}')
+            ret = self.rknn.init_runtime(core_mask=RKNNLite.NPU_CORE_0_1_2)
+        else:
+            self.rknn = RKNN(verbose=False)
+            ret = self.rknn.load_rknn(str(model_path))
+            if ret == 0:
+                ret = self.rknn.init_runtime()
+            if ret != 0:
+                # rknn-toolkit2 не умеет инферить load_rknn-модель на симуляторе
+                # без target → пересобираем из ONNX (как validate_bench).
+                onnx_path = self.model_dir / f'{self.model_name}.onnx'
+                if not onnx_path.exists():
+                    onnx_path = self.model_dir / 'model.onnx'
+                if not onnx_path.exists():
+                    raise RuntimeError(f'Нет ONNX для пересборки симулятора: {onnx_path}')
+                log.warning('init_runtime вернул %s, пересборка ONNX для симулятора', ret)
+                self.rknn = RKNN(verbose=False)
+                self.rknn.config(mean_values=[[0, 0, 0]], std_values=[[255, 255, 255]],
+                                 target_platform='rk3588')
+                self.rknn.load_onnx(model=str(onnx_path))
+                self.rknn.build(do_quantization=False)
+                ret = self.rknn.init_runtime()
         if ret != 0:
             raise RuntimeError(f'Не удалось инициализировать runtime: {ret}')
         self._detect_input_size_from_onnx()
-        log.info('модель загружена (RKNN) модель=%s суффикс=%s input_size=%s',
+        log.info('модель загружена (RKNN%s) модель=%s суффикс=%s input_size=%s',
+                 '' if self._lite else ' x86-эмулятор',
                  self.model_name, self.rknn_suffix, self.input_size)
 
     def _load_onnx(self) -> None:

@@ -17,6 +17,28 @@ CITYSCAPES_HF_REPO = 'Antreas/Cityscapes'
 IMAGENET_VAL_URL = 'https://image-net.org/data/ILSVRC/2012/ILSVRC2012_img_val.tar'
 IMAGENET_VALPREP_URL = 'https://raw.githubusercontent.com/soumith/imagenetloader.torch/master/valprep.sh'
 
+# Встроенные мини-датасеты ultralytics, используемые для INT8-конвертации
+# (TASK2CALIBRATIONDATA) и smoke-проверок. Ключи — задачи проекта.
+MINI_DATASETS = {
+    'detect': 'coco128.yaml',
+    'seg': 'coco128-seg.yaml',
+    'pose': 'coco8-pose.yaml',
+    'obb': 'dota128.yaml',
+    'cls': 'imagenet100',
+    'sem': 'cityscapes8.yaml',
+}
+TASK_ALIASES = {'segment': 'seg', 'classify': 'cls', 'semantic': 'sem'}
+
+# Полные датасеты задач (для eval / int8-calib)
+FULL_DATASETS = {
+    'detect': 'coco_val2017',
+    'seg': 'coco_val2017',
+    'pose': 'coco_val2017',
+    'obb': 'dotav1',
+    'cls': 'imagenet',
+    'sem': 'cityscapes',
+}
+
 
 def ensure_dir(path: Path) -> None:
     """Создать директорию и проверить права на запись."""
@@ -332,27 +354,63 @@ def normalize_image_extensions(root: Path) -> int:
     return renamed
 
 
-def fix_imagenet10_extensions() -> None:
-    """Нормализовать расширения в imagenet10 (внутренний датасет ultralytics).
+def ensure_ultralytics_dir() -> Path:
+    """Гарантировать, что мини-датасеты ultralytics качаются в datasets/ проекта.
 
-    ultralytics скачивает imagenet10 с .JPEG файлами, но rknn-toolkit2
-    поддерживает только .jpg (нижний регистр). Вызывается перед сборкой.
+    Задаёт YOLO_DATASETS_DIR (и дублирует в settings ultralytics), чтобы
+    встроенные мини-датасеты (coco128, coco8-pose, dota128, imagenet100, ...)
+    попадали в папку проекта, а не в пользовательский кэш. Вызывать ДО
+    первого использования ultralytics (импорт/check_det_dataset).
     """
-    # imagenet10 может быть в нескольких местах
-    search_dirs = [
-        DATASETS_DIR / 'imagenet10',
-        Path(__file__).parent / 'convert' / 'datasets' / 'imagenet10',
-    ]
-    for d in search_dirs:
-        if not d.exists():
-            continue
-        n = normalize_image_extensions(d)
-        if n:
-            print(f'  Нормализовано {n} расширений в {d}')
-        # Удаляем дубликаты с " copy" в имени (артефакты скачивания)
-        for f in list(d.rglob('* copy*')):
-            if f.is_file():
-                f.unlink()
+    ensure_dir(DATASETS_DIR)
+    os.environ.setdefault('YOLO_DATASETS_DIR', str(DATASETS_DIR))
+    try:
+        from ultralytics.utils import SETTINGS
+        if SETTINGS.get('datasets_dir') != str(DATASETS_DIR):
+            SETTINGS.update({'datasets_dir': str(DATASETS_DIR)})
+    except Exception:
+        pass
+    return DATASETS_DIR
+
+
+def _normalize_mini_extensions(data_dir: Path) -> None:
+    """Привести расширения мини-датасета к нижнему регистру после скачивания.
+
+    rknn-toolkit2 поддерживает только .jpg .jpeg .png .bmp (нижний регистр),
+    а ultralytics скачивает imagenet100 с .JPEG файлами.
+    """
+    if not data_dir.exists():
+        return
+    n = normalize_image_extensions(data_dir)
+    if n:
+        print(f'  Нормализовано {n} расширений в {data_dir}')
+
+
+def ensure_mini_dataset(task: str) -> Path:
+    """Обеспечить встроенный мини-датасет ultralytics для задачи (в datasets/).
+
+    Скачивает ТОЛЬКО то, что нужно текущей задаче (coco128 / coco128-seg /
+    coco8-pose / dota128 / imagenet100 / cityscapes8). Используется для
+    INT8-конвертации без калибровки и smoke-проверок. Идемпотентно.
+    """
+    ensure_ultralytics_dir()
+    task = TASK_ALIASES.get(task, task)
+    key = MINI_DATASETS.get(task)
+    if key is None:
+        raise ValueError(f'Неизвестная задача для мини-датасета: {task}')
+
+    if task == 'cls':
+        from ultralytics.data.utils import check_cls_dataset
+        check_cls_dataset(key)
+        data_dir = DATASETS_DIR / 'imagenet100'
+        _normalize_mini_extensions(data_dir)
+        return data_dir
+
+    from ultralytics.data.utils import check_det_dataset
+    info = check_det_dataset(key)
+    data_dir = Path(info.get('path', str(DATASETS_DIR / Path(key).stem)))
+    _normalize_mini_extensions(data_dir)
+    return data_dir
 
 
 def setup_imagenet_val() -> None:
@@ -424,17 +482,53 @@ def setup_imagenet_val() -> None:
     print(f'  Директория: {imagenet_dir}')
 
 
+def _setup_full_dataset(task: str) -> None:
+    """Загрузить полный датасет задачи (для eval / int8-calib)."""
+    task = TASK_ALIASES.get(task, task)
+    if task in ('detect', 'seg', 'pose'):
+        setup_coco_val2017()
+    elif task == 'obb':
+        setup_dota_v1()
+    elif task == 'sem':
+        setup_cityscapes_val()
+    elif task == 'cls':
+        setup_imagenet_val()
+    else:
+        raise ValueError(f'Неизвестная задача: {task}')
+
+
+def ensure_full_dataset(task: str) -> Path:
+    """Программный доступ к полному датасету задачи (качает, если отсутствует).
+
+    Используется eval/3way для автоскачивания полного датасета с аннотациями
+    (GT для метрик). Возвращает путь к датасету.
+    """
+    task = TASK_ALIASES.get(task, task)
+    name = FULL_DATASETS.get(task)
+    if name is None:
+        raise ValueError(f'Неизвестная задача: {task}')
+    data_dir = DATASETS_DIR / name
+    _setup_full_dataset(task)
+    return data_dir
+
+
 def main() -> None:
     global DATASETS_DIR
 
     parser = argparse.ArgumentParser(
         description='Загрузка датасетов для калибровки и валидации',
     )
+    parser.add_argument('task', nargs='?', default=None,
+                        help='Задача: detect|segment|pose|obb|classify|semantic')
+    parser.add_argument('--mini', action='store_true',
+                        help='Скачать встроенный мини-датасет задачи (для INT8/smoke)')
+    parser.add_argument('--full', action='store_true',
+                        help='Скачать полный датасет задачи (для eval/int8-calib)')
     parser.add_argument('--coco', action='store_true', help='Загрузить COCO val2017')
     parser.add_argument('--dota', action='store_true', help='Загрузить DOTAv1 val')
     parser.add_argument('--cityscapes', action='store_true', help='Загрузить Cityscapes val')
     parser.add_argument('--imagenet', action='store_true', help='Загрузить ImageNet val (6.3 GB, 1000 классов)')
-    parser.add_argument('--all', action='store_true', help='Загрузить все датасеты (по умолчанию)')
+    parser.add_argument('--all', action='store_true', help='Загрузить все датасеты')
     parser.add_argument('--data-dir', default=None,
                         help='Куда скачивать датасеты (по умолчанию: datasets/ рядом со скриптом)')
     args = parser.parse_args()
@@ -442,34 +536,42 @@ def main() -> None:
     if args.data_dir:
         DATASETS_DIR = Path(args.data_dir)
 
-    # Если ничего не указано — загружаем всё
-    if not (args.coco or args.dota or args.cityscapes or args.imagenet or args.all):
-        args.all = True
-
     DATASETS_DIR.mkdir(parents=True, exist_ok=True)
+    ensure_ultralytics_dir()
 
     print('=== Подготовка датасетов ===')
     print()
 
-    if args.all or args.coco:
-        setup_coco_val2017()
-        print()
+    if args.task:
+        # Режим по задаче: качать только нужное (--mini / --full / оба)
+        if args.mini or not (args.full or args.coco or args.dota or args.cityscapes or args.imagenet):
+            print(f'[mini] {args.task}: {MINI_DATASETS.get(TASK_ALIASES.get(args.task, args.task))}')
+            ensure_mini_dataset(args.task)
+            print()
+        if args.full:
+            print(f'[full] {args.task}: {FULL_DATASETS.get(TASK_ALIASES.get(args.task, args.task))}')
+            _setup_full_dataset(args.task)
+            print()
+    else:
+        # Legacy-режим
+        if not (args.coco or args.dota or args.cityscapes or args.imagenet or args.all):
+            args.all = True
 
-    if args.all or args.dota:
-        setup_dota_v1()
-        print()
+        if args.all or args.coco:
+            setup_coco_val2017()
+            print()
 
-    if args.all or args.cityscapes:
-        setup_cityscapes_val()
-        print()
+        if args.all or args.dota:
+            setup_dota_v1()
+            print()
 
-    if args.all or args.imagenet:
-        setup_imagenet_val()
-        print()
+        if args.all or args.cityscapes:
+            setup_cityscapes_val()
+            print()
 
-    # Нормализация расширений imagenet10 (rknn-toolkit2 совместимость)
-    fix_imagenet10_extensions()
-    print()
+        if args.all or args.imagenet:
+            setup_imagenet_val()
+            print()
 
     print('=== Все датасеты готовы ===')
     print(f'Директория: {DATASETS_DIR}')

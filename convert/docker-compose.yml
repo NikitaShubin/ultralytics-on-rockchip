@@ -6,6 +6,8 @@ services:
     devices:
       - /dev/dri:/dev/dri
     volumes:
+      - /usr/lib/librknnrt.so:/usr/lib/librknnrt.so:ro
+      - /usr/lib/librknn_api.so:/usr/lib/librknn_api.so:ro
       - ../model:/app/convert/model
       - ../cache:/app/cache
       - ./weights:/app/convert/weights

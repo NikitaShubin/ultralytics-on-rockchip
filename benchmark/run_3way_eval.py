@@ -53,6 +53,10 @@ os.environ['ULTRALYTICS_NO_UPDATE_CHECK'] = 'True'
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
+from setup_datasets import ensure_full_dataset, ensure_mini_dataset, ensure_ultralytics_dir  # noqa: E402
+
+ensure_ultralytics_dir()
+
 RESULTS_DIR = ROOT / 'cache' / '3way_results'
 RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -127,6 +131,59 @@ def resolve_imgsz(pt_path, std_model_dir):
 # ---------------------------------------------------------------------------
 # Автоподготовка кэша (реюз convert)
 # ---------------------------------------------------------------------------
+
+# Задачи, где встроенный мини-датасет даёт валидные GT для 3way-метрик
+# (bbox/kpts из YOLO-разметки). Для остальных минидатасеты несовместимы
+# (seg — нет полигонов, obb/cls/sem — другая структура) → используется полный.
+MINI_SMOKE_TASKS = {'detect', 'pose'}
+
+
+def _full_data_dir(task: str) -> Path:
+    return ROOT / 'datasets' / {
+        'detect': 'coco_val2017',
+        'segment': 'coco_val2017',
+        'pose': 'coco_val2017',
+        'obb': 'dotav1',
+        'classify': 'imagenet',
+        'semantic': 'cityscapes',
+    }[task]
+
+
+def _dataset_present(full: Path) -> bool:
+    """Полный датасет уже скачан (есть изображения)?"""
+    for probe in (
+        full / 'images' / 'val2017',
+        full / 'images' / 'val',
+        full / 'images',
+    ):
+        if probe.exists() and any(probe.glob('*.*')):
+            return True
+    return False
+
+
+def resolve_eval_data(task: str, limit: int, override: str = '') -> str:
+    """Выбрать датасет для eval/3way без лишних скачиваний.
+
+    Правило:
+      1. --data-dir задан явно → его;
+      2. полный датасет задачи уже скачан → его (subset через --limit);
+      3. smoke (limit>0) и задача поддерживает мини-датасет → встроенный
+         мини-датасет (качается в datasets/, крошечный);
+      4. иначе → полный датасет качается сам (код подтягивает необходимое).
+    """
+    if override:
+        return override
+    full = _full_data_dir(task)
+    if _dataset_present(full):
+        return str(full)
+    if limit and task in MINI_SMOKE_TASKS:
+        mini = ensure_mini_dataset(task)
+        print(f'[DATA] полный датасет не скачан, smoke на мини-датасете: {mini}')
+        return str(mini)
+    print(f'[DATA] полный датасет не скачан, качаю: {full}')
+    ensure_full_dataset(task)
+    return str(full)
+
 
 def ensure_model_pt(model, pt_arg):
     """Вернуть путь к .pt в cache/<model>/<model>.pt (скачивает pretrained или копирует кастомный)."""
@@ -754,8 +811,7 @@ def main():
     cfg['std_model_dir'] = std_model_dir
     cfg['rko_model_dir'] = rko_model_dir
     cfg['pt_path'] = pt_path
-    if args.data_dir:
-        cfg['eval_data'] = args.data_dir
+    cfg['eval_data'] = resolve_eval_data(task, args.limit, args.data_dir)
     cfg['imgsz'] = resolve_imgsz(pt_path, std_model_dir)
 
     task_key = f'{model}-{task}'

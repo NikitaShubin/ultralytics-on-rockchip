@@ -6,7 +6,7 @@
 
 Для каждой модели тестирует:
   ONNX на CPU     — FPS (без CPU load, всегда ~100%)
-  RKNN FP32 на NPU — FPS + NPU load + CPU load
+  RKNN FP16 на NPU — FPS + NPU load + CPU load
   RKNN INT8 на NPU — FPS + NPU load + CPU load
 """
 
@@ -246,7 +246,7 @@ def main() -> None:
     parser.add_argument('--warmup', type=int, default=10, help='Секунды прогрева')
     parser.add_argument('--measure', type=int, default=20, help='Секунды измерения')
     parser.add_argument('--quantize', choices=['onnx', 'none', 'int8', 'int8-calib', 'all'], default='all',
-                        help='Какие варианты тестировать: onnx=только CPU, none=FP32, int8=INT8, int8-calib=INT8 с калибровкой, all=все')
+                        help='Какие варианты тестировать: onnx=только CPU, none=FP16, int8=INT8, int8-calib=INT8 с калибровкой, all=все')
     args = parser.parse_args()
 
     images = load_test_images(args.data_dir)

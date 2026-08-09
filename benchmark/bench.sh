@@ -19,19 +19,13 @@ echo "[$(date '+%H:%M:%S')] Лог: ${LOG_FILE}"
 # Остановка percept для освобождения камеры / NPU
 docker compose -f ../docker-compose.yml stop percept 2>/dev/null || true
 
-# Очистка временных файлов от предыдущего запуска
-docker run --rm -v "$(pwd)/temp_models:/tmp/cleanup" \
-  alpine sh -c "rm -rf /tmp/cleanup/*" 2>/dev/null || true
-
-mkdir -p temp_models results
-
 echo ""
 
 # Все аргументы пробрасываются в benchmark.py
 # Примеры:
-#   ./run.sh                          # полный бенчмарк
-#   ./run.sh --model yolo26x-seg      # одна модель
-#   ./run.sh --model yolo26x-seg --quantize int8
+#   ./bench.sh                        # полный бенчмарк
+#   ./bench.sh --model yolo26n        # одна модель
+#   ./bench.sh --model yolo26n --quantize int8
 python3 benchmark.py "$@" 2>&1 | tee "$LOG_FILE"
 
 echo ""

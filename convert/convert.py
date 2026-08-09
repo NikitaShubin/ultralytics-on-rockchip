@@ -30,6 +30,15 @@ _CONVERT_DIR = Path(__file__).resolve().parent
 if str(_CONVERT_DIR) not in sys.path:
     sys.path.insert(0, str(_CONVERT_DIR))
 
+# Подготовка данных: setup_datasets из корня проекта гарантирует, что
+# мини-датасеты ultralytics (coco128 и т.п.) качаются в datasets/, а не в кэш.
+_ROOT_DIR = _CONVERT_DIR.parent
+if str(_ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(_ROOT_DIR))
+from setup_datasets import ensure_mini_dataset, ensure_ultralytics_dir  # noqa: E402
+
+ensure_ultralytics_dir()
+
 CACHE_DIR = Path("/app/cache")
 MODEL_DIR = Path("/app/convert/model")
 WEIGHTS_DIR = Path("/app/convert/weights")
@@ -702,15 +711,7 @@ def export_and_compile_all(pt_path, info=None):
 
     Возвращает (onnx_path, rknn_fp16_path, rknn_int8_path, rknn_int8cal_path).
     """
-    # Нормализация расширений imagenet10 перед INT8 экспортом
-    # rknn-toolkit2 поддерживает только .jpg .jpeg .png .bmp (нижний регистр)
-    for d in [Path('/app/convert/datasets/imagenet10'), Path('.') / 'datasets' / 'imagenet10']:
-        if d.exists():
-            for p in d.rglob('*.JPEG'):
-                p.rename(p.with_suffix('.jpg'))
-            for p in d.rglob('* copy*'):
-                if p.is_file():
-                    p.unlink()
+    task = info.get("task", "detect") if info else "detect"
     onnx_path = export_onnx_only(pt_path)
     if not onnx_path:
         raise RuntimeError("Экспорт ONNX не удался")
@@ -724,7 +725,10 @@ def export_and_compile_all(pt_path, info=None):
     pt_stem = Path(pt_path).stem
     pt_parent = str(Path(pt_path).parent)
 
-    # INT8 без калибровки (ultralytics использует coco8 по умолчанию)
+    # INT8 без калибровки: ultralytics берёт дефолтный мини-датасет задачи
+    # (coco128 / coco128-seg / coco8-pose / dota128 / imagenet100 / cityscapes8).
+    # ensure_mini_dataset гарантирует, что он скачан в datasets/ проекта.
+    log(f"INT8 без калибровки: задача={task}, мини-датасет={ensure_mini_dataset(task)}")
     model = YOLO(str(pt_path))
     rknn_dir = model.export(format="rknn", quantize=8)
     rknn_files = list(Path(rknn_dir).resolve().glob("*.rknn"))
@@ -738,7 +742,6 @@ def export_and_compile_all(pt_path, info=None):
 
     # INT8-calib: RKNN с калибровкой на реальном датасете
     rknn_int8cal = None
-    task = info.get("task", "detect") if info else "detect"
     try:
         data_yaml = _make_calib_yaml(task)
         log(f"Сборка RKNN int8-calib: задача={task}, data={data_yaml}")
@@ -1138,7 +1141,8 @@ def run_convert(model_input: str, quantize: str, info: dict | None = None) -> Pa
                 else:
                     raise RuntimeError("RKNN файл не найден после экспорта")
             elif quantize == "int8":
-                log("Сборка RKNN int8 (без калибровки)")
+                task = info_local.get("task", "detect")
+                log(f"Сборка RKNN int8 (без калибровки): задача={task}, мини-датасет={ensure_mini_dataset(task)}")
                 apply_patches()
                 from ultralytics import YOLO
                 if pt_src:

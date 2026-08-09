@@ -4,7 +4,7 @@
 Запускается внутри контейнера convert.
 Использование: python3 validate_bench.py <model_name> <task> <model_dir> [test_data_dir]
 
-Сравнивает выходы ONNX vs RKNN FP32 и ONNX vs RKNN INT8 на тестовых изображениях.
+Сравнивает выходы ONNX vs RKNN FP16 и ONNX vs RKNN INT8 на тестовых изображениях.
 """
 
 from __future__ import annotations
@@ -143,17 +143,17 @@ def main() -> dict:
     results = {'model': model_name, 'task': task, 'validations': {}}
 
     if rknn_fp16_path.exists():
-        sys.stderr.write(f'[ВАЛИДАЦИЯ] FP32: ONNX vs {rknn_fp16_path.name}...\n')
+        sys.stderr.write(f'[ВАЛИДАЦИЯ] FP16: ONNX vs {rknn_fp16_path.name}...\n')
         t0 = time.time()
-        v_fp32 = run_validation(str(onnx_path), str(rknn_fp16_path), images, input_size=input_size)
+        v_fp16 = run_validation(str(onnx_path), str(rknn_fp16_path), images, input_size=input_size)
         elapsed = time.time() - t0
-        v_fp32['elapsed'] = round(elapsed, 1)
-        results['validations']['fp32'] = v_fp32
-        sys.stderr.write(f'[ВАЛИДАЦИЯ] FP32: max_diff_avg={v_fp32["max_diff_avg"]:.4f} '
-                         f'max={v_fp32["max_diff_max"]:.4f} ({v_fp32["validation_mode"]}) '
+        v_fp16['elapsed'] = round(elapsed, 1)
+        results['validations']['fp16'] = v_fp16
+        sys.stderr.write(f'[ВАЛИДАЦИЯ] FP16: max_diff_avg={v_fp16["max_diff_avg"]:.4f} '
+                         f'max={v_fp16["max_diff_max"]:.4f} ({v_fp16["validation_mode"]}) '
                          f'за {elapsed:.0f}с\n')
     else:
-        sys.stderr.write(f'[ПРОПУСК] FP32: {rknn_fp16_path.name} не найден\n')
+        sys.stderr.write(f'[ПРОПУСК] FP16: {rknn_fp16_path.name} не найден\n')
 
     if rknn_int8_path.exists():
         sys.stderr.write(f'[ВАЛИДАЦИЯ] INT8: ONNX vs {rknn_int8_path.name}...\n')

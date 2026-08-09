@@ -73,6 +73,14 @@ datasets/coco8.yaml
 datasets/coco_pose/
 datasets/coco_seg/
 datasets/mini_seg26/
+# Mini-datasets (auto-downloaded by setup_datasets.py --mini / ensure_mini_dataset)
+datasets/coco128/
+datasets/coco128-seg/
+datasets/coco8-pose/
+datasets/coco8-seg/
+datasets/dota128/
+datasets/imagenet100/
+datasets/imagenet100.zip
 
 # Overclock binaries
 overclock/*.dtbo
