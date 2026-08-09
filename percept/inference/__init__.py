@@ -66,7 +66,9 @@ class ModelBackend:
         ret = self.rknn.init_runtime(core_mask=RKNNLite.NPU_CORE_0_1_2)
         if ret != 0:
             raise RuntimeError(f'Не удалось инициализировать runtime: {ret}')
-        log.info('модель загружена (RKNN) модель=%s суффикс=%s', self.model_name, self.rknn_suffix)
+        self._detect_input_size_from_onnx()
+        log.info('модель загружена (RKNN) модель=%s суффикс=%s input_size=%s',
+                 self.model_name, self.rknn_suffix, self.input_size)
 
     def _load_onnx(self) -> None:
         """Загрузка ONNX модели (CPU)."""
@@ -82,12 +84,38 @@ class ModelBackend:
             providers=['CPUExecutionProvider'],
         )
         self._input_name = self._session.get_inputs()[0].name
-        log.info('модель загружена (ONNX CPU) модель=%s', self.model_name)
+        shape = self._session.get_inputs()[0].shape
+        if len(shape) == 4 and isinstance(shape[2], int):
+            self.input_size = shape[2]
+        log.info('модель загружена (ONNX CPU) модель=%s input_size=%s',
+                 self.model_name, self.input_size)
+
+    def _detect_input_size_from_onnx(self) -> None:
+        """Определить input_size из ONNX модели в model_dir (для RKNN backend)."""
+        for name in (f'{self.model_name}.onnx', 'model.onnx'):
+            onnx_path = self.model_dir / name
+            if onnx_path.exists():
+                try:
+                    import onnxruntime as rt
+                    sess = rt.InferenceSession(str(onnx_path), providers=['CPUExecutionProvider'])
+                    shape = sess.get_inputs()[0].shape
+                    if len(shape) == 4 and isinstance(shape[2], int):
+                        self.input_size = shape[2]
+                        return
+                except Exception:
+                    pass
+        pp = self.model_dir / 'postprocess.py'
+        if pp.exists():
+            import re
+            text = pp.read_text()
+            m = re.search(r'INPUT_SIZE\s*=\s*(\d+)', text)
+            if m:
+                self.input_size = int(m.group(1))
 
     def infer(self, tensor: np.ndarray) -> list[np.ndarray]:
         """Запуск инференса на бэкенде."""
         if self.backend == 'cpu':
-            return self._session.run(None, {self._input_name: tensor / 255.0})
+            return self._session.run(None, {self._input_name: tensor})
         nhwc = tensor.transpose(0, 2, 3, 1)
         outputs = self.rknn.inference(inputs=[nhwc])
         if outputs is None:
@@ -149,6 +177,8 @@ class ModelBackend:
                 canvas, scale, pad = letterbox(frame, self.input_size)
                 rgb = cv2.cvtColor(canvas, cv2.COLOR_BGR2RGB).astype(np.float32)
                 tensor = np.expand_dims(rgb.transpose(2, 0, 1), axis=0)
+                if self.backend == 'cpu':
+                    tensor = tensor / 255.0
             try:
                 outputs = self.infer(tensor)
             except Exception:
@@ -158,5 +188,7 @@ class ModelBackend:
         metadata = {
             'orig_size': (h, w),
             'input_size': self.input_size,
+            'scale': float(scale),
+            'pad': (float(pad[0]), float(pad[1])),
         }
         return objects, metadata

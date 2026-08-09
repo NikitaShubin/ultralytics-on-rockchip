@@ -20,11 +20,14 @@ def postprocess(outputs, scale, pad, orig_shape):
     orig_h, orig_w = orig_shape
     logits = outputs[0][0]
     if logits.ndim == 3:
+        # RK-opt: logits [C, H, W] → argmax по классам
         class_map = logits.argmax(axis=0).astype(np.int32)
     else:
-        class_map = logits.argmax(axis=0).astype(np.int32)
+        # std: уже argmax-карта классов [H, W] (bake_argmax в SemanticSegment export)
+        class_map = logits.astype(np.int32)
 
-    pad_left, pad_top = pad[0] // 2, pad[1] // 2
+    pad_left = round(pad[0] / 2 - 0.1)
+    pad_top = round(pad[1] / 2 - 0.1)
     new_w = round(orig_w * scale)
     new_h = round(orig_h * scale)
     class_map = cv2.resize(

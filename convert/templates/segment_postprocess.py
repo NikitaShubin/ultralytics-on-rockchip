@@ -8,10 +8,13 @@ REG_MAX = {{REG_MAX}}
 BIN_COUNT = {{BIN_COUNT}}
 CONF_THRESH = {{CONF_THRESH}}
 IOU_THRESH = {{IOU_THRESH}}
-MIN_WH = {{MIN_WH}}
+MAX_DET = 300
+MAX_NMS = 30000
+MAX_WH = 7680
 NUM_CLASSES = {{NUM_CLASSES}}
 NM = {{NM}}
 COCO_CLASSES = {{COCO_CLASSES}}
+EVAL_PRECISE = False
 {{NO_DFL}}
 
 def dfl_nodfl(position):
@@ -27,6 +30,17 @@ def dfl(position):
     return (y_softmax * weights).sum(axis=2)
 
 _dfl = dfl_nodfl if {{NO_DFL}} else dfl
+
+
+def xywh2xyxy(x):
+    """Center-based xywh → corner xyxy. Matches ultralytics.ops.xywh2xyxy."""
+    y = np.empty_like(x)
+    y[:, 0] = x[:, 0] - x[:, 2] / 2
+    y[:, 1] = x[:, 1] - x[:, 3] / 2
+    y[:, 2] = x[:, 0] + x[:, 2] / 2
+    y[:, 3] = x[:, 1] + x[:, 3] / 2
+    return y
+
 
 def process_head(box_dist, cls_scores, stride, grid_h, grid_w):
     col = np.arange(grid_w, dtype=np.float32).reshape(1, 1, 1, grid_w)
@@ -47,7 +61,10 @@ def process_head(box_dist, cls_scores, stride, grid_h, grid_w):
     return boxes, scores
 
 
-def nms(boxes, scores, iou_thresh):
+def nms(boxes, scores, iou_threshold):
+    """Greedy NMS — exact copy of ultralytics TorchNMS (numpy version)."""
+    if boxes.shape[0] == 0:
+        return np.array([], dtype=np.int64)
     x1, y1, x2, y2 = boxes.T
     areas = (x2 - x1) * (y2 - y1)
     order = scores.argsort()[::-1]
@@ -55,191 +72,194 @@ def nms(boxes, scores, iou_thresh):
     while order.size > 0:
         i = order[0]
         keep.append(i)
-        xx1 = np.maximum(x1[i], x1[order[1:]])
-        yy1 = np.maximum(y1[i], y1[order[1:]])
-        xx2 = np.minimum(x2[i], x2[order[1:]])
-        yy2 = np.minimum(y2[i], y2[order[1:]])
-        inter = np.maximum(0, xx2 - xx1) * np.maximum(0, yy2 - yy1)
-        iou = inter / (areas[i] + areas[order[1:]] - inter + 1e-10)
-        order = order[1:][iou <= iou_thresh]
-    return np.array(keep)
-
-
-def dedup(boxes, scores, class_ids):
-    if len(boxes) < 2:
-        return np.arange(len(boxes))
-    widths = boxes[:, 2] - boxes[:, 0]
-    heights = boxes[:, 3] - boxes[:, 1]
-    cx = (boxes[:, 0] + boxes[:, 2]) / 2
-    cy = (boxes[:, 1] + boxes[:, 3]) / 2
-    groups = []
-    assigned = set()
-    for i in range(len(boxes)):
-        if i in assigned:
+        if order.size == 1:
+            break
+        rest = order[1:]
+        xx1 = np.maximum(x1[i], x1[rest])
+        yy1 = np.maximum(y1[i], y1[rest])
+        xx2 = np.minimum(x2[i], x2[rest])
+        yy2 = np.minimum(y2[i], y2[rest])
+        w = np.maximum(0, xx2 - xx1)
+        h = np.maximum(0, yy2 - yy1)
+        inter = w * h
+        if inter.sum() == 0:
+            order = rest
             continue
-        group = [i]
-        assigned.add(i)
-        for j in range(i + 1, len(boxes)):
-            if j in assigned:
-                continue
-            if class_ids[j] != class_ids[i]:
-                continue
-            w_r = min(widths[i], widths[j]) / max(widths[i], widths[j])
-            h_r = min(heights[i], heights[j]) / max(heights[i], heights[j])
-            center_dist = np.hypot(cx[i] - cx[j], cy[i] - cy[j])
-            same_center = center_dist < 50
-            same_size = w_r > 0.75 and h_r > 0.75
-            if same_size or (same_center and center_dist < max(widths[i], widths[j]) * 0.75):
-                group.append(j)
-                assigned.add(j)
-        groups.append(group)
-    keep = []
-    for group in groups:
-        best = max(group, key=lambda i: scores[i])
-        keep.append(best)
-    return np.array(keep)
+        iou = inter / (areas[i] + areas[rest] - inter)
+        order = rest[iou <= iou_threshold]
+    return np.array(keep, dtype=np.int64)
 
 
-def reconstruct_masks(proto, coeffs, boxes, orig_shape, scale, pad):
-    """Reconstruct masks from prototype masks and per-detection coefficients.
+def process_mask_160(protos, masks_in, bboxes_letter, imgsz=640):
+    """Маски на разрешении прототипов (160x160) в letterboxed-пространстве.
 
-    Args:
-        proto: (NM, ph, pw) prototype masks from model
-        coeffs: (N, NM) mask coefficients per detection
-        boxes: (N, 4) boxes in original image coords [x1,y1,x2,y2]
-        orig_shape: (orig_h, orig_w)
-        scale: resize scale
-        pad: (total_pad_w, total_pad_h)
-
-    Returns:
-        list of (bh, bw) uint8 binary masks cropped to each box
+    Ровно как ultralytics ops.process_mask(..., upsample=False):
+      masks = (coeffs @ proto.view(32, -1)).view(n, 160, 160);
+      binarize > 0 (= sigmoid > 0.5 без сигмоида); crop_mask по letterboxed-bbox.
     """
-    orig_h, orig_w = orig_shape
-    pad_left, pad_top = pad[0] // 2, pad[1] // 2
-    nm, ph, pw = proto.shape
-    proto_flat = proto.reshape(nm, ph * pw)
-    coeffs = np.nan_to_num(coeffs, nan=0.0, posinf=1e3, neginf=-1e3)
-    raw_masks = 1.0 / (1.0 + np.exp(-coeffs @ proto_flat))
-    raw_masks = raw_masks.reshape(-1, ph, pw)
-
-    new_w = round(orig_w * scale)
-    new_h = round(orig_h * scale)
-
-    box_masks = []
-    for i in range(len(boxes)):
-        x1_i, y1_i, x2_i, y2_i = boxes[i].astype(int)
-        if x2_i <= x1_i or y2_i <= y1_i:
-            box_masks.append(np.zeros((1, 1), dtype=np.uint8))
-            continue
-
-        mask_proto = raw_masks[i]
-        mask_canvas = cv2.resize(mask_proto, (INPUT_SIZE, INPUT_SIZE), cv2.INTER_LINEAR)
-        mask_unpadded = mask_canvas[pad_top:pad_top + new_h, pad_left:pad_left + new_w]
-        mask_full = cv2.resize(mask_unpadded, (orig_w, orig_h), cv2.INTER_LINEAR)
-
-        bh = y2_i - y1_i
-        bw = x2_i - x1_i
-        mask_crop = mask_full[y1_i:y2_i, x1_i:x2_i]
-        mask_bin = (mask_crop > 0.5).astype(np.uint8) * 255
-        box_masks.append(mask_bin)
-
-    return box_masks
+    c, mh, mw = protos.shape
+    if masks_in.shape[0] == 0:
+        return np.zeros((0, mh, mw), dtype=np.uint8)
+    masks = (masks_in @ protos.reshape(c, -1)).reshape(-1, mh, mw)
+    masks = (masks > 0.0).astype(np.uint8)
+    if len(bboxes_letter):
+        bx = np.asarray(bboxes_letter, dtype=np.float32) * (mw / imgsz)
+        xx = np.arange(mw, dtype=np.float32)[None, None, :]
+        yy = np.arange(mh, dtype=np.float32)[None, :, None]
+        crop = (
+            (xx >= bx[:, 0][:, None, None])
+            & (xx < bx[:, 2][:, None, None])
+            & (yy >= bx[:, 1][:, None, None])
+            & (yy < bx[:, 3][:, None, None])
+        ).astype(np.uint8)
+        masks = masks * crop
+    return masks
 
 
-def postprocess(outputs, scale, pad, orig_shape):
-    """Decode RKNN outputs into segmentation objects.
-
-    Args:
-        outputs: 10 tensors: [box, cls, coeff] x 3 heads + proto
-        scale: float resize scale
-        pad: (total_pad_w, total_pad_h)
-        orig_shape: (orig_h, orig_w)
-
-    Returns:
-        list of dicts with "bbox", "score", "class_id", "class_name", "mask"
-    """
-    orig_h, orig_w = orig_shape
-    all_boxes, all_scores, all_cls = [], [], []
-    all_coeffs = []
-
-    proto = outputs[-1][0]
-
+def _decode_per_stride(outputs):
+    """RK-opt/RKNN формат: per-stride [box_dist, cls_sigmoid, coeff] x len(STRIDES) + proto."""
+    all_boxes, all_scores, all_coeffs = [], [], []
     for idx in range(len(STRIDES)):
         box_dist = outputs[idx * 3]
         cls_scores = outputs[idx * 3 + 1]
         coeff = outputs[idx * 3 + 2]
-        stride = STRIDES[idx]
-        gh = gw = GRID_SIZES[idx]
-        boxes, scores = process_head(box_dist, cls_scores, stride, gh, gw)
-        max_cls = scores.max(axis=1)
-        cls_ids = scores.argmax(axis=1)
-        mask = max_cls > CONF_THRESH
-        if not mask.any():
-            continue
-        all_boxes.append(boxes[mask])
-        all_scores.append(max_cls[mask])
-        all_cls.append(cls_ids[mask])
-        coeff_flat = coeff[0].reshape(NM, gh * gw).T
-        all_coeffs.append(coeff_flat[mask])
-
-    if not all_boxes:
-        return []
-
+        boxes, scores = process_head(box_dist, cls_scores, STRIDES[idx], GRID_SIZES[idx], GRID_SIZES[idx])
+        nm = coeff.shape[1]
+        all_boxes.append(boxes)
+        all_scores.append(scores)
+        all_coeffs.append(coeff[0].reshape(nm, -1).T)  # (gh*gw, nm)
     boxes = np.concatenate(all_boxes)
     scores = np.concatenate(all_scores)
-    cls_ids = np.concatenate(all_cls)
     coeffs = np.concatenate(all_coeffs)
+    return boxes, scores, coeffs
 
-    pad_left, pad_top = pad[0] // 2, pad[1] // 2
-    x1 = np.clip((boxes[:, 0] - pad_left) / scale, 0, orig_w)
-    y1 = np.clip((boxes[:, 1] - pad_top) / scale, 0, orig_h)
-    x2 = np.clip((boxes[:, 2] - pad_left) / scale, 0, orig_w)
-    y2 = np.clip((boxes[:, 3] - pad_top) / scale, 0, orig_h)
-    boxes = np.stack([x1, y1, x2, y2], axis=1)
 
-    valid = (boxes[:, 2] - boxes[:, 0] > 0) & (boxes[:, 3] - boxes[:, 1] > 0)
-    boxes, scores, cls_ids, coeffs = boxes[valid], scores[valid], cls_ids[valid], coeffs[valid]
-    if not len(boxes):
+def postprocess(outputs, scale, pad, orig_shape):
+    """Postprocess matching ultralytics non_max_suppression() + process_mask.
+
+    Args:
+        outputs: std ONNX — [output0 (1, 4+nc+NM, total), proto (1, NM, 160, 160)];
+                 RK-opt/RKNN — per-stride [box_dist, cls_sigmoid, coeff] x len(STRIDES)
+                               + proto в конце (последний выход).
+        scale: letterbox scale factor
+        pad: (pad_w, pad_h) total padding
+        orig_shape: (orig_h, orig_w)
+    Returns:
+        list of dicts with bbox, score, class_id, class_name, masks_160
+        (и full-res "segmentation" когда EVAL_PRECISE=False).
+    """
+    orig_h, orig_w = orig_shape
+    single_output = (len(outputs) == 2)
+    if single_output:
+        pred = outputs[0][0].astype(np.float32)  # (4+nc+NM, total)
+        nc = pred.shape[0] - 4 - NM
+        proto = outputs[1]
+        if proto.ndim == 4:
+            proto = proto[0]
+        pred[:4] = xywh2xyxy(pred[:4].T).T
+        pred = pred.T                            # (total, 4+nc+NM)
+        box = pred[:, :4]
+        cls = pred[:, 4:4 + nc]
+        coeffs = pred[:, 4 + nc:]
+    else:
+        proto = outputs[-1]
+        if proto.ndim == 4:
+            proto = proto[0]
+        box, cls, coeffs = _decode_per_stride(outputs)
+
+    # Step 1: confidence filter
+    xc = cls.max(axis=1) > CONF_THRESH
+    box = box[xc]
+    cls = cls[xc]
+    coeffs = coeffs[xc]
+    if len(box) == 0:
         return []
 
-    bw = boxes[:, 2] - boxes[:, 0]
-    bh = boxes[:, 3] - boxes[:, 1]
-    valid = (bw >= MIN_WH) & (bh >= MIN_WH)
-    boxes, scores, cls_ids, coeffs = boxes[valid], scores[valid], cls_ids[valid], coeffs[valid]
-    if not len(boxes):
+    # Step 2: multi_label=True — expand each box by each class above conf
+    i, j = np.where(cls > CONF_THRESH)
+    if len(i) == 0:
         return []
 
-    keep = nms(boxes, scores, IOU_THRESH)
-    boxes, scores, cls_ids, coeffs = boxes[keep], scores[keep], cls_ids[keep], coeffs[keep]
-    keep = dedup(boxes, scores, cls_ids)
-    boxes, scores, cls_ids, coeffs = boxes[keep], scores[keep], cls_ids[keep], coeffs[keep]
+    # (M, 6+NM): [x1, y1, x2, y2, confidence, class_id, coeffs...]
+    x = np.column_stack([
+        box[i],
+        cls[i, j, None],
+        j[:, None].astype(np.float32),
+        coeffs[i],
+    ])
 
-    box_masks = reconstruct_masks(proto, coeffs, boxes, orig_shape, scale, pad)
+    # Step 3: sort by confidence, cap at max_nms
+    if x.shape[0] > MAX_NMS:
+        filt = x[:, 4].argsort()[::-1][:MAX_NMS]
+        x = x[filt]
 
+    # Step 4: class-aware NMS — offset boxes by class_id * max_wh
+    c = x[:, 5:6] * MAX_WH
+    boxes_nms = x[:, :4] + c
+    keep = nms(boxes_nms, x[:, 4], IOU_THRESH)
+    keep = keep[:MAX_DET]
+    x = x[keep]
+    if len(x) == 0:
+        return []
+
+    # Step 5: masks at prototype resolution (160x160), letterboxed space
+    bboxes_letter = x[:, :4].copy()
+    masks_160 = process_mask_160(proto, x[:, 6:], bboxes_letter)
+
+    # Step 6: reverse letterbox
+    pad_left = round(pad[0] / 2 - 0.1)
+    pad_top = round(pad[1] / 2 - 0.1)
+    gain = scale
+    x[:, 0] = (x[:, 0] - pad_left) / gain
+    x[:, 1] = (x[:, 1] - pad_top) / gain
+    x[:, 2] = (x[:, 2] - pad_left) / gain
+    x[:, 3] = (x[:, 3] - pad_top) / gain
+
+    # Step 7: clip to image bounds (skip in EVAL_PRECISE — ultralytics doesn't clip;
+    # masks_160 считаются по letterboxed-bbox до reverse letterbox)
+    if not EVAL_PRECISE:
+        x[:, [0, 2]] = np.clip(x[:, [0, 2]], 0, orig_w)
+        x[:, [1, 3]] = np.clip(x[:, [1, 3]], 0, orig_h)
+
+    # Step 8: format output
+    if EVAL_PRECISE:
+        results = []
+        for i in range(len(x)):
+            c = int(x[i, 5])
+            results.append({
+                "bbox": [float(x[i, 0]), float(x[i, 1]), float(x[i, 2]), float(x[i, 3])],
+                "score": float(x[i, 4]),
+                "class_id": c,
+                "class_name": COCO_CLASSES[c] if c < len(COCO_CLASSES) else str(c),
+                "masks_160": masks_160[i],
+            })
+        return results
+
+    # Full-res masks (upsample masks_160 to orig, nearest, cropped by bbox)
     results = []
-    for i in range(len(boxes)):
-        x1_i, y1_i, x2_i, y2_i = boxes[i].astype(int).tolist()
-        c = int(cls_ids[i])
+    for i in range(len(x)):
+        x1, y1, x2, y2 = x[i, :4].astype(int)
+        c = int(x[i, 5])
+        mask_crop = np.zeros((orig_h, orig_w), dtype=np.uint8)
+        bx1, by1 = max(0, x1), max(0, y1)
+        bx2, by2 = min(orig_w, x2), min(orig_h, y2)
+        if bx2 > bx1 and by2 > by1:
+            m = cv2.resize(masks_160[i].astype(np.uint8), (orig_w, orig_h),
+                           interpolation=cv2.INTER_NEAREST)
+            mask_crop[by1:by2, bx1:bx2] = m[by1:by2, bx1:bx2] * 255
         results.append({
-            "bbox": [x1_i, y1_i, x2_i, y2_i],
-            "score": float(scores[i]),
+            "bbox": [int(x1), int(y1), int(x2), int(y2)],
+            "score": float(x[i, 4]),
             "class_id": c,
             "class_name": COCO_CLASSES[c] if c < len(COCO_CLASSES) else str(c),
-            "mask": box_masks[i],
+            "segmentation": mask_crop,
+            "masks_160": masks_160[i],
         })
     return results
 
 
 def visualize(frame, objects):
-    """Draw segmentation masks and boxes on frame.
-
-    Args:
-        frame: numpy array (H, W, 3) BGR
-        objects: list of dicts from postprocess()
-
-    Returns:
-        numpy array with drawn detections
-    """
+    """Draw segmentation masks and boxes on frame."""
     h, w = frame.shape[:2]
     s = max(h, w) / 1000
     thick = max(1, int(s * 3))
@@ -253,23 +273,17 @@ def visualize(frame, objects):
     for i, obj in enumerate(objects):
         x1, y1, x2, y2 = obj["bbox"]
         color = colors[i % len(colors)]
-        mask_bin = obj["mask"]
-        if mask_bin.size > 1:
-            overlay[y1:y2, x1:x2][mask_bin > 0] = color
+        mask_bin = obj.get("segmentation")
+        if isinstance(mask_bin, np.ndarray) and mask_bin.size > 1:
+            mask_bool = mask_bin > 127
+            overlay[mask_bool] = color
     cv2.addWeighted(overlay, 0.35, frame, 0.65, 0, frame)
     for i, obj in enumerate(objects):
         x1, y1, x2, y2 = obj["bbox"]
         color = colors[i % len(colors)]
-        mask_bin = obj["mask"]
         score = obj["score"]
         label = f"{obj['class_name']}: {score:.2f}"
-        cv2.rectangle(frame, (x1, y1), (x2, y2), color, thick)
-        cv2.putText(frame, label, (x1, y1 - 5),
+        cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), color, thick)
+        cv2.putText(frame, label, (int(x1), int(y1) - 5),
                     cv2.FONT_HERSHEY_SIMPLEX, fs, color, fthick)
-        if mask_bin.size > 1:
-            contours, _ = cv2.findContours(mask_bin, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            for cnt in contours:
-                cnt[:, 0, 0] += x1
-                cnt[:, 0, 1] += y1
-                cv2.drawContours(frame, [cnt], -1, color, thick)
     return frame

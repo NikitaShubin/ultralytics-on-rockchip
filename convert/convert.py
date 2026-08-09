@@ -23,6 +23,13 @@ import numpy as np
 # Paths
 # ---------------------------------------------------------------------------
 
+# convert.py использует `from patches import rknn_patch` (lazy, в apply_patches).
+# Добавляем свою директорию в sys.path, чтобы модуль импортировался и как
+# convert.convert (из benchmark/run_3way_eval.py), и как скрипт.
+_CONVERT_DIR = Path(__file__).resolve().parent
+if str(_CONVERT_DIR) not in sys.path:
+    sys.path.insert(0, str(_CONVERT_DIR))
+
 CACHE_DIR = Path("/app/cache")
 MODEL_DIR = Path("/app/convert/model")
 WEIGHTS_DIR = Path("/app/convert/weights")
@@ -586,6 +593,7 @@ def _detect_model_info(pt_path):
         "num_kpts": num_kpts,
         "nm": nm,
         "reg_max": reg_max,
+        "head_type": type(head).__name__,
     }
 
 
@@ -602,6 +610,12 @@ def export_onnx_only(pt_path):
 
     for m in model.model.modules():
         m._rknn_mode = True
+        # yolo26 end2end: fuse() иначе удаляет cv2/cv3 (one2many) и оставляет one2one —
+        # RK-opt получил бы другие головы, чем std. Экспортируем всегда с one2many.
+        if hasattr(m, "end2end"):
+            m.end2end = False
+    if hasattr(model, "end2end"):
+        model.end2end = False
 
     is_rtdetr = isinstance(model.model.model[-1], RTDETRDecoder)
     opset = 16 if is_rtdetr else 12
@@ -629,6 +643,12 @@ def export_and_compile(pt_path, info=None, quantize="fp16"):
 
     for m in model.model.modules():
         m._rknn_mode = True
+        # yolo26 end2end: fuse() иначе удаляет cv2/cv3 (one2many) и оставляет one2one —
+        # RK-opt получил бы другие головы, чем std. Экспортируем всегда с one2many.
+        if hasattr(m, "end2end"):
+            m.end2end = False
+    if hasattr(model, "end2end"):
+        model.end2end = False
 
     is_rtdetr = info and info.get("is_rtdetr", False)
     opset = 16 if is_rtdetr else 12
@@ -851,6 +871,9 @@ def _generate_postprocess(info, dst_dir):
     is_seg = task == "segment"
     is_cls = task == "classify"
     is_nodfl = info.get("reg_max", 16) <= 1
+    # OBB26 (yolo26) отдаёт angle в виде RAW (без sigmoid), OBB (yolo11) — через
+    # (sigmoid(x)-0.25)*pi. Это важно только для RK-opt per-stride ветки.
+    is_obb26 = info.get("head_type") == "OBB26"
     low_thresh = is_obb or is_pose or is_seg
     substitutions = {
         "INPUT_SIZE": str(info["input_size"]),
@@ -863,9 +886,9 @@ def _generate_postprocess(info, dst_dir):
         "REG_MAX": str(info.get("reg_max", 16)),
         "BIN_COUNT": "4",
         "CONF_THRESH": "0.25" if low_thresh else "0.5",
-        "IOU_THRESH": "0.5",
-        "MIN_WH": "20" if low_thresh else "40",
+        "IOU_THRESH": "0.7",
         "NO_DFL": "True" if is_nodfl else "False",
+        "ANGLE_SIGMOID": "False" if is_obb26 else "True",
     }
 
     for key, val in substitutions.items():

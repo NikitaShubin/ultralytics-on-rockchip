@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import math
+
 import cv2
 import numpy as np
 
@@ -14,7 +16,8 @@ def letterbox(
     """Resize and pad image to new_size with aspect ratio preservation."""
     h, w = img.shape[:2]
     scale = new_size / max(h, w)
-    new_w, new_h = round(w * scale), round(h * scale)
+    new_w = min(math.ceil(w * scale), new_size)
+    new_h = min(math.ceil(h * scale), new_size)
     pad_w = new_size - new_w
     pad_h = new_size - new_h
     pad_left = round(pad_w / 2 - 0.1)

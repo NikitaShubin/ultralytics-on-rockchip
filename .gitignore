@@ -52,6 +52,9 @@ fps_after.txt
 oc_results.csv
 results/
 
+# Ultralytics val artifacts (root-level runs/ from col1)
+runs/
+
 # Test images (user data)
 test/*_pred.jpg
 test/*_preview.jpg
@@ -60,10 +63,16 @@ test/*_preview.jpg
 datasets/coco_val2017/
 datasets/dotav1/
 datasets/cityscapes/
+datasets/cityscapes8/
+datasets/cityscapes_val_parquet/
+datasets/gtFine_trainvaltest.zip
 datasets/imagenet/
 datasets/ILSVRC2012_img_val.tar
 datasets/coco8
 datasets/coco8.yaml
+datasets/coco_pose/
+datasets/coco_seg/
+datasets/mini_seg26/
 
 # Overclock binaries
 overclock/*.dtbo

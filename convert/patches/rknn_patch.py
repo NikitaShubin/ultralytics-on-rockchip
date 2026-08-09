@@ -88,12 +88,16 @@ def _patch_detect(cls):
 def _rknn_semantic_segment(self, x):
     """RKNN совместимый forward для SemanticSegment.
 
-    Заменяет bilinear interpolation на nearest и убирает argmax,
-    которые не поддерживаются RKNN.
+    Возвращает upsampled logits [B, nc, H, W] (без argmax — он перенесён
+    в постпроцесс, см. semantic_postprocess.py). Апсэмпл ОБЯЗАН быть bilinear
+    (align_corners=False) — тем же, что в std-экспорте (SemanticSegment.forward),
+    иначе RK-opt logits не совпадут со std и col3 просядет (~0.03 mIoU на
+    cityscapes8 из-за nearest). RKNN-поддержка bilinear Upsample: в целевом
+    runtime на NPU может исполняться на CPU — проверить при RKNN-деплое.
     """
     import torch.nn.functional as F
     logits = self.classifier(x[0])
-    y = F.interpolate(logits, scale_factor=8, mode='nearest')
+    y = F.interpolate(logits, scale_factor=8, mode='bilinear', align_corners=False)
     return y
 
 

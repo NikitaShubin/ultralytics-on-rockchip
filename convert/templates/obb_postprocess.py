@@ -1,5 +1,4 @@
 import numpy as np
-import cv2
 import math
 
 INPUT_SIZE = {{INPUT_SIZE}}
@@ -9,15 +8,11 @@ REG_MAX = {{REG_MAX}}
 BIN_COUNT = {{BIN_COUNT}}
 CONF_THRESH = {{CONF_THRESH}}
 IOU_THRESH = {{IOU_THRESH}}
-MIN_WH = {{MIN_WH}}
+MAX_DET = 300
+MAX_NMS = 30000
+MAX_WH = 7680
 NUM_CLASSES = {{NUM_CLASSES}}
 COCO_CLASSES = {{COCO_CLASSES}}
-{{NO_DFL}}
-
-_OFFSETS = [gs * gs for gs in GRID_SIZES]
-_TOTAL_GRID = sum(_OFFSETS)
-# OBB output format: 20 channels = 4(box) + NUM_CLASSES(cls) + 1(angle)
-_OBB_NUM_CLS_CH = {{NUM_CLASSES}}
 
 def dfl_nodfl(position):
     return position
@@ -34,26 +29,8 @@ def dfl(position):
 _dfl = dfl_nodfl if {{NO_DFL}} else dfl
 
 
-def _split_single_output(feat):
-    """Split single (1, 20, total_grid) output into per-stride box/cls/angle."""
-    n, c, total = feat.shape
-    off = 0
-    splits = []
-    for i, g in enumerate(GRID_SIZES):
-        sz = g * g
-        f = feat[:, :, off:off+sz].reshape(n, c, g, g)
-        box = f[:, 0:4, :, :]
-        cls_raw = f[:, 4:4+_OBB_NUM_CLS_CH, :, :]
-        angle_raw = f[:, 4+_OBB_NUM_CLS_CH:4+_OBB_NUM_CLS_CH+1, :, :]
-        splits.append((box, cls_raw, angle_raw))
-        off += sz
-    return splits
-
-
 def dist2rbox_np(pred_dist, angle, grid_x, grid_y, stride):
-    """Convert distance predictions + angle to rotated box in pixel coords.
-    Returns [cx, cy, w, h] in image coordinates.
-    """
+    """Convert distance predictions + angle to rotated box in pixel coords."""
     l, t, r, b = pred_dist[:, 0], pred_dist[:, 1], pred_dist[:, 2], pred_dist[:, 3]
     cos_a = np.cos(angle)
     sin_a = np.sin(angle)
@@ -69,17 +46,16 @@ def dist2rbox_np(pred_dist, angle, grid_x, grid_y, stride):
 
 
 def process_head(box_dist, cls_scores, angle_raw, stride, grid_h, grid_w):
-    gh, gw = grid_h, grid_w
-
+    """RK-opt/RKNN per-stride decode: raw DFL + raw angle → cx,cy,w,h,angle."""
     dbox = _dfl(box_dist)
     dbox = np.nan_to_num(dbox, nan=0.0, posinf=1e6, neginf=-1e6)
-    col = np.arange(gw, dtype=np.float32).reshape(1, 1, 1, gw)
-    row = np.arange(gh, dtype=np.float32).reshape(1, 1, gh, 1)
-    grid_x = np.broadcast_to(col, (1, 1, gh, gw)) + 0.5
-    grid_y = np.broadcast_to(row, (1, 1, gh, gw)) + 0.5
+    col = np.arange(grid_w, dtype=np.float32).reshape(1, 1, 1, grid_w)
+    row = np.arange(grid_h, dtype=np.float32).reshape(1, 1, grid_h, 1)
+    grid_x = np.broadcast_to(col, (1, 1, grid_h, grid_w)) + 0.5
+    grid_y = np.broadcast_to(row, (1, 1, grid_h, grid_w)) + 0.5
 
     angle_raw_clip = np.clip(angle_raw, -80, 80)
-    ang = (1 / (1 + np.exp(-angle_raw_clip)) - 0.25) * math.pi
+    ang = (1 / (1 + np.exp(-angle_raw_clip)) - 0.25) * math.pi if {{ANGLE_SIGMOID}} else angle_raw_clip
 
     boxes = dbox.transpose(0, 2, 3, 1).reshape(-1, 4)
     ang_f = ang.transpose(0, 2, 3, 1).reshape(-1)
@@ -90,191 +66,146 @@ def process_head(box_dist, cls_scores, angle_raw, stride, grid_h, grid_w):
 
     cx, cy, bw, bh = dist2rbox_np(boxes, ang_f, gx, gy, stride)
 
-    swap = bh > bw
-    if np.any(swap):
-        bw[swap], bh[swap] = bh[swap], bw[swap]
-        ang_f[swap] -= np.pi / 2
-        under = swap & (ang_f < -np.pi / 4)
-        ang_f[under] += np.pi
-
-    return cx, cy, bw, bh, ang_f, scores
-
-
-def nms(cx, cy, bw, bh, scores, iou_thresh):
-    x1 = cx - bw / 2
-    y1 = cy - bh / 2
-    x2 = cx + bw / 2
-    y2 = cy + bh / 2
-    areas = bw * bh
-    order = scores.argsort()[::-1]
-    keep = []
-    while order.size > 0:
-        i = order[0]
-        keep.append(i)
-        xx1 = np.maximum(x1[i], x1[order[1:]])
-        yy1 = np.maximum(y1[i], y1[order[1:]])
-        xx2 = np.minimum(x2[i], x2[order[1:]])
-        yy2 = np.minimum(y2[i], y2[order[1:]])
-        inter = np.maximum(0, xx2 - xx1) * np.maximum(0, yy2 - yy1)
-        iou = inter / (areas[i] + areas[order[1:]] - inter + 1e-10)
-        order = order[1:][iou <= iou_thresh]
-    return np.array(keep)
-
-
-def dedup(boxes, scores, class_ids):
-    if len(boxes) < 2:
-        return np.arange(len(boxes))
-    widths = boxes[:, 2]
-    heights = boxes[:, 3]
-    cx = boxes[:, 0]
-    cy = boxes[:, 1]
-    groups = []
-    assigned = set()
-    for i in range(len(boxes)):
-        if i in assigned:
-            continue
-        group = [i]
-        assigned.add(i)
-        for j in range(i + 1, len(boxes)):
-            if j in assigned:
-                continue
-            if class_ids[j] != class_ids[i]:
-                continue
-            w_r = min(widths[i], widths[j]) / max(widths[i], widths[j])
-            h_r = min(heights[i], heights[j]) / max(heights[i], heights[j])
-            center_dist = np.hypot(cx[i] - cx[j], cy[i] - cy[j])
-            same_center = center_dist < 50
-            same_size = w_r > 0.75 and h_r > 0.75
-            if same_size or (same_center and center_dist < max(widths[i], widths[j]) * 0.75):
-                group.append(j)
-                assigned.add(j)
-        groups.append(group)
-    keep = []
-    for group in groups:
-        best = max(group, key=lambda i: scores[i])
-        keep.append(best)
-    return np.array(keep)
+    return np.column_stack([cx, cy, bw, bh]), ang_f, scores
 
 
 def postprocess(outputs, scale, pad, orig_shape):
-    orig_h, orig_w = orig_shape
-    all_cx, all_cy, all_bw, all_bh = [], [], [], []
-    all_scores, all_cls, all_angle = [], [], []
+    """Postprocess matching ultralytics val non_max_suppression for obb.
 
-    has_single_output = len(outputs) == 1 and outputs[0].shape[1] == 4 + _OBB_NUM_CLS_CH + 1
-
-    if has_single_output:
-        feat = outputs[0]
-        splits = _split_single_output(feat)
+    Args:
+        outputs: std ONNX — один tensor (1, 4+nc+1, total) decoded cxcywh+cls+angle;
+                 RK-opt/RKNN — per-stride [box_dist, cls_sigmoid, angle_raw].
+        scale: letterbox scale
+        pad: (pad_w, pad_h) total padding
+        orig_shape: (orig_h, orig_w)
+    Returns:
+        list of dicts with bbox [cx,cy,w,h], score, class_id, angle
+    """
+    single_output = (len(outputs) == 1 and outputs[0].ndim == 3
+                     and outputs[0].shape[1] == 4 + NUM_CLASSES + 1)
+    if single_output:
+        # std ONNX: уже decoded (cx,cy,w,h + sigmoid cls + angle)
+        pred = outputs[0][0].astype(np.float32)  # (4+nc+1, total)
+        nc = pred.shape[0] - 4 - 1
+        xc = pred[4:4 + nc].max(axis=0) > CONF_THRESH
+        pred = pred.T[xc]
+        if len(pred) == 0:
+            return []
+        box = pred[:, :4]           # cx, cy, w, h
+        cls = pred[:, 4:4 + nc]     # (N, nc)
+        angle = pred[:, 4 + nc:]    # (N, 1)
     else:
-        splits = [(outputs[i * 3], outputs[i * 3 + 1], outputs[i * 3 + 2]) for i in range(len(STRIDES))]
+        # RK-opt/RKNN: per-stride raw
+        parts = []
+        for i in range(len(STRIDES)):
+            boxxy, ang, scores = process_head(
+                outputs[i * 3], outputs[i * 3 + 1], outputs[i * 3 + 2],
+                STRIDES[i], GRID_SIZES[i], GRID_SIZES[i])
+            parts.append((boxxy, ang, scores))
+        box = np.concatenate([p[0] for p in parts])
+        angle = np.concatenate([p[1] for p in parts])[:, None]
+        cls = np.concatenate([p[2] for p in parts])
+        xc = cls.max(axis=1) > CONF_THRESH
+        box, angle, cls = box[xc], angle[xc], cls[xc]
+        if len(box) == 0:
+            return []
 
-    for idx in range(len(STRIDES)):
-        box_dist, cls_raw, angle_raw = splits[idx]
-        stride = STRIDES[idx]
-        gh = gw = GRID_SIZES[idx]
-
-        cls_scores = 1 / (1 + np.exp(-cls_raw)) if has_single_output else cls_raw
-
-        cx, cy, bw, bh, ang, scores = process_head(box_dist, cls_scores, angle_raw, stride, gh, gw)
-
-        max_cls = scores.max(axis=1)
-        cls_ids = scores.argmax(axis=1)
-        mask = max_cls > CONF_THRESH
-        if not mask.any():
-            continue
-        all_cx.append(cx[mask])
-        all_cy.append(cy[mask])
-        all_bw.append(bw[mask])
-        all_bh.append(bh[mask])
-        all_angle.append(ang[mask])
-        all_scores.append(max_cls[mask])
-        all_cls.append(cls_ids[mask])
-
-    if not all_cx:
+    # multi_label=True — expand each box by each class above conf_thres
+    i, j = np.where(cls > CONF_THRESH)
+    if len(i) == 0:
         return []
 
-    cx = np.concatenate(all_cx)
-    cy = np.concatenate(all_cy)
-    bw = np.concatenate(all_bw)
-    bh = np.concatenate(all_bh)
-    angle = np.concatenate(all_angle)
-    scores = np.concatenate(all_scores)
-    cls_ids = np.concatenate(all_cls)
+    # (M, 7): [cx, cy, w, h, confidence, class_id, angle]
+    x = np.column_stack([
+        box[i],                          # (M, 4) — repeated boxes
+        cls[i, j, None],                 # (M, 1) — per-class confidence
+        j[:, None].astype(np.float32),   # (M, 1) — class IDs
+        angle[i],                        # (M, 1) — angle per box
+    ])
 
-    pad_left, pad_top = pad[0] // 2, pad[1] // 2
-    cx = (cx - pad_left) / scale
-    cy = (cy - pad_top) / scale
-    bw = bw / scale
-    bh = bh / scale
-    cx = np.clip(cx, 0, orig_w)
-    cy = np.clip(cy, 0, orig_h)
+    # sort + max_nms cap
+    if x.shape[0] > MAX_NMS:
+        filt = x[:, 4].argsort()[::-1][:MAX_NMS]
+        x = x[filt]
 
-    valid = (bw > 0) & (bh > 0)
-    cx, cy, bw, bh = cx[valid], cy[valid], bw[valid], bh[valid]
-    angle, scores, cls_ids = angle[valid], scores[valid], cls_ids[valid]
-    if not len(cx):
+    # rotated NMS — fast_nms (TorchNMS) + class offset, batch_probiou
+    from ultralytics.utils.metrics import batch_probiou
+    import torch
+
+    c = x[:, 5:6] * MAX_WH
+    boxes_xywhr = torch.from_numpy(np.column_stack([
+        x[:, :2] + c,  # cx+class_offset, cy+class_offset
+        x[:, 2:4],     # w, h
+        x[:, -1:],     # angle
+    ]))
+    scores = torch.from_numpy(x[:, 4])
+
+    sorted_idx = torch.argsort(scores, descending=True)
+    boxes_sorted = boxes_xywhr[sorted_idx]
+    ious = batch_probiou(boxes_sorted, boxes_sorted)
+    ious_np = ious.numpy()
+    n = ious_np.shape[0]
+    keep_mask = np.ones(n, dtype=bool)
+    for j in range(1, n):
+        if np.any(ious_np[:j, j] >= IOU_THRESH):
+            keep_mask[j] = False
+
+    sorted_indices = sorted_idx.numpy()
+    keep_sorted = np.where(keep_mask)[0][:MAX_DET]
+    keep = sorted_indices[keep_sorted]
+    x = x[keep]
+
+    if len(x) == 0:
         return []
 
-    valid = np.maximum(bw, bh) >= MIN_WH
-    cx, cy, bw, bh = cx[valid], cy[valid], bw[valid], bh[valid]
-    angle, scores, cls_ids = angle[valid], scores[valid], cls_ids[valid]
-    if not len(cx):
-        return []
-
-    keep = nms(cx, cy, bw, bh, scores, IOU_THRESH)
-    cx, cy, bw, bh = cx[keep], cy[keep], bw[keep], bh[keep]
-    angle, scores, cls_ids = angle[keep], scores[keep], cls_ids[keep]
-    boxes = np.stack([cx, cy, bw, bh], axis=1)
-    keep = dedup(boxes, scores, cls_ids)
-    cx, cy, bw, bh = cx[keep], cy[keep], bw[keep], bh[keep]
-    angle, scores, cls_ids = angle[keep], scores[keep], cls_ids[keep]
+    # reverse letterbox on cx,cy,w,h (xywh=True mode)
+    pad_left = round(pad[0] / 2 - 0.1)
+    pad_top = round(pad[1] / 2 - 0.1)
+    gain = scale
+    x[:, 0] = (x[:, 0] - pad_left) / gain  # cx
+    x[:, 1] = (x[:, 1] - pad_top) / gain   # cy
+    x[:, 2] = x[:, 2] / gain               # w
+    x[:, 3] = x[:, 3] / gain               # h
 
     results = []
-    for i in range(len(cx)):
-        c = int(cls_ids[i])
+    for row in x:
+        cx, cy, w, h = row[:4]
+        conf, cls_id, ang = row[4], int(row[5]), float(row[6])
         results.append({
-            "bbox": [int(cx[i]), int(cy[i]), int(bw[i]), int(bh[i])],
-            "angle": float(angle[i]),
-            "score": float(scores[i]),
-            "class_id": c,
-            "class_name": COCO_CLASSES[c] if c < len(COCO_CLASSES) else str(c),
+            "bbox": [float(cx), float(cy), float(w), float(h)],
+            "score": float(conf),
+            "class_id": cls_id,
+            "class_name": str(cls_id),
+            "angle": ang,
         })
     return results
 
 
-def _rotated_rect(cx, cy, w, h, angle):
-    cos_a = math.cos(angle)
-    sin_a = math.sin(angle)
-    wx = w / 2 * cos_a
-    wy = w / 2 * sin_a
-    hx = -h / 2 * sin_a
-    hy = h / 2 * cos_a
-    pts = np.array([
-        [cx - wx - hx, cy - wy - hy],
-        [cx + wx - hx, cy + wy - hy],
-        [cx + wx + hx, cy + wy + hy],
-        [cx - wx + hx, cy - wy + hy],
-    ], dtype=np.int32)
-    return pts
-
-
 def visualize(frame, objects):
+    import cv2
     h, w = frame.shape[:2]
     s = max(h, w) / 1000
     thick = max(1, int(s * 3))
-    rad = max(2, int(s * 4))
     fs = max(0.3, s * 0.5)
     fthick = max(1, int(s * 1.5))
-    for obj in objects:
-        cx, cy, bw, bh = obj["bbox"]
-        angle = obj["angle"]
-        score = obj["score"]
-        label = f"{obj['class_name']}: {score:.2f}"
-
-        pts = _rotated_rect(cx, cy, bw, bh, angle)
-        cv2.polylines(frame, [pts], isClosed=True, color=(0, 255, 0), thickness=thick)
-        cv2.circle(frame, (int(cx), int(cy)), rad, (0, 255, 0), -1)
-        cv2.putText(frame, label, (int(cx), int(cy) - 12),
-                    cv2.FONT_HERSHEY_SIMPLEX, fs, (0, 255, 0), fthick)
+    colors = [
+        (0, 255, 0), (255, 0, 0), (0, 0, 255), (255, 255, 0),
+        (255, 0, 255), (0, 255, 255), (128, 255, 0), (255, 128, 0),
+    ]
+    for i, obj in enumerate(objects):
+        cx, cy, w, h = obj["bbox"]
+        angle = obj.get("angle", 0)
+        color = colors[i % len(colors)]
+        cos_a, sin_a = np.cos(angle), np.sin(angle)
+        dx, dy = w / 2, h / 2
+        corners = np.array([
+            [cx + cos_a * (-dx) - sin_a * (-dy), cy + sin_a * (-dx) + cos_a * (-dy)],
+            [cx + cos_a * (dx) - sin_a * (-dy), cy + sin_a * (dx) + cos_a * (-dy)],
+            [cx + cos_a * (dx) - sin_a * (dy), cy + sin_a * (dx) + cos_a * (dy)],
+            [cx + cos_a * (-dx) - sin_a * (dy), cy + sin_a * (-dx) + cos_a * (dy)],
+        ], dtype=np.int32)
+        cv2.polylines(frame, [corners], True, color, thick)
+        label = f"{obj['class_name']}: {obj['score']:.2f}"
+        cv2.putText(frame, label, (int(cx) - 20, int(cy) - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX, fs, color, fthick)
     return frame

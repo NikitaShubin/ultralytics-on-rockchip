@@ -13,7 +13,7 @@ from pathlib import Path
 DATASETS_DIR = Path(__file__).parent / 'datasets'
 
 DOTAV1_URL = 'https://github.com/ultralytics/assets/releases/download/v0.0.0/DOTAv1.zip'
-CITYSCAPES_HF_REPO = 'Chris1/cityscapes'
+CITYSCAPES_HF_REPO = 'Antreas/Cityscapes'
 IMAGENET_VAL_URL = 'https://image-net.org/data/ILSVRC/2012/ILSVRC2012_img_val.tar'
 IMAGENET_VALPREP_URL = 'https://raw.githubusercontent.com/soumith/imagenetloader.torch/master/valprep.sh'
 
@@ -97,6 +97,9 @@ def setup_coco_val2017() -> None:
     # Проверка: всё уже на месте
     if (images_dir.exists() and any(images_dir.glob('*.jpg'))
             and ann_dir.exists() and any(ann_dir.glob('*.json'))):
+        # Убираем оставшиеся архивы (распаковано, архив не нужен)
+        for leftover in ['annotations_trainval2017.zip', 'val2017.zip']:
+            (DATASETS_DIR / leftover).unlink(missing_ok=True)
         print('COCO val2017 уже загружена')
         return
 
@@ -112,6 +115,7 @@ def setup_coco_val2017() -> None:
         with zipfile.ZipFile(ann_zip, 'r') as z:
             z.extractall(coco_dir)
 
+        # Архив успешно распакован — удаляем, чтобы не занимать место
         ann_zip.unlink(missing_ok=True)
 
     # Изображения
@@ -126,6 +130,7 @@ def setup_coco_val2017() -> None:
         with zipfile.ZipFile(img_zip, 'r') as z:
             z.extractall(coco_dir / 'images')
 
+        # Архив успешно распакован — удаляем, чтобы не занимать место
         img_zip.unlink(missing_ok=True)
 
     print(f'COCO val2017 готова: {coco_dir}')
@@ -148,6 +153,8 @@ def setup_dota_v1() -> None:
             and labels_val.exists() and any(labels_val.glob('*.txt'))):
         n_img = len(list(images_val.iterdir()))
         n_lbl = len(list(labels_val.glob('*.txt')))
+        # Убираем оставшийся архив (распакован — не нужен)
+        (DATASETS_DIR / 'DOTAv1.zip').unlink(missing_ok=True)
         print(f'DOTAv1 val уже загружена: {n_img} изображений, {n_lbl} аннотаций')
         return
 
@@ -205,8 +212,9 @@ def setup_dota_v1() -> None:
 def setup_cityscapes_val() -> None:
     """Загрузка Cityscapes val split (500 изображений + маски).
 
-    Скачивает parquet-файлы val split напрямую с HuggingFace
-    и извлекает изображения и маски как PNG файлы.
+    Источник: Antreas/Cityscapes на HuggingFace (parquet val split, 3 шарда,
+    изображения в нормальном PNG). Имена — официальные (из path маски,
+    `<city>_<seq>_<frame>`), совпадают со стемами масок.
     """
     cs_dir = DATASETS_DIR / 'cityscapes'
     ensure_dir(cs_dir)
@@ -223,10 +231,11 @@ def setup_cityscapes_val() -> None:
         print(f'Cityscapes val уже загружена: {n_img} изображений, {n_mask} масок')
         return
 
-    # Список parquet-файлов val split (через API с редиректами)
+    # Список parquet-файлов val split Antreas/Cityscapes (3 шарда)
     parquet_urls = [
-        'https://huggingface.co/api/datasets/Chris1/cityscapes/parquet/default/validation/0.parquet',
-        'https://huggingface.co/api/datasets/Chris1/cityscapes/parquet/default/validation/1.parquet',
+        'https://huggingface.co/datasets/Antreas/Cityscapes/resolve/main/data/val-00000-of-00003.parquet',
+        'https://huggingface.co/datasets/Antreas/Cityscapes/resolve/main/data/val-00001-of-00003.parquet',
+        'https://huggingface.co/datasets/Antreas/Cityscapes/resolve/main/data/val-00002-of-00003.parquet',
     ]
 
     images_val.mkdir(parents=True, exist_ok=True)
@@ -263,35 +272,25 @@ def setup_cityscapes_val() -> None:
         print(f'Извлечение из {fname}...')
         table = pq.read_table(str(cache_path))
 
+        img_col = table.column('image').combine_chunks()
+        seg_col = table.column('semantic_segmentation').combine_chunks()
+
         for row_idx in range(len(table)):
-            row = {col: table.column(col)[row_idx].as_py() for col in table.column_names}
+            # Официальное имя из path маски: <city>_<seq>_<frame>_gtFine_labelIds.png
+            seg_path = seg_col.field('path')[row_idx].as_py()
+            if not seg_path or not seg_path.endswith('_gtFine_labelIds.png'):
+                raise ValueError(f'Неожиданный path маски: {seg_path}')
+            stem = Path(seg_path).name.replace('_gtFine_labelIds.png', '')
 
-            # Изображение
-            img_bytes = row['image']['bytes']
-            img = Image.open(BytesIO(img_bytes))
-
-            # Маска сегментации
-            mask_data = row['semantic_segmentation']
-            if isinstance(mask_data, dict) and 'bytes' in mask_data:
-                mask = Image.open(BytesIO(mask_data['bytes']))
-            elif isinstance(mask_data, dict) and 'path' in mask_data:
-                # Если путь — качаем отдельно
-                mask_url = f'https://huggingface.co/datasets/Chris1/cityscapes/resolve/main/{mask_data["path"]}'
-                mask_cache = cs_dir / mask_data['path'].split('/')[-1]
-                if not mask_cache.exists():
-                    subprocess.run(
-                        ['curl', '-fSL', '-o', str(mask_cache), mask_url],
-                        check=True,
-                    )
-                mask = Image.open(mask_cache)
-
-            image_path = images_val / f'{idx:06d}.png'
-            mask_path = masks_val / f'{idx:06d}.png'
+            image_path = images_val / f'{stem}.png'
+            mask_path = masks_val / f'{stem}.png'
 
             if not image_path.exists():
-                img.save(image_path)
+                img_bytes = img_col.field('bytes')[row_idx].as_py()
+                Image.open(BytesIO(img_bytes)).save(image_path)
             if not mask_path.exists():
-                mask.save(mask_path)
+                mask_bytes = seg_col.field('bytes')[row_idx].as_py()
+                Image.open(BytesIO(mask_bytes)).save(mask_path)
 
             idx += 1
 
@@ -369,6 +368,8 @@ def setup_imagenet_val() -> None:
         if n_classes >= 999 and n_images >= 49000:
             print(f'ImageNet val уже загружена: {n_images} изображений, {n_classes} классов')
             normalize_image_extensions(val_dir)
+            # Убираем оставшийся tar-архив (распакован — не нужен)
+            (DATASETS_DIR / 'ILSVRC2012_img_val.tar').unlink(missing_ok=True)
             return
 
     # Если val_dir есть но неполный — удаляем и начинаем заново
@@ -395,6 +396,9 @@ def setup_imagenet_val() -> None:
     with tarfile.open(tar_path, 'r:*') as tar:
         tar.extractall(val_dir)
     print('Распаковка завершена')
+
+    # Архив успешно распакован — удаляем, чтобы не занимать место (~6.3 GB)
+    tar_path.unlink(missing_ok=True)
 
     # Организация по классам
     valprep_sh = imagenet_dir / 'valprep.sh'

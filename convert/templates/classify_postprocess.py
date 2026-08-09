@@ -1,65 +1,63 @@
 import numpy as np
 import cv2
+from PIL import Image
+from torchvision.transforms import Resize, CenterCrop, ToTensor, Compose
 
 INPUT_SIZE = {{INPUT_SIZE}}
 NUM_CLASSES = {{NUM_CLASSES}}
 COCO_CLASSES = {{COCO_CLASSES}}
 
+# Точная копия ultralytics classify_transforms: Resize(224, bilinear) +
+# CenterCrop(224) + ToTensor(/255). НЕ letterbox!
+_transforms = Compose([
+    Resize(INPUT_SIZE, interpolation=2),
+    CenterCrop(INPUT_SIZE),
+    ToTensor(),
+])
+
 
 def preprocess(frame):
-    """CenterCrop + resize to INPUT_SIZE. Returns (tensor, scale=1.0, pad=(0,0))."""
-    h, w = frame.shape[:2]
-    s = min(h, w)
-    y1 = (h - s) // 2
-    x1 = (w - s) // 2
-    crop = frame[y1:y1 + s, x1:x1 + s]
-    resized = cv2.resize(crop, (INPUT_SIZE, INPUT_SIZE), cv2.INTER_LINEAR)
-    tensor = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB).astype(np.float32)
-    tensor = np.expand_dims(tensor.transpose(2, 0, 1), axis=0)
+    """Resize короткой стороны до INPUT_SIZE + CenterCrop + /255.
+
+    Matches ultralytics classify_transforms exactly.
+    Returns (tensor [0,1], scale, pad) — scale/pad dummy для cls.
+    """
+    pil = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+    tensor = _transforms(pil).unsqueeze(0).numpy()
     return tensor, 1.0, (0, 0)
 
 
-def softmax(x):
-    e = np.exp(x - x.max())
-    return e / e.sum()
-
-
 def postprocess(outputs, scale, pad, orig_shape):
-    """Decode RKNN classify output into top-K predictions.
+    """Classify: top-1 предсказание (score = сырое значение модели).
 
     Args:
-        outputs: list with single tensor [1, NUM_CLASSES]
-        scale, pad: ignored (no box decoding for classify)
+        outputs: list с одним тензором [1, NUM_CLASSES]
+        scale, pad: игнорируются (нет бокс-декодинга для cls)
         orig_shape: tuple (orig_h, orig_w)
 
     Returns:
-        list of dicts: [{"bbox": [0,0,w,h], "score": float, "class_id": int, "class_name": str}, ...]
+        list из одного dict: {"bbox", "score", "class_id", "class_name"}
     """
+    pred = outputs[0]
+    if pred.ndim == 2:
+        pred = pred[0]
+    elif pred.ndim == 3:
+        pred = pred[0, 0]
+
     orig_h, orig_w = orig_shape
-    logits = outputs[0][0]
-    probs = softmax(logits)
-    top5 = np.argsort(-probs)[:5]
-    results = []
-    for c in top5:
-        results.append({
-            "bbox": [0, 0, orig_w, orig_h],
-            "score": float(probs[c]),
-            "class_id": int(c),
-            "class_name": COCO_CLASSES[c] if c < len(COCO_CLASSES) else str(c),
-        })
-    return results
+    cls_id = int(np.argmax(pred))
+    score = float(pred[cls_id])
+
+    return [{
+        "bbox": [0, 0, orig_w, orig_h],
+        "score": score,
+        "class_id": cls_id,
+        "class_name": COCO_CLASSES[cls_id] if cls_id < len(COCO_CLASSES) else str(cls_id),
+    }]
 
 
 def visualize(frame, objects):
-    """Draw classification results on frame.
-
-    Args:
-        frame: numpy array (H, W, 3) BGR
-        objects: list of dicts from postprocess()
-
-    Returns:
-        numpy array with drawn labels
-    """
+    """Draw classification results on frame."""
     h, w = frame.shape[:2]
     s = max(h, w) / 1000
     fs = max(0.8, s * 1.2)

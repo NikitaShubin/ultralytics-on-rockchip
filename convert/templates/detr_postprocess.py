@@ -40,7 +40,8 @@ def postprocess(outputs, scale, pad, orig_shape):
         list of dicts: [{"bbox": [x1,y1,x2,y2], "score": float, "class_id": int, "class_name": str}, ...]
     """
     orig_h, orig_w = orig_shape
-    pad_left, pad_top = pad[0] // 2, pad[1] // 2
+    pad_left = round(pad[0] / 2 - 0.1)
+    pad_top = round(pad[1] / 2 - 0.1)
 
     if not outputs or len(outputs) == 0:
         return []

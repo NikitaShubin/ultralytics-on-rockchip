@@ -71,8 +71,7 @@ class Pipeline:
         self._semantic_mode = getattr(mod, 'SEMANTIC_MODE', False)
         if self._postprocess is None:
             raise RuntimeError('postprocess.py должен определять функцию postprocess()')
-        self.input_size = getattr(mod, 'INPUT_SIZE', 640)
-        self._backend.input_size = self.input_size
+        self.input_size = self._backend.input_size
         log.info(
             'постпроцесс загружен из %s (input_size=%s)',
             post_path,

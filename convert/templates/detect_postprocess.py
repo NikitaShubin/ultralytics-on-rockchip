@@ -8,12 +8,19 @@ REG_MAX = {{REG_MAX}}
 BIN_COUNT = {{BIN_COUNT}}
 CONF_THRESH = {{CONF_THRESH}}
 IOU_THRESH = {{IOU_THRESH}}
-MIN_WH = {{MIN_WH}}
+MIN_WH = 1
+MAX_DET = 300
+MAX_NMS = 30000
+MAX_WH = 7680
+DEDUP_ENABLED = False
+EVAL_PRECISE = False
 NUM_CLASSES = {{NUM_CLASSES}}
 COCO_CLASSES = {{COCO_CLASSES}}
 
+
 def dfl_nodfl(position):
     return position
+
 
 def dfl(position):
     n, c, h, w = position.shape
@@ -24,7 +31,19 @@ def dfl(position):
     weights = np.arange(mc, dtype=np.float32).reshape(1, 1, mc, 1, 1)
     return (y_softmax * weights).sum(axis=2)
 
+
 _dfl = dfl_nodfl if {{NO_DFL}} else dfl
+
+
+def xywh2xyxy(x):
+    """Center-based xywh → corner xyxy. Matches ultralytics.ops.xywh2xyxy."""
+    y = np.empty_like(x)
+    y[:, 0] = x[:, 0] - x[:, 2] / 2
+    y[:, 1] = x[:, 1] - x[:, 3] / 2
+    y[:, 2] = x[:, 0] + x[:, 2] / 2
+    y[:, 3] = x[:, 1] + x[:, 3] / 2
+    return y
+
 
 def process_head(box_dist, cls_scores, stride, grid_h, grid_w):
     col = np.arange(grid_w, dtype=np.float32).reshape(1, 1, 1, grid_w)
@@ -45,7 +64,15 @@ def process_head(box_dist, cls_scores, stride, grid_h, grid_w):
     return boxes, scores
 
 
-def nms(boxes, scores, iou_thresh):
+def nms(boxes, scores, iou_threshold):
+    """Greedy NMS — exact copy of ultralytics TorchNMS (numpy version).
+
+    boxes: (N, 4) xyxy in model coords
+    scores: (N,) confidence
+    returns: (K,) indices of kept boxes
+    """
+    if boxes.shape[0] == 0:
+        return np.array([], dtype=np.int64)
     x1, y1, x2, y2 = boxes.T
     areas = (x2 - x1) * (y2 - y1)
     order = scores.argsort()[::-1]
@@ -53,111 +80,126 @@ def nms(boxes, scores, iou_thresh):
     while order.size > 0:
         i = order[0]
         keep.append(i)
-        xx1 = np.maximum(x1[i], x1[order[1:]])
-        yy1 = np.maximum(y1[i], y1[order[1:]])
-        xx2 = np.minimum(x2[i], x2[order[1:]])
-        yy2 = np.minimum(y2[i], y2[order[1:]])
-        inter = np.maximum(0, xx2 - xx1) * np.maximum(0, yy2 - yy1)
-        iou = inter / (areas[i] + areas[order[1:]] - inter + 1e-10)
-        order = order[1:][iou <= iou_thresh]
-    return np.array(keep)
-
-
-def dedup(boxes, scores, class_ids):
-    if len(boxes) < 2:
-        return np.arange(len(boxes))
-    widths = boxes[:, 2] - boxes[:, 0]
-    heights = boxes[:, 3] - boxes[:, 1]
-    cx = (boxes[:, 0] + boxes[:, 2]) / 2
-    cy = (boxes[:, 1] + boxes[:, 3]) / 2
-    groups = []
-    assigned = set()
-    for i in range(len(boxes)):
-        if i in assigned:
+        if order.size == 1:
+            break
+        rest = order[1:]
+        xx1 = np.maximum(x1[i], x1[rest])
+        yy1 = np.maximum(y1[i], y1[rest])
+        xx2 = np.minimum(x2[i], x2[rest])
+        yy2 = np.minimum(y2[i], y2[rest])
+        w = np.maximum(0, xx2 - xx1)
+        h = np.maximum(0, yy2 - yy1)
+        inter = w * h
+        if inter.sum() == 0:
+            order = rest
             continue
-        group = [i]
-        assigned.add(i)
-        for j in range(i + 1, len(boxes)):
-            if j in assigned:
-                continue
-            if class_ids[j] != class_ids[i]:
-                continue
-            w_r = min(widths[i], widths[j]) / max(widths[i], widths[j])
-            h_r = min(heights[i], heights[j]) / max(heights[i], heights[j])
-            center_dist = np.hypot(cx[i] - cx[j], cy[i] - cy[j])
-            same_center = center_dist < 50
-            same_size = w_r > 0.75 and h_r > 0.75
-            if same_size or (same_center and center_dist < max(widths[i], widths[j]) * 0.75):
-                group.append(j)
-                assigned.add(j)
-        groups.append(group)
-    keep = []
-    for group in groups:
-        best = max(group, key=lambda i: scores[i])
-        keep.append(best)
-    return np.array(keep)
+        iou = inter / (areas[i] + areas[rest] - inter)
+        order = rest[iou <= iou_threshold]
+    return np.array(keep, dtype=np.int64)
 
 
-def postprocess(outputs, scale, pad, orig_shape):
-    orig_h, orig_w = orig_shape
-    all_boxes, all_scores, all_cls = [], [], []
-
+def _decode_per_stride(outputs):
+    """RK-opt/RKNN формат: per-stride [box_dist, cls_sigmoid, sm]."""
+    all_boxes, all_scores = [], []
     for idx in range(len(STRIDES)):
         box_dist = outputs[idx * 3]
         cls_scores = outputs[idx * 3 + 1]
-        stride = STRIDES[idx]
-        gh = gw = GRID_SIZES[idx]
-        boxes, scores = process_head(box_dist, cls_scores, stride, gh, gw)
-        max_cls = scores.max(axis=1)
-        cls_ids = scores.argmax(axis=1)
-        mask = max_cls > CONF_THRESH
-        if not mask.any():
-            continue
-        all_boxes.append(boxes[mask])
-        all_scores.append(max_cls[mask])
-        all_cls.append(cls_ids[mask])
-
-    if not all_boxes:
-        return []
-
+        boxes, scores = process_head(box_dist, cls_scores, STRIDES[idx], GRID_SIZES[idx], GRID_SIZES[idx])
+        all_boxes.append(boxes)
+        all_scores.append(scores)
     boxes = np.concatenate(all_boxes)
     scores = np.concatenate(all_scores)
-    cls_ids = np.concatenate(all_cls)
+    return np.concatenate([boxes, scores], axis=1)  # (N, 4+nc) xyxy + sigmoid cls
 
-    pad_left, pad_top = pad[0] // 2, pad[1] // 2
-    x1 = np.clip((boxes[:, 0] - pad_left) / scale, 0, orig_w)
-    y1 = np.clip((boxes[:, 1] - pad_top) / scale, 0, orig_h)
-    x2 = np.clip((boxes[:, 2] - pad_left) / scale, 0, orig_w)
-    y2 = np.clip((boxes[:, 3] - pad_top) / scale, 0, orig_h)
-    boxes = np.stack([x1, y1, x2, y2], axis=1)
 
-    valid = (boxes[:, 2] - boxes[:, 0] > 0) & (boxes[:, 3] - boxes[:, 1] > 0)
-    boxes, scores, cls_ids = boxes[valid], scores[valid], cls_ids[valid]
-    if not len(boxes):
+def postprocess(outputs, scale, pad, orig_shape):
+    """Postprocess matching ultralytics non_max_suppression() exactly.
+
+    Args:
+        outputs: std ONNX — один tensor (1, 4+nc, total_grid) decoded xywh+sigmoid;
+                 RK-opt/RKNN — per-stride [box_dist, cls_sigmoid, sm].
+        scale: letterbox scale factor
+        pad: (pad_w, pad_h) total padding
+        orig_shape: (orig_h, orig_w)
+    Returns:
+        list of dicts with bbox, score, class_id, class_name
+    """
+    orig_h, orig_w = orig_shape
+    single_output = (len(outputs) == 1 and outputs[0].ndim == 3
+                     and outputs[0].shape[1] == 4 + NUM_CLASSES)
+    if single_output:
+        pred = outputs[0][0].astype(np.float32)  # (4+nc, total)
+        pred[:4] = xywh2xyxy(pred[:4].T).T
+        pred = pred.T                            # (total, 4+nc)
+    else:
+        pred = _decode_per_stride(outputs)
+
+    # Step 1: confidence filter (max class score > CONF_THRESH)
+    xc = pred[:, 4:4 + NUM_CLASSES].max(axis=1) > CONF_THRESH
+    pred = pred[xc]
+    if len(pred) == 0:
         return []
 
-    bw = boxes[:, 2] - boxes[:, 0]
-    bh = boxes[:, 3] - boxes[:, 1]
-    valid = (bw >= MIN_WH) & (bh >= MIN_WH)
-    boxes, scores, cls_ids = boxes[valid], scores[valid], cls_ids[valid]
-    if not len(boxes):
+    box = pred[:, :4]
+    cls = pred[:, 4:4 + NUM_CLASSES]
+
+    # Step 2: multi_label=True — expand each box by each class above conf
+    i, j = np.where(cls > CONF_THRESH)
+    if len(i) == 0:
         return []
 
-    keep = nms(boxes, scores, IOU_THRESH)
-    boxes, scores, cls_ids = boxes[keep], scores[keep], cls_ids[keep]
-    keep = dedup(boxes, scores, cls_ids)
-    boxes, scores, cls_ids = boxes[keep], scores[keep], cls_ids[keep]
+    # (M, 6): [x1, y1, x2, y2, confidence, class_id]
+    x = np.column_stack([
+        box[i],                      # (M, 4) — repeated boxes
+        cls[i, j, None],             # (M, 1) — per-class confidence
+        j[:, None].astype(np.float32),  # (M, 1) — class IDs
+    ])
 
+    # Step 3: sort by confidence, cap at max_nms
+    if x.shape[0] > MAX_NMS:
+        filt = x[:, 4].argsort()[::-1][:MAX_NMS]
+        x = x[filt]
+
+    # Step 4: class-aware NMS — offset boxes by class_id * max_wh
+    c = x[:, 5:6] * MAX_WH
+    boxes_nms = x[:, :4] + c
+    keep = nms(boxes_nms, x[:, 4], IOU_THRESH)
+    keep = keep[:MAX_DET]
+    x = x[keep]
+
+    # Step 5: reverse letterbox — model coords → original image coords
+    pad_left = round(pad[0] / 2 - 0.1)
+    pad_top = round(pad[1] / 2 - 0.1)
+    gain = scale
+    x[:, 0] = (x[:, 0] - pad_left) / gain
+    x[:, 1] = (x[:, 1] - pad_top) / gain
+    x[:, 2] = (x[:, 2] - pad_left) / gain
+    x[:, 3] = (x[:, 3] - pad_top) / gain
+
+    # Step 6: clip to image bounds (skip in EVAL_PRECISE — ultralytics doesn't clip)
+    if not EVAL_PRECISE:
+        x[:, [0, 2]] = np.clip(x[:, [0, 2]], 0, orig_w)
+        x[:, [1, 3]] = np.clip(x[:, [1, 3]], 0, orig_h)
+
+    # Step 7: format output
     results = []
-    for i in range(len(boxes)):
-        x1_i, y1_i, x2_i, y2_i = boxes[i].astype(int).tolist()
-        c = int(cls_ids[i])
-        results.append({
-            "bbox": [x1_i, y1_i, x2_i, y2_i],
-            "score": float(scores[i]),
-            "class_id": c,
-            "class_name": COCO_CLASSES[c] if c < len(COCO_CLASSES) else str(c),
-        })
+    for row in x:
+        x1, y1, x2, y2, conf, cls_id = row
+        c = int(cls_id)
+        if EVAL_PRECISE:
+            results.append({
+                "bbox": [float(x1), float(y1), float(x2), float(y2)],
+                "score": float(conf),
+                "class_id": c,
+                "class_name": COCO_CLASSES[c] if c < len(COCO_CLASSES) else str(c),
+            })
+        else:
+            results.append({
+                "bbox": [int(x1), int(y1), int(x2), int(y2)],
+                "score": float(conf),
+                "class_id": c,
+                "class_name": COCO_CLASSES[c] if c < len(COCO_CLASSES) else str(c),
+            })
     return results
 
 
@@ -176,7 +218,7 @@ def visualize(frame, objects):
         color = colors[i % len(colors)]
         score = obj["score"]
         label = f"{obj['class_name']}: {score:.2f}"
-        cv2.rectangle(frame, (x1, y1), (x2, y2), color, thick)
-        cv2.putText(frame, label, (x1, y1 - 5),
+        cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), color, thick)
+        cv2.putText(frame, label, (int(x1), int(y1) - 5),
                     cv2.FONT_HERSHEY_SIMPLEX, fs, color, fthick)
     return frame
