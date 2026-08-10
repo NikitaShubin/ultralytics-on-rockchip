@@ -75,12 +75,15 @@ RKNN-деплой отложен по решению пользователя. �
   Метрики при этом НЕ меняются.
 
 ### Инфраструктура docker
-- **docker работает без sudo** (группа docker). Рабочий контейнер `segsmoke`
-  (`percept-converter:latest`, torch 2.2.0, ultralytics 8.4.105), запуск:
-  `docker run -d --name segsmoke --entrypoint sleep --memory=4g -v /home/orangepi/work/percept:/app -w /app percept-converter:latest infinity`
-  (у образа ENTRYPOINT=convert.py — без `--entrypoint sleep` контейнер падает). Прогон: `docker exec -d segsmoke sh -c '... > /app/cache/_xxx.log 2>&1'`
-  (bash-инструмент таймаутит 120s и убивает фоновые процессы; `-d` + лог в bind-папке cache/ — единственный паттерн).
+- **docker работает без sudo** (группа docker). Ad-hoc команды (eval, smoke-тесты)
+  гонять через convert-сервис (тот же `percept-converter:latest`, NPU-доступ):
+  `docker compose -f convert/docker-compose.yml run --rm --entrypoint python convert <script> ...`
+  (у образа ENTRYPOINT=convert.py — для произвольных команд нужен `--entrypoint`).
+  Фоновые прогоны: `nohup ... > /tmp/xxx.log 2>&1` или `docker exec -d` в одноразовом
+  контейнере, запущенном `docker compose run`; лог — в bind-папке cache/.
+  (bash-инструмент таймаутит 120s и убивает фоновые процессы — запускать через tmux).
   Контейнер `percept` (percept-percept) НЕ подходит (нет ultralytics).
+  **segsmoke УДАЛЁН (2026-08-11)** — был дублем convert-сервиса.
 
 ### Important Details
 - **System freezes under sustained CPU load** (even 2 containers) due to 8GB RAM exhaustion + thermal throttling. Workaround: run 1 container at a time with `--memory=4g` or for eval use `--limit 500`.

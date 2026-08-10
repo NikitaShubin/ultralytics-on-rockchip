@@ -178,7 +178,7 @@ deploy.sh <model> --fp16|--int8|--onnx
 Детали:
 - Путь B работает: `YOLO(pt).export(format='rknn', quantize=8, data=coco128.yaml)` → создаёт
   `cache/yolo11n/yolo11n_rknn_model/` (metadata.yaml `quantize: 8`, `end2end: false`,
-  RKNNBackend денормирует координаты по imgsz). `.val()` на NPU (контейнер segsmoke) работает.
+  RKNNBackend денормирует координаты по imgsz). `.val()` на NPU (convert-контейнер) работает.
 - **Нативный export B ЗАТИРАЕТ `cache/yolo11n/yolo11n.onnx`** (создаёт ONNX рядом с .pt,
   конвертит в RKNN и удаляет его) — RK-opt ONNX пришлось перегенерировать
   (`export_onnx_only`, 9 per-stride выходов).
@@ -186,8 +186,9 @@ deploy.sh <model> --fp16|--int8|--onnx
   preds только через нашу inmem-метрику.
 - rknn-toolkit2 2.3.2: `do_quantization=True` без `calib_dir` → `rknn.build не удался: -1`
   (датасет обязателен для INT8); наш `_build_rknn` берёт `calib_dir=coco128/images/train2017`.
-- Контейнер segsmoke: NPU доступ через `--privileged` + `-v /proc/device-tree/compatible`
-  + `--network host` + `-v /dev:/dev:rw`.
+- convert-контейнер: NPU доступ через `--privileged` + `-v /proc/device-tree/compatible`
+  + `--network host` (см. convert/docker-compose.yml). Бывший ad-hoc контейнер segsmoke
+  удалён как дубль convert-сервиса.
 - **БАГ logging**: импорт `rknnlite.api` перезаписывает `logging._nameToLevel` → torch падает
   `Unknown level: 'WARNING'`. Фикс в `percept/inference/__init__.py::_load_rknn` (save/restore).
 - **БАГ pycoco в eval.py**: `detections_to_coco` занижает map50 в ~4 раза (0.145 vs inmem 0.64)
