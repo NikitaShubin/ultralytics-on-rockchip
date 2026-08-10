@@ -157,6 +157,11 @@ RKNN-деплой отложен по решению пользователя. �
   (8.4.105): пока образ не пересобран с новой версией — ничего не сломается.
 
 ### Active
+- **Фикс склейки JSON fps_bench (2026-08-11)**: rknnlite пишет в stdout без trailing \n
+  (I RKNN: ...), JSON-результат приклеивался к RKNN-строке → benchmark.py не находил строку
+  с `{` → fps записывались как -1. Фикс: `run_fps` ищет `rfind('{"model"')` + `raw_decode`,
+  fps_bench печатает `'\n'+json+\n'` + flush. Результаты yolo26n (повторы=3, conf=0.25):
+  cpu=5.08, fp16=13.0 (NPU 17.3%/CPU 23.4%), int8=17.69 (15.0/26.5%), int8-calib=17.68 (14.4/27.1%).
 - **Resume-логика convert (2026-08-10)**: `benchmark/benchmark.py --phase convert` проверяет ВСЕ нужные
   варианты (onnx/fp16/int8/int8-calib), а не только `_fp16.rknn` — отсутствующий int8 теперь ДОСОБИРАЕТСЯ
   через `convert_bench.py`, а не тихо пропускается. `convert_bench.py` переведён на кеширующий
