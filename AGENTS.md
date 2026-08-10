@@ -117,6 +117,24 @@ RKNN-деплой отложен по решению пользователя. �
 - **detect eval mode**: now sets `MIN_WH=1, MAX_DET=300, DEDUP_ENABLED=False` to match ultralytics postprocessing. Previously `MIN_WH=40` filtered small objects.
 - **`load_yolo_as_coco` keypoints**: now extracts 17 keypoints (x,y,v) from YOLO pose labels (56-value format: `class cx cy w h x1 y1 v1 ... x17 y17 v17`). Previously ignored keypoints entirely — caused pose eval to return all -1.0.
 - **col1 падал с "Dataset ... images not found, missing path .../convert/datasets/coco8/images/val"**: `datasets/coco8` был симлинком на абсолютный хостовый путь → внутри контейнера битый. **Фикс**: заменить симлинк на реальную копию. УРОК: в `datasets/` не должно быть симлинков на абсолютные хостовые пути — только реальные директории.
+- **Parallel NMS в eval.py (2026-08-10)**: полный eval fp16/onnx на 5000 кадров упирался в
+  torchvision NMS на 30000 кандидатов: при conf=0.001 fp16-шум > 0.001 → expand даёт 672000 кандидатов
+  → NMS = **1.35с/кадр** на ARM (у ultralytics `.val()` ТО ЖЕ САМОЕ — тот же `torchvision.ops.nms`
+  на тех же 30000; int8 быстрый, т.к. квантование обнуляет шум). **Фикс**: детект-ветка eval.py
+  переведена на конвейер — infer (NPU) последовательно в главном потоке, pre-NMS шаги
+  (decode/expand/sort) там же, NMS+reverse+format — в `ThreadPoolExecutor` по числу "больших" ядер
+  (`_big_core_count()` — авто через `/sys/devices/system/cpu/cpu*/cpufreq/cpuinfo_max_freq`, на RK3588 = 4×A76;
+  8 воркеров ХУЖЕ из-за 4×A55: замер 4=11.8с vs 8=17.2с на 8 кадрах). torchvision NMS освобождает GIL →
+  потоки дают реальный параллелизм. Ускорение: 1500→507мс/кадр (2.7x, 93% от теоретического предела
+  для 4 ядер), полный fp16 eval yolo26n = **42 мин** вместо ~2ч. Результаты байт-в-байт совпадают с
+  шаблонным `postprocess` (сверка в prof_one_frame.py: OK). `_detect_pre_nms`/`_detect_nms_finish` —
+  точная копия шагов detect_postprocess.py:137-203. Батч-инференс не встроен (см. ниже).
+- **Эксперимент батч-инференса (2026-08-10)**: `benchmark/prof_batch_infer.py` собрал std ONNX batch=8
+  → RKNN fp16 static [8,3,640,640] (в /tmp/bs8_test_*, рабочие файлы НЕ тронуты) и замерил на реальном
+  NPU: bs8×1 = 470ms на 8 кадров vs bs1×8 = 649ms → **1.38x** на yolo26n (nano — NPU недогружен и на
+  batch-1; для x-линейки, где NPU насыщен, прирост больше). Для eval батч дал бы лишь ~1.4x сверху
+  (NMS-пул всё равно доминирует ~340мс/кадр); в продакшене (conf=0.25) полезнее: infer 81→59ms/кадр.
+  Конвертер под батч НЕ переделывали.
 
 ### Interleaved runner — исправленные баги (2026-08-08)
 (1) **nms-мутация std_raw**: `_nms_det` без `.copy()` портил буфер std_raw (xywh→xyxy инплейс) → col2 постпроцесс ломался. Фикс `.copy()` в run_3way_eval.py:678. (2) **'masks' vs 'masks_160'**: canon_col1 писал 'masks', а canon_objs/_seg_tp_per_image/compare_preds ждали 'masks_160' → KeyError. Унифицировано на 'masks_160'. (3) **segment/pose постпроцессы клипали bbox ВСЕГДА** (не под `if not EVAL_PRECISE` как detect) → col1 vs col2 bbox diff. Фикс в шаблонах `convert/templates/{segment,pose}_postprocess.py` + патч сгенерированных кэш-файлов. (4) **semantic-ветка** использовала постпроцесс (возвращает orig-пространство) при GT в letterboxed → TypeError 'dict'; переведена на raw argmax (`raw[0][0].argmax(0)`) как eval.py (run_3way_eval.py:633-647).
@@ -160,8 +178,11 @@ RKNN-деплой отложен по решению пользователя. �
   obb input 1024 → grid [128,64,32]).
 
 ### Next Move
-1. **Запустить полноценный бенчмарк yolo26n.pt** (команда дана пользователю). Еval-фаза на eval.py
-   (onnx→cpu, fp16/int8/int8-calib→npu реальный), `results.json['eval']` — dict по вариантам.
+1. **Полный бенчмарк yolo26n-det** — планируется: `cd benchmark && python3 benchmark.py --phase all --model yolo26n`.
+   Полный eval **fp16** (5000, NPU) уже завершён напрямую eval.py (42 мин): map50=0.568, map50_95=0.408
+   (эталон на onnx-вариант benchmark.py возьмёт из eval.py onnx/cpu). Осталось прогнать
+   onnx(cpu)/int8/int8-calib варианты + validate/bench фазы. Оценка: ~3-4ч суммарно (все варианты
+   с параллельным NMS по ~45 мин каждый).
 2. **Interleaved runner**: smoke-тесты всех 6 задач ПРОЙДЕНЫ (col1==col2==col3, diverged=0).
    Полные прогоны (limit 500/5000) — по желанию пользователя.
 3. **YOLO26/YOLO12/YOLO11 3-way ЗАВЕРШЕНЫ** — см. PLAN.md. RKNN-деплой (int8) — отложен по решению пользователя.
@@ -179,4 +200,5 @@ RKNN-деплой отложен по решению пользователя. �
 - `benchmark/run_3way_eval.py` — interleaved-режим: один цикл по кадрам (col1 nms / col2 std / col3 rko), `compare_preds` с допусками, инкрементальные tp-агрегаты, diverged-список; результат в `cache/3way_results/<model>-<task>_interleaved.json`; флаги `--limit/--force/--save-diverged/--diverged-dir`
 - `benchmark/export_std_onnx.py` — штатный экспорт std ONNX на нативном imgsz (без override) + перегенерация postprocess
 - `percept/inference/__init__.py`: `/255.0` moved from `infer()` to default letterbox path only
-- `benchmark/eval.py`: MIN_WH=1/MAX_DET=300/DEDUP_ENABLED=False в eval mode; `compute_inmemory_box_map`, `compute_inmemory_pose_map` (GT=orig_px*scale+pad), `compute_inmemory_obb_map` + `xyxyxyxy2xywhr_np`, `compute_inmemory_seg_map` (polygons2masks_overlap + декод + gt_cls[order]); EVAL_DUMP_PREDS→`benchmark/dump_preds.pkl`; ветка detect/pose/segment собирает preds_by_img/scales_pads; **per-image tp-функции `_box/_pose/_seg/_obb_tp_per_image` + `_ap_finalize(prefix=...)`, `_seg_finalize` — обёртка над `_ap_finalize` (2026-08-08)**; `load_yolo_as_coco` возвращает 4 значения (`images, ann_by_img, cat_ids, tmp.name`)
+- `benchmark/eval.py`: MIN_WH=1/MAX_DET=300/DEDUP_ENABLED=False в eval mode; `compute_inmemory_box_map`, `compute_inmemory_pose_map` (GT=orig_px*scale+pad), `compute_inmemory_obb_map` + `xyxyxyxy2xywhr_np`, `compute_inmemory_seg_map` (polygons2masks_overlap + декод + gt_cls[order]); EVAL_DUMP_PREDS→`benchmark/dump_preds.pkl`; ветка detect/pose/segment собирает preds_by_img/scales_pads; **per-image tp-функции `_box/_pose/_seg/_obb_tp_per_image` + `_ap_finalize(prefix=...)`, `_seg_finalize` — обёртка над `_ap_finalize` (2026-08-08)**; `load_yolo_as_coco` возвращает 4 значения (`images, ann_by_img, cat_ids, tmp.name`); **parallel NMS конвейер в detect-ветке (2026-08-10)**: `_detect_pre_nms` + `_detect_nms_finish` + `_big_core_count()`, NMS в ThreadPool по числу "больших" ядер, infer последовательно — полный fp16 eval yolo26n 5000 кадров за 42 мин (2.7x)
+- `benchmark/prof_one_frame.py` — поэтапный профиль 1 кадра (letterbox/pre-NMS/NMS/finish) + сверка конвейерной пары == шаблонный postprocess (OK); `benchmark/prof_nms.py` — torchvision vs ultralytics NMS на 30000 кандидатов; `benchmark/prof_nms_parallel.py` — ThreadPool (4) vs ProcessPool (8) vs sequential; `benchmark/prof_batch_infer.py` — RKNN батч-8 vs bs1×8 на реальном NPU (1.38x)
