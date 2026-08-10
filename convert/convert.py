@@ -784,7 +784,7 @@ def _generate_postprocess(info, dst_dir):
         "COCO_CLASSES": json.dumps(class_names),
         "REG_MAX": str(info.get("reg_max", 16)),
         "BIN_COUNT": "4",
-        "CONF_THRESH": "0.25" if low_thresh else "0.5",
+        "CONF_THRESH": "0.25",
         "IOU_THRESH": "0.7",
         "NO_DFL": "True" if is_nodfl else "False",
         "ANGLE_SIGMOID": "False" if is_obb26 else "True",
