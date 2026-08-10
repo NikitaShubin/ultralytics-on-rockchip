@@ -54,7 +54,8 @@ IMAGENET_VAL_DIR = PROJECT_DIR / 'datasets' / 'imagenet'
 IMAGENET_VAL_CONTAINER = '/app/datasets/imagenet'
 
 WARMUP_S = int(os.environ.get('BENCH_WARMUP', '10'))
-MEASURE_S = int(os.environ.get('BENCH_MEASURE', '20'))
+MEASURE_S = int(os.environ.get('BENCH_MEASURE', '30'))
+BENCH_REPEATS = int(os.environ.get('BENCH_REPEATS', '3'))
 CONVERT_TIMEOUT = int(os.environ.get('BENCH_CONVERT_TIMEOUT', '7200'))
 EVAL_TIMEOUT = int(os.environ.get('BENCH_EVAL_TIMEOUT', '14400'))
 QUANTIZE = os.environ.get('BENCH_QUANTIZE', 'all')
@@ -323,13 +324,14 @@ def run_fps(model_name: str, task: str, cache_dir: Path, data_dir: Path,
         '--data-dir', data_path,
         '--warmup', str(WARMUP_S),
         '--measure', str(MEASURE_S),
+        '--repeats', str(BENCH_REPEATS),
         '--quantize', quantize,
     ]
-    log(f'ЗАПУСК: {" ".join(cmd[:-8])} ...')
+    log(f'ЗАПУСК: {" ".join(cmd[:-9])} ...')
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=1200)
     except subprocess.TimeoutExpired:
-        log(f'[ОШИБКА] FPS-тест превысил таймаут 600с')
+        log(f'[ОШИБКА] FPS-тест превысил таймаут 1200с')
         return None
 
     if result.stdout:
@@ -343,14 +345,14 @@ def run_fps(model_name: str, task: str, cache_dir: Path, data_dir: Path,
         log(f'[ОШИБКА] percept завершился с кодом {result.returncode}')
         return None
 
-    for line in reversed(result.stdout.strip().split('\n')):
-        line = line.strip()
-        if line.startswith('{'):
-            try:
-                return json.loads(line)
-            except json.JSONDecodeError:
-                continue
-    return None
+    marker = '{"model"'
+    idx = result.stdout.rfind(marker)
+    if idx < 0:
+        return None
+    try:
+        return json.JSONDecoder().raw_decode(result.stdout[idx:])[0]
+    except json.JSONDecodeError:
+        return None
 
 
 # ---------------------------------------------------------------------------

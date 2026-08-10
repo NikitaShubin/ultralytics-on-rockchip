@@ -236,6 +236,25 @@ def benchmark_backend(
     }
 
 
+def _bench_median(repeats: int, bench_fn) -> dict:
+    """Запустить benchmark_backend `repeats` раз, вернуть повтор с медианным fps.
+
+    Медиана устойчива к редким выбросам (фоновая нагрузка, редкий медленный
+    кадр) — при коротких замерах (15-30с) разброс между повторами ~±8%.
+    """
+    runs = []
+    for _ in range(max(1, repeats)):
+        runs.append(bench_fn())
+    fps_list = [r['fps'] for r in runs]
+    fps_list_sorted = sorted(fps_list)
+    med = fps_list_sorted[len(fps_list_sorted) // 2]
+    chosen = next(r for r in runs if r['fps'] == med)
+    chosen['fps_min'] = min(fps_list)
+    chosen['fps_max'] = max(fps_list)
+    chosen['n_repeats'] = len(fps_list)
+    return chosen
+
+
 def main() -> None:
     """Основная функция бенчмарка."""
     parser = argparse.ArgumentParser()
@@ -244,7 +263,9 @@ def main() -> None:
     parser.add_argument('--temp-dir', default='/app/benchmark/temp_models', help='Директория с моделями')
     parser.add_argument('--data-dir', default='/app/datasets/coco_val2017/images/val2017', help='Директория тестовых изображений')
     parser.add_argument('--warmup', type=int, default=10, help='Секунды прогрева')
-    parser.add_argument('--measure', type=int, default=20, help='Секунды измерения')
+    parser.add_argument('--measure', type=int, default=20, help='Секунды измерения на повтор')
+    parser.add_argument('--repeats', type=int, default=1,
+                        help='Сколько раз повторить каждый вариант (возвращается медиана fps)')
     parser.add_argument('--quantize', choices=['onnx', 'none', 'int8', 'int8-calib', 'all'], default='all',
                         help='Какие варианты тестировать: onnx=только CPU, none=FP16, int8=INT8, int8-calib=INT8 с калибровкой, all=все')
     args = parser.parse_args()
@@ -295,15 +316,16 @@ def main() -> None:
     has_onnx = (temp_dir / f'{args.model_name}.onnx').exists() or (temp_dir / 'model.onnx').exists()
     if has_onnx and args.quantize in ('onnx', 'all'):
         try:
-            sys.stderr.write(f'[ИНФО] бенчмарк ONNX CPU...\n')
-            bench = benchmark_backend(
+            sys.stderr.write(f'[ИНФО] бенчмарк ONNX CPU (repeats={args.repeats})...\n')
+            bench = _bench_median(args.repeats, lambda: benchmark_backend(
                 args.model_name, args.temp_dir, images, Backend.CPU,
                 rknn_suffix='',
                 warmup_sec=args.warmup, measure_sec=args.measure,
                 collect_npu_load=False, collect_cpu_load=False,
-            )
+            ))
             sys.stderr.write(f'[ИНФО] ONNX CPU FPS={bench["fps"]} '
-                             f'(n={bench["n_frames"]}, {bench["elapsed_s"]}с)\n')
+                             f'(n={bench["n_frames"]}, {bench["elapsed_s"]}с, '
+                             f'min={bench.get("fps_min")}, max={bench.get("fps_max")})\n')
             results['cpu'] = bench
         except Exception as e:
             import traceback
@@ -317,16 +339,17 @@ def main() -> None:
     # RKNN варианты на NPU
     for suffix, label in rknn_variants:
         try:
-            sys.stderr.write(f'[ИНФО] бенчмарк {label}...\n')
-            bench = benchmark_backend(
+            sys.stderr.write(f'[ИНФО] бенчмарк {label} (repeats={args.repeats})...\n')
+            bench = _bench_median(args.repeats, lambda s=suffix, l=label: benchmark_backend(
                 args.model_name, args.temp_dir, images, Backend.NPU,
-                rknn_suffix={'none': '_fp16', 'int8': '_int8', 'int8-calib': '_int8-calib'}.get(suffix, ''),
+                rknn_suffix={'none': '_fp16', 'int8': '_int8', 'int8-calib': '_int8-calib'}.get(s, ''),
                 warmup_sec=args.warmup, measure_sec=args.measure,
                 collect_npu_load=True, collect_cpu_load=True,
-            )
+            ))
             sys.stderr.write(f'[ИНФО] {label} FPS={bench["fps"]} '
                              f'(n={bench["n_frames"]}, {bench["elapsed_s"]}с, '
-                             f'NPU={bench["npu_load_avg"]}%, CPU={bench["cpu_load_avg"]}%)\n')
+                             f'NPU={bench["npu_load_avg"]}%, CPU={bench["cpu_load_avg"]}%, '
+                             f'min={bench.get("fps_min")}, max={bench.get("fps_max")})\n')
             results[f'npu_{suffix}'] = bench
         except Exception as e:
             import traceback
@@ -339,7 +362,9 @@ def main() -> None:
         # Уже запущены все варианты выше
         pass
 
-    print(json.dumps(results))
+    sys.stdout.flush()
+    sys.stdout.write('\n' + json.dumps(results) + '\n')
+    sys.stdout.flush()
 
 
 if __name__ == '__main__':
