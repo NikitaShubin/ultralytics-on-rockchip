@@ -62,6 +62,15 @@ class ModelBackend:
             model_path = self.model_dir / 'model.rknn'
         if not model_path.exists():
             raise RuntimeError(f'Модель RKNN не найдена: {model_path}')
+
+        # Импорт rknnlite/rknn-toolkit2 перезаписывает logging._nameToLevel/_levelToName
+        # (уровни → односимвольные 'C','E','W','I','D'), что ломает последующий
+        # импорт torch (Unknown level: 'WARNING'). Сохраняем стандартные таблицы
+        # ДО импорта RKNN и восстанавливаем после всех его вызовов.
+        import logging as _logging
+        _name_to_level = dict(_logging._nameToLevel)
+        _level_to_name = dict(_logging._levelToName)
+
         try:
             from rknnlite.api import RKNNLite
             self._lite = True
@@ -97,6 +106,10 @@ class ModelBackend:
                 ret = self.rknn.init_runtime()
         if ret != 0:
             raise RuntimeError(f'Не удалось инициализировать runtime: {ret}')
+        _logging._nameToLevel.clear()
+        _logging._nameToLevel.update(_name_to_level)
+        _logging._levelToName.clear()
+        _logging._levelToName.update(_level_to_name)
         self._detect_input_size_from_onnx()
         log.info('модель загружена (RKNN%s) модель=%s суффикс=%s input_size=%s',
                  '' if self._lite else ' x86-эмулятор',

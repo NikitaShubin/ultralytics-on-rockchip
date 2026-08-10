@@ -929,6 +929,30 @@ def evaluate(task: str, data_dir: str, model_dir: str = '/app/model',
             post_mod.EVAL_PRECISE = True
         sys.stderr.write(f'[EVAL] eval_mode: CONF_THRESH=0.001, IOU_THRESH=0.7 MIN_WH=1 MAX_DET=300 DEDUP=OFF\n')
 
+        # Fast NMS: RKNN-квантование даёт шум в cls_scores → при conf=0.001
+        # сотни тысяч кандидатов → numpy-цикл NMS = секунды на кадр.
+        # Используем torchvision.ops.nms (C++, тот же greedy, что у col1/ultralytics),
+        # если torch доступен; иначе fallback на numpy. Продакшен-рантайм не трогаем.
+        if hasattr(post_mod, 'nms'):
+            _orig_nms = post_mod.nms
+            try:
+                import torch
+                import torchvision
+                _tv_nms = torchvision.ops.nms
+            except ImportError:
+                _tv_nms = None
+            if _tv_nms is not None:
+                def _fast_nms(boxes, scores, iou_threshold):
+                    try:
+                        tb = torch.from_numpy(np.ascontiguousarray(boxes, dtype=np.float32))
+                        ts = torch.from_numpy(np.ascontiguousarray(scores, dtype=np.float32))
+                        keep = _tv_nms(tb, ts, iou_threshold)
+                        return keep.numpy().astype(np.int64)
+                    except Exception:
+                        return _orig_nms(boxes, scores, iou_threshold)
+                post_mod.nms = _fast_nms
+                sys.stderr.write('[EVAL] fast NMS: torchvision.ops.nms (fallback: numpy)\n')
+
     # Загрузка датасета
     ann_file = None
     tmp_ann_file = None

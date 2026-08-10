@@ -65,6 +65,10 @@ deploy.sh <model> --fp16|--int8|--onnx
 - Полные interleaved-прогоны (limit 500/5000) для части задач — по желанию.
 - Регрессия конвертера (mini-метрики на конвертерных файлах) — по желанию.
 
+### 3.4 INT8 эксперимент (2026-08-09)
+- **ЗАВЕРШЁН** (Этап H): наш RK-opt путь теряет при INT8 ~1%, нативный ultralytics
+  8.4.116 (`_NormalizeCoords`) — ~20%. Миграция на вариант B не нужна.
+
 ## 4. РАБОТА ПО ЭТАПАМ
 
 ### Этап A. Синхронизация шаблонов конвертера с доказанной логикой (ЗАВЕРШЕН)
@@ -127,6 +131,49 @@ deploy.sh <model> --fp16|--int8|--onnx
   YOLO12n: стандартная голова Detect (reg_max=16, DFL, end2end=False, выход [1,84,8400]) —
   RK-opt патчи и шаблоны yolo11 подошли БЕЗ изменений; отличие только в backbone (A2C2f attention).
   Официальных весов yolo12 для seg/pose/obb/cls НЕТ (только detect n/s/m/l/x) — yolo12 ограничен detect.
+
+### Этап H. INT8 сравнение: наш RK-opt путь vs нативный ultralytics 8.4.116 (2026-08-09)
+
+Причина: ультралитикс добавил `_NormalizeCoords` (нормировка xywh на размер входа при
+`format=='rknn' and quantize==8`), чтобы пер-тензорный INT8 scale не давил class-scores.
+Спросили: не решили ли они нашу проблему лучше (мигрировать на вариант B?).
+
+**Эксперимент: yolo11n detect, coco128 (smoke) + полный val2017 (5000 imgs), только int8.**
+
+Итоговые цифры (метрика — inmem, доказано эквивалентна их `.val()`, проверено: std ONNX
+0.6744 в обоих):
+
+| Путь | fp32 | int8 | потеря точности |
+|---|---|---|---|
+| A (наш RK-opt: декодирование вне графа, per-stride) | 0.523 | **0.518** | **~1%** |
+| B (нативный 8.4.116: `_NormalizeCoords` + RKNNBackend денормировка) | 0.542 | **0.435** | **~20%** |
+
+**ВЫВОД: наш RK-opt путь сохраняет точность INT8 в ~20 раз лучше, чем `_NormalizeCoords`.**
+Абсолютная INT8 точность выше (0.518 vs 0.435) несмотря на то, что наш fp32-базлайн
+немного ниже (0.523 vs 0.542). **Миграция на вариант B НЕ нужна** — их фикс заметно хуже.
+
+Детали:
+- Путь B работает: `YOLO(pt).export(format='rknn', quantize=8, data=coco128.yaml)` → создаёт
+  `cache/yolo11n/yolo11n_rknn_model/` (metadata.yaml `quantize: 8`, `end2end: false`,
+  RKNNBackend денормирует координаты по imgsz). `.val()` на NPU (контейнер segsmoke) работает.
+- **Нативный export B ЗАТИРАЕТ `cache/yolo11n/yolo11n.onnx`** (создаёт ONNX рядом с .pt,
+  конвертит в RKNN и удаляет его) — RK-opt ONNX пришлось перегенерировать
+  (`export_onnx_only`, 9 per-stride выходов).
+- Их `.val()` не обрабатывает RK-opt per-stride выходы (IndexError) — прямое сравнение
+  preds только через нашу inmem-метрику.
+- rknn-toolkit2 2.3.2: `do_quantization=True` без `calib_dir` → `rknn.build не удался: -1`
+  (датасет обязателен для INT8); наш `_build_rknn` берёт `calib_dir=coco128/images/train2017`.
+- Контейнер segsmoke: NPU доступ через `--privileged` + `-v /proc/device-tree/compatible`
+  + `--network host` + `-v /dev:/dev:rw`.
+- **БАГ logging**: импорт `rknnlite.api` перезаписывает `logging._nameToLevel` → torch падает
+  `Unknown level: 'WARNING'`. Фикс в `percept/inference/__init__.py::_load_rknn` (save/restore).
+- **БАГ pycoco в eval.py**: `detections_to_coco` занижает map50 в ~4 раза (0.145 vs inmem 0.64)
+  на coco128; на полном val2017 расхождение меньше (0.532 vs 0.523). inmem-метрика валидна.
+
+Открытая аномалия: наш RK-opt fp32 (0.523) на ~3.5% ниже std (0.542) на полном val2017
+(на coco128: 0.64 vs 0.6744, -5%), хотя ранее доказывалась байт-в-байт эквивалентность
+col1/col2/col3 для yolo11n detect. Возможная причина — RK-opt ONNX после force-перегенерации
+или разные конфиги eval. Требует проверки (interleaved col2 vs col3).
 
 ### Этап G. Sweep nano-моделей от версии 3 (ЗАВЕРШЕН)
 Причина: пользователь хотел проверить эквивалентность всех непроверенных nano-моделей,

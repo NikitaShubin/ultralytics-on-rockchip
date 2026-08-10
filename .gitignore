@@ -55,6 +55,10 @@ results/
 # Ultralytics val artifacts (root-level runs/ from col1)
 runs/
 
+# Root-level model weights cache (resolve_pt on-demand download)
+*.pt
+*.onnx
+
 # Test images (user data)
 test/*_pred.jpg
 test/*_preview.jpg
@@ -75,6 +79,7 @@ datasets/coco_seg/
 datasets/mini_seg26/
 # Mini-datasets (auto-downloaded by setup_datasets.py --mini / ensure_mini_dataset)
 datasets/coco128/
+datasets/coco128.yaml
 datasets/coco128-seg/
 datasets/coco8-pose/
 datasets/coco8-seg/

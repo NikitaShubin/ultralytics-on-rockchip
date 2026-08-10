@@ -13,6 +13,7 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -641,140 +642,35 @@ def export_onnx_only(pt_path):
     return onnx_path
 
 
-def export_and_compile(pt_path, info=None, quantize="fp16"):
-    """Экспорт .pt → ONNX → RKNN.
+def _calib_img_dir(data_root: Path) -> Path:
+    """Найти каталог с изображениями внутри датасета для калибровки RKNN.
 
-    Возвращает (onnx_path, rknn_path).
+    Обходит рекурсивно (coco128: images/train2017, coco8-pose: images/train,
+    imagenet: вложенные каталоги классов). Возвращает каталог первого .jpg.
     """
-    apply_patches()
-    from ultralytics import YOLO
-    model = YOLO(pt_path)
-
-    for m in model.model.modules():
-        m._rknn_mode = True
-        # yolo26 end2end: fuse() иначе удаляет cv2/cv3 (one2many) и оставляет one2one —
-        # RK-opt получил бы другие головы, чем std. Экспортируем всегда с one2many.
-        if hasattr(m, "end2end"):
-            m.end2end = False
-    if hasattr(model, "end2end"):
-        model.end2end = False
-
-    is_rtdetr = info and info.get("is_rtdetr", False)
-    opset = 16 if is_rtdetr else 12
-    log(f"ONNX opset {opset}")
-
-    export_kwargs = {"format": "rknn", "opset": opset}
-    if quantize == "int8-calib":
-        task = info.get("task", "detect") if info else "detect"
-        _ensure_dataset(task)
-        data_yaml = _make_calib_yaml(task)
-        export_kwargs["data"] = data_yaml
-        export_kwargs["quantize"] = 8
-        log(f"INT8 с калибровкой: задача={task}, датасет={_dataset_name(task)}")
-    elif quantize == "int8":
-        log("INT8 без калибровки")
-        export_kwargs["quantize"] = 8
-
-    t0 = time.time()
-    log("Запуск model.export() ...")
-    rknn_dir = model.export(**export_kwargs)
-    log(f"model.export() завершён за {time.time() - t0:.0f}с")
-
-    rknn_dir_path = Path(rknn_dir)
-    model_stem = Path(pt_path).stem
-    pt_dir = Path(pt_path).parent
-
-    onnx_path = None
-    for c in [str(pt_dir / f"{model_stem}.onnx"), f"{model_stem}.onnx"]:
-        if os.path.exists(c):
-            onnx_path = str(Path(c).resolve())
-            break
-    if not onnx_path:
-        onnx_paths = list(Path(".").glob("*.onnx"))
-        onnx_path = str(onnx_paths[-1].resolve()) if onnx_paths else None
-
-    rknn_files = sorted(rknn_dir_path.glob("*.rknn"), key=os.path.getmtime, reverse=True)
-    rknn_path = str(rknn_files[0].resolve()) if rknn_files else str(Path(rknn_dir).resolve())
-
-    if onnx_path:
-        log(f"ONNX: {onnx_path}")
-    log(f"RKNN: {rknn_path}")
-
-    if quantize == "int8-calib":
-        _log_dataset_txt()
-
-    return onnx_path, rknn_path
-
-
-def export_and_compile_all(pt_path, info=None):
-    """Экспорт .pt → ONNX → RKNN (fp16 + int8 + int8-calib).
-
-    Возвращает (onnx_path, rknn_fp16_path, rknn_int8_path, rknn_int8cal_path).
-    """
-    task = info.get("task", "detect") if info else "detect"
-    onnx_path = export_onnx_only(pt_path)
-    if not onnx_path:
-        raise RuntimeError("Экспорт ONNX не удался")
-
-    rknn_fp16 = _build_rknn(onnx_path, quantize=False)
-
-    # INT8 через ultralytics (rknn-toolkit2 2.3.2 требует датасет для rknn.build)
-    rknn_int8 = None
-    apply_patches()
-    from ultralytics import YOLO
-    pt_stem = Path(pt_path).stem
-    pt_parent = str(Path(pt_path).parent)
-
-    # INT8 без калибровки: ultralytics берёт дефолтный мини-датасет задачи
-    # (coco128 / coco128-seg / coco8-pose / dota128 / imagenet100 / cityscapes8).
-    # ensure_mini_dataset гарантирует, что он скачан в datasets/ проекта.
-    log(f"INT8 без калибровки: задача={task}, мини-датасет={ensure_mini_dataset(task)}")
-    model = YOLO(str(pt_path))
-    rknn_dir = model.export(format="rknn", quantize=8)
-    rknn_files = list(Path(rknn_dir).resolve().glob("*.rknn"))
-    if rknn_files:
-        rknn_int8 = rknn_files[0]
-        # Копируем в отдельный файл чтобы не путать с int8-calib
-        target_int8 = Path(onnx_path).parent / f"{pt_stem}_int8.rknn"
-        if rknn_int8 != target_int8:
-            shutil.copy2(str(rknn_int8), str(target_int8))
-        rknn_int8 = target_int8
-
-    # INT8-calib: RKNN с калибровкой на реальном датасете
-    rknn_int8cal = None
-    try:
-        data_yaml = _make_calib_yaml(task)
-        log(f"Сборка RKNN int8-calib: задача={task}, data={data_yaml}")
-        # Очищаем кэш ultralytics чтобы избежать повторного использования кэшированного результата
-        runs_dir = Path(pt_parent) / "runs"
-        if runs_dir.exists():
-            import glob as _glob
-            for d in _glob.glob(str(runs_dir / "detect" / "export*")):
-                shutil.rmtree(d, ignore_errors=True)
-        model_cal = YOLO(str(pt_path))
-        rknn_dir_cal = model_cal.export(format="rknn", data=data_yaml, quantize=8)
-        rknn_files_cal = list(Path(rknn_dir_cal).resolve().glob("*.rknn"))
-        if rknn_files_cal:
-            rknn_int8cal = rknn_files_cal[0]
-            target_cal = Path(onnx_path).parent / f"{Path(onnx_path).stem}_int8-calib.rknn"
-            if rknn_int8cal != target_cal:
-                shutil.copy2(str(rknn_int8cal), str(target_cal))
-            rknn_int8cal = target_cal
-            log(f"RKNN (int8-calib): {rknn_int8cal}")
-    except Exception as e:
-        log(f"[ПРЕДУПРЕЖДЕНИЕ] int8-calib не удался: {e}")
-
-    return onnx_path, rknn_fp16, rknn_int8, rknn_int8cal
+    root = Path(data_root)
+    for jpg in root.rglob("*.jpg"):
+        return jpg.parent
+    for jpg in root.rglob("*.jpeg"):
+        return jpg.parent
+    raise RuntimeError(f"Нет изображений для калибровки в {root}")
 
 
 def _build_rknn(onnx_path, quantize, calib_dir=None):
-    """Собрать RKNN из ONNX файла."""
+    """Собрать RKNN из ONNX файла.
+
+    Сборка во временный каталог (не рядом с onnx!): когда onnx уже лежит в кеше,
+    запись рядом дала бы путь, совпадающий с целевым rknn-файлом, и последующий
+    copy2(src, dst) падал бы 'same file'. Плюс при падении сборки в кеше не
+    остаётся обрубленного rknn, который потом приняли бы за валидный.
+    """
     from rknn.api import RKNN
 
     onnx_abs = Path(onnx_path).resolve()
     stem = onnx_abs.stem
     suffix = "_int8.rknn" if quantize else "_fp16.rknn"
-    rknn_path = str(onnx_abs.parent / f"{stem}{suffix}")
+    tmp_dir = Path(tempfile.mkdtemp(prefix="rknn_build_"))
+    rknn_path = str(tmp_dir / f"{stem}{suffix}")
 
     rknn = RKNN(verbose=False)
     rknn.config(mean_values=[[0, 0, 0]], std_values=[[255, 255, 255]],
@@ -1120,41 +1016,18 @@ def run_convert(model_input: str, quantize: str, info: dict | None = None) -> Pa
             onnx_src = _onnx_file(model_name) if fmt == "pt" else src
             info_local = info or _detect_model_info(str(_pt_file(model_name)) if _pt_file(model_name).exists() else str(onnx_src))
 
-            # ultralytics требует .pt файл для export()
-            pt_src = str(_pt_file(model_name)) if _pt_file(model_name).exists() else None
-
             if quantize == "int8-calib":
                 task = info_local.get("task", "detect")
-                _ensure_dataset(task)
-                data_yaml = _make_calib_yaml(task)
-                log(f"Сборка RKNN int8-calib: задача={task}")
-                apply_patches()
-                from ultralytics import YOLO
-                if pt_src:
-                    model = YOLO(pt_src)
-                else:
-                    model = YOLO(str(onnx_src))
-                rknn_dir = model.export(format="rknn", data=data_yaml, quantize=8)
-                rknn_files = list(Path(rknn_dir).glob("*.rknn"))
-                if rknn_files:
-                    shutil.copy2(str(rknn_files[0]), str(target))
-                else:
-                    raise RuntimeError("RKNN файл не найден после экспорта")
+                calib_dir = _calib_img_dir(_ensure_dataset(task))
+                log(f"Сборка RKNN int8-calib: задача={task}, датасет={calib_dir}")
+                rknn_path = _build_rknn(str(onnx_src), quantize=True, calib_dir=calib_dir)
+                shutil.copy2(rknn_path, str(target))
             elif quantize == "int8":
                 task = info_local.get("task", "detect")
-                log(f"Сборка RKNN int8 (без калибровки): задача={task}, мини-датасет={ensure_mini_dataset(task)}")
-                apply_patches()
-                from ultralytics import YOLO
-                if pt_src:
-                    model = YOLO(pt_src)
-                else:
-                    model = YOLO(str(onnx_src))
-                rknn_dir = model.export(format="rknn", quantize=8)
-                rknn_files = list(Path(rknn_dir).glob("*.rknn"))
-                if rknn_files:
-                    shutil.copy2(str(rknn_files[0]), str(target))
-                else:
-                    raise RuntimeError("RKNN файл не найден после экспорта")
+                calib_dir = _calib_img_dir(ensure_mini_dataset(task))
+                log(f"Сборка RKNN int8 (без калибровки): задача={task}, мини-датасет={calib_dir}")
+                rknn_path = _build_rknn(str(onnx_src), quantize=True, calib_dir=calib_dir)
+                shutil.copy2(rknn_path, str(target))
             else:
                 # fp16
                 rknn_path = _build_rknn(str(onnx_src), quantize=False)
@@ -1170,31 +1043,19 @@ def run_convert(model_input: str, quantize: str, info: dict | None = None) -> Pa
             if not onnx_src.exists():
                 raise RuntimeError(f"ONNX не найден для {model_name}, необходим для конвертации из {fmt}")
 
-            # ultralytics требует .pt файл для export()
-            pt_src = str(_pt_file(model_name)) if _pt_file(model_name).exists() else None
-
             info_local = info or {}
             if quantize == "int8-calib":
                 task = info_local.get("task", "detect")
-                _ensure_dataset(task)
-                data_yaml = _make_calib_yaml(task)
-                log(f"Сборка RKNN int8-calib из ONNX")
-                apply_patches()
-                from ultralytics import YOLO
-                model = YOLO(pt_src if pt_src else str(onnx_src))
-                rknn_dir = model.export(format="rknn", data=data_yaml, quantize=8)
-                rknn_files = list(Path(rknn_dir).glob("*.rknn"))
-                if rknn_files:
-                    shutil.copy2(str(rknn_files[0]), str(target))
+                calib_dir = _calib_img_dir(_ensure_dataset(task))
+                log(f"Сборка RKNN int8-calib из ONNX: датасет={calib_dir}")
+                rknn_path = _build_rknn(str(onnx_src), quantize=True, calib_dir=calib_dir)
+                shutil.copy2(rknn_path, str(target))
             elif quantize == "int8":
-                log("Сборка RKNN int8 из ONNX")
-                apply_patches()
-                from ultralytics import YOLO
-                model = YOLO(pt_src if pt_src else str(onnx_src))
-                rknn_dir = model.export(format="rknn", quantize=8)
-                rknn_files = list(Path(rknn_dir).glob("*.rknn"))
-                if rknn_files:
-                    shutil.copy2(str(rknn_files[0]), str(target))
+                task = info_local.get("task", "detect")
+                calib_dir = _calib_img_dir(ensure_mini_dataset(task))
+                log(f"Сборка RKNN int8 из ONNX: мини-датасет={calib_dir}")
+                rknn_path = _build_rknn(str(onnx_src), quantize=True, calib_dir=calib_dir)
+                shutil.copy2(rknn_path, str(target))
             else:
                 rknn_path = _build_rknn(str(onnx_src), quantize=False)
                 shutil.copy2(rknn_path, str(target))
@@ -1235,29 +1096,16 @@ def run_convert(model_input: str, quantize: str, info: dict | None = None) -> Pa
     # Сборка RKNN
     if quantize == "int8-calib":
         task = info.get("task", "detect")
-        _ensure_dataset(task)
-        data_yaml = _make_calib_yaml(task)
-        log(f"Сборка RKNN int8-calib: задача={task}")
-        apply_patches()
-        from ultralytics import YOLO
-        model = YOLO(str(onnx_dst))
-        rknn_dir = model.export(format="rknn", data=data_yaml, quantize=8)
-        rknn_files = list(Path(rknn_dir).glob("*.rknn"))
-        if rknn_files:
-            shutil.copy2(str(rknn_files[0]), str(target))
-        else:
-            raise RuntimeError("RKNN файл не найден после экспорта")
+        calib_dir = _calib_img_dir(_ensure_dataset(task))
+        log(f"Сборка RKNN int8-calib: задача={task}, датасет={calib_dir}")
+        rknn_path = _build_rknn(str(onnx_dst), quantize=True, calib_dir=calib_dir)
+        shutil.copy2(rknn_path, str(target))
     elif quantize == "int8":
-        log("Сборка RKNN int8")
-        apply_patches()
-        from ultralytics import YOLO
-        model = YOLO(str(onnx_dst))
-        rknn_dir = model.export(format="rknn", quantize=8)
-        rknn_files = list(Path(rknn_dir).glob("*.rknn"))
-        if rknn_files:
-            shutil.copy2(str(rknn_files[0]), str(target))
-        else:
-            raise RuntimeError("RKNN файл не найден после экспорта")
+        task = info.get("task", "detect")
+        calib_dir = _calib_img_dir(ensure_mini_dataset(task))
+        log(f"Сборка RKNN int8: задача={task}, мини-датасет={calib_dir}")
+        rknn_path = _build_rknn(str(onnx_dst), quantize=True, calib_dir=calib_dir)
+        shutil.copy2(rknn_path, str(target))
     else:
         rknn_path = _build_rknn(str(onnx_dst), quantize=False)
         shutil.copy2(rknn_path, str(target))

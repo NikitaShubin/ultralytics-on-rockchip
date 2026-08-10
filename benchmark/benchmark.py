@@ -437,11 +437,10 @@ def model_is_complete(result: dict) -> bool:
     if not has_fps:
         return False
     eval_result = result.get('eval', {}) or {}
-    has_eval = any(
-        isinstance(v, dict) and v.get('elapsed_s', 0) > 0
-        for v in eval_result.values()
-    )
-    if not has_eval:
+    done_keys = {k for k, val in eval_result.items()
+                 if isinstance(val, dict) and val.get('elapsed_s', 0) > 0}
+    need_keys = QUANTIZE_TO_EVAL.get(QUANTIZE, ['onnx', 'fp16', 'int8', 'int8-calib'])
+    if not all(vr in done_keys for vr in need_keys):
         return False
     return True
 
@@ -638,9 +637,16 @@ def main() -> None:
 
             # --- Фаза: convert ---
             if phase_is(phases, 'convert'):
-                # Resume: пропускаем если уже сконвертировано (есть _fp16.rknn)
-                if (model_cache_dir / f'{model.name}_fp16.rknn').exists():
-                    log(f'[ПРОПУСК] convert: уже сконвертировано')
+                # Resume: пропускаем convert только если ВСЕ нужные файлы на месте.
+                # (ранее проверялся только _fp16.rknn — это была дыра: при наличии fp16
+                # отсутствующие int8/int8-calib тихо пропускались и не дособирались)
+                need_convert = QUANTIZE_TO_EVAL.get(QUANTIZE, ['onnx', 'fp16', 'int8', 'int8-calib'])
+                missing = [
+                    v for v in need_convert
+                    if not (model_cache_dir / EVAL_VARIANTS[v]['file'](model.name)).exists()
+                ]
+                if not missing:
+                    log(f'[ПРОПУСК] convert: все файлы ({", ".join(need_convert)}) уже на месте')
                     if model.name not in {r['model'] for r in existing}:
                         existing.append({
                             'model': model.name,
@@ -652,8 +658,6 @@ def main() -> None:
                             'status': 'ОЖИДАНИЕ',
                         })
                         save_results(existing)
-                elif model.name in {r['model'] for r in existing if r.get('conversion_status') == 'OK'}:
-                    log(f'[ПРОПУСК] convert: уже сконвертировано (results.json)')
                 else:
                     conv_result = run_converter(model.name, model.task, model_cache_dir, model_data_dir)
                     if conv_result is None or conv_result.get('status') != 'OK':

@@ -121,7 +121,31 @@ RKNN-деплой отложен по решению пользователя. �
 ### Interleaved runner — исправленные баги (2026-08-08)
 (1) **nms-мутация std_raw**: `_nms_det` без `.copy()` портил буфер std_raw (xywh→xyxy инплейс) → col2 постпроцесс ломался. Фикс `.copy()` в run_3way_eval.py:678. (2) **'masks' vs 'masks_160'**: canon_col1 писал 'masks', а canon_objs/_seg_tp_per_image/compare_preds ждали 'masks_160' → KeyError. Унифицировано на 'masks_160'. (3) **segment/pose постпроцессы клипали bbox ВСЕГДА** (не под `if not EVAL_PRECISE` как detect) → col1 vs col2 bbox diff. Фикс в шаблонах `convert/templates/{segment,pose}_postprocess.py` + патч сгенерированных кэш-файлов. (4) **semantic-ветка** использовала постпроцесс (возвращает orig-пространство) при GT в letterboxed → TypeError 'dict'; переведена на raw argmax (`raw[0][0].argmax(0)`) как eval.py (run_3way_eval.py:633-647).
 
+### Решение пользователя (2026-08-10): старый пайплайн остаётся основным
+- **НЕ переходим на новый ultralytics-RKNN пайплайн (B-путь) полностью**: точность int8 в нём падает
+  (B fp32=0.542→int8=0.435, −20%) против нашего RK-opt (A fp32=0.523→int8=0.518, −1%).
+  Старый пайплайн (`percept/` + RK-opt постпроцесс) — по умолчанию.
+- **Производительность НЕ страдает** (замер на yolo11n, 640, NPU, conf=0.25):
+  наш infer=43.3ms + постпроцесс=14.7ms (25%) = 57.9ms (~17 fps);
+  их infer=47.0ms + NMS=9.0ms = 56.0ms (~18 fps). Разница ~2ms (3%) — узкое место NPU,
+  не CPU-постобработка. Их NMS тоже на CPU (декодирование у них в графе).
+  Eval-режим (conf=0.001, multi-label) НЕ репрезентативен: постпроцесс раздувается до секунд
+  из-за 8400×80 кандидатов → замерять скорость только в продакшен-конфиге (conf=0.25).
+- **Восстановимость пайплайна при обновлении ultralytics — высокая**: рантайм `percept/`
+  НЕ импортирует ultralytics (только rknnlite+numpy) → продакшен не ломается.
+  Зависимость только в экспорте/бенчмарках: `rknn_patch.py` патчит головы по стабильным
+  атрибутам (cv2/cv3/nl/proto/one2one), метрики `ultralytics.utils.*` (ap_per_class, box_iou,
+  non_max_suppression, polygons2masks_overlap) — стабильный API. Экспорт в фикс. контейнере
+  (8.4.105): пока образ не пересобран с новой версией — ничего не сломается.
+
 ### Active
+- **Resume-логика convert (2026-08-10)**: `benchmark/benchmark.py --phase convert` проверяет ВСЕ нужные
+  варианты (onnx/fp16/int8/int8-calib), а не только `_fp16.rknn` — отсутствующий int8 теперь ДОСОБИРАЕТСЯ
+  через `convert_bench.py`, а не тихо пропускается. `convert_bench.py` переведён на кеширующий
+  `convert.run_convert()` (не удалённый `export_and_compile_all`): при полном кеше прогон занимает ~4с.
+  `_build_rknn` собирает во ВРЕМЕННУЮ папку (`tempfile.mkdtemp`), а не рядом с onnx — иначе при onnx в кеше
+  путь совпадал с целевым rknn и `copy2(src, src)` падал 'same file'; заодно при сбое сборки в кеше не
+  остаётся обрубленного rknn.
 - **Инвентаризация real-time моделей (2026-08-08)**: критерий — **самая лёгкая модель из каждой
   линейки** (не обязательно nano): добавлены **yolov3-tinyu** (23MB, самая лёгкая в yolo3; nl=2) и
   **yolov9t** (самая лёгкая в yolo9) — обе голова `Detect`, RK-opt патч подойдёт без изменений.
