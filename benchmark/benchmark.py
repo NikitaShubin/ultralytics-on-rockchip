@@ -809,6 +809,9 @@ def main() -> None:
                                     'npu_load_per_core': b.get('npu_load_per_core', {}),
                                     'cpu_load_avg': b.get('cpu_load_avg'),
                                     'cpu_load_per_core': b.get('cpu_load_per_core', {}),
+                                    'npu_temp_avg': b.get('npu_temp_avg'),
+                                    'npu_temp_min': b.get('npu_temp_min'),
+                                    'npu_temp_max': b.get('npu_temp_max'),
                                     'error': b.get('error'),
                                 }
 

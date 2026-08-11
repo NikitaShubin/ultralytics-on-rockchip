@@ -28,6 +28,16 @@ from pipeline import Pipeline  # noqa: E402
 from config import Backend  # noqa: E402
 
 NPU_LOAD_PATH = '/sys/kernel/debug/rknpu/load'
+NPU_TEMP_PATH = '/sys/class/thermal/thermal_zone6/temp'
+
+
+def _read_npu_temp() -> float | None:
+    """Температура NPU из thermal-зоны (в °C) или None."""
+    try:
+        with open(NPU_TEMP_PATH) as f:
+            return float(f.read().strip()) / 1000.0
+    except (FileNotFoundError, PermissionError, OSError, ValueError):
+        return None
 
 
 def _sample_npu_load(samples: list[float], stop_event: threading.Event) -> None:
@@ -166,6 +176,7 @@ def benchmark_backend(
     npu_load_samples: list[float] = []
     npu_load_per_core: dict[int, list[float]] = {}
     cpu_load_per_core: dict[int, list[float]] = {}
+    temp_samples: list[float] = []
     stop_event = threading.Event()
     sampler_threads: list[threading.Thread] = []
 
@@ -179,6 +190,17 @@ def benchmark_backend(
 
     if collect_cpu_load:
         t = threading.Thread(target=_sample_cpu_load_per_core, args=(cpu_load_per_core, stop_event), daemon=True)
+        t.start()
+        sampler_threads.append(t)
+
+    if collect_npu_load or collect_cpu_load:
+        def _sample_temp(samples: list[float], stop_event: threading.Event) -> None:
+            while not stop_event.is_set():
+                v = _read_npu_temp()
+                if v is not None:
+                    samples.append(v)
+                stop_event.wait(0.5)
+        t = threading.Thread(target=_sample_temp, args=(temp_samples, stop_event), daemon=True)
         t.start()
         sampler_threads.append(t)
 
@@ -219,6 +241,10 @@ def benchmark_backend(
         vals = cpu_load_per_core[cid]
         cpu_per_core[str(cid)] = round(float(np.mean(vals)), 1) if vals else 0
 
+    npu_temp_avg = round(float(np.mean(temp_samples)), 1) if temp_samples else None
+    npu_temp_min = round(float(min(temp_samples)), 1) if temp_samples else None
+    npu_temp_max = round(float(max(temp_samples)), 1) if temp_samples else None
+
     return {
         'backend': backend.value,
         'rknn_suffix': rknn_suffix,
@@ -233,6 +259,9 @@ def benchmark_backend(
         'npu_load_per_core': npu_per_core,
         'cpu_load_avg': cpu_load_avg,
         'cpu_load_per_core': cpu_per_core,
+        'npu_temp_avg': npu_temp_avg,
+        'npu_temp_min': npu_temp_min,
+        'npu_temp_max': npu_temp_max,
     }
 
 
@@ -349,6 +378,7 @@ def main() -> None:
             sys.stderr.write(f'[ИНФО] {label} FPS={bench["fps"]} '
                              f'(n={bench["n_frames"]}, {bench["elapsed_s"]}с, '
                              f'NPU={bench["npu_load_avg"]}%, CPU={bench["cpu_load_avg"]}%, '
+                             f'temp={bench.get("npu_temp_avg")}°C[{bench.get("npu_temp_min")}..{bench.get("npu_temp_max")}], '
                              f'min={bench.get("fps_min")}, max={bench.get("fps_max")})\n')
             results[f'npu_{suffix}'] = bench
         except Exception as e:
