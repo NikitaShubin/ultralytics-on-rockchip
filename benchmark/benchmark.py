@@ -513,7 +513,7 @@ def write_tsv(results: list[dict]) -> None:
         header += [
             'top1', 'top5', 'map50', 'map50_95',
             'max_diff_avg', 'max_diff_max',
-            'Статус',
+            'Троттлинг', 'Статус',
         ]
         writer.writerow(header)
 
@@ -556,8 +556,14 @@ def write_tsv(results: list[dict]) -> None:
             row += [
                 top1, top5, map50, map50_95,
                 max_diff, max_diff_max,
-                r.get('status', '?'),
             ]
+            throttle_parts = []
+            for vd in (cpu, npu_fp16, npu_int8, npu_int8cal):
+                if vd.get('throttled'):
+                    tag = 'cpu' if vd.get('backend') == 'cpu' else (vd.get('rknn_suffix') or '?')
+                    throttle_parts.append(f'{tag}:{vd.get("throttle_reason")}')
+            row.append('; '.join(throttle_parts) if throttle_parts else '')
+            row.append(r.get('status', '?'))
             writer.writerow(row)
     log(f'[ГОТОВО] TSV-сводка записана в {SUMMARY_TSV}')
 
@@ -812,6 +818,11 @@ def main() -> None:
                                     'npu_temp_avg': b.get('npu_temp_avg'),
                                     'npu_temp_min': b.get('npu_temp_min'),
                                     'npu_temp_max': b.get('npu_temp_max'),
+                                    'npu_freq_avg': b.get('npu_freq_avg'),
+                                    'thermal_max_c': b.get('thermal_max_c'),
+                                    'cpu_freq_ratio': b.get('cpu_freq_ratio'),
+                                    'throttled': b.get('throttled'),
+                                    'throttle_reason': b.get('throttle_reason'),
                                     'error': b.get('error'),
                                 }
 
