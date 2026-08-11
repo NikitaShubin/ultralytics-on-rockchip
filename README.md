@@ -32,6 +32,10 @@
 ## Требования
 
 - Docker Engine, пользователь в группе `docker`
+- `python3` (системный) — для оркестратора бенчмарка и скриптов установки
+  датасетов (`benchmark/benchmark.py`, `setup_datasets.py`, `stress_test.py`).
+  Тяжёлые зависимости (ultralytics, rknn-toolkit, torch) на хост ставить НЕ нужно —
+  всё выполняется в контейнерах.
 - RK3588S с библиотеками NPU: `librknnrt.so`, `librknn_api.so`
 - USB камера (MJPEG) или GigE Vision камера (Basler)
 
