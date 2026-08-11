@@ -165,7 +165,8 @@ RKNN-деплой отложен по решению пользователя. �
   всех thermal-зон и частоты CPU per-core (`scaling_cur_freq`). В результат: `npu_temp_avg/min/max`,
   `npu_freq_avg/min`, `thermal_max_c`, `cpu_freq_ratio` (мин. avg/max по НАГРУЖЕННЫМ ядрам load>50% —
   иначе ложные срабатывания: в idle ядра легитимно снижают частоту). `throttled=True` + `throttle_reason`
-  при: NPU freq <90% max, cpu freq <90% max на нагруженном ядре, либо любая зона ≥80°C. `_bench_median`
+  при: NPU freq <90% max **И загрузке NPU >50%** (недогрузка — не троттлинг!), cpu freq <90% max на
+  нагруженном ядре, либо любая зона ≥80°C. `_bench_median`
   перед КАЖДЫМ повтором ждёт выхода из троттлинга (`_wait_no_throttle`, критерий — только температура,
   т.к. в idle частоты падают) с таймаутом `--throttle-timeout` (деф. 600с); при таймауте повтор/вариант
   НЕ запускается и помечается `error='throttle_timeout'`, fps=-1. В TSV добавлена колонка 'Троттлинг'

@@ -346,8 +346,9 @@ def benchmark_backend(
         cpu_freq_ratio = round(min(ratios), 2) if ratios else None
 
     reasons = []
-    if npu_freq_avg is not None and npu_freq_avg < NPU_MAX_FREQ_HZ / 1e6 * THROTTLE_FREQ_RATIO:
-        reasons.append(f'npu_freq={npu_freq_avg:.0f}MHz')
+    if (npu_freq_avg is not None and npu_load_avg is not None and npu_load_avg > 50.0
+            and npu_freq_avg < NPU_MAX_FREQ_HZ / 1e6 * THROTTLE_FREQ_RATIO):
+        reasons.append(f'npu_freq={npu_freq_avg:.0f}MHz@load={npu_load_avg:.0f}%')
     if cpu_freq_ratio is not None and cpu_freq_ratio < THROTTLE_FREQ_RATIO:
         reasons.append(f'cpu_freq={cpu_freq_ratio:.2f}')
     if thermal_max is not None and thermal_max >= THROTTLE_TEMP_C:
@@ -478,7 +479,7 @@ def main() -> None:
                 args.model_name, args.temp_dir, images, Backend.CPU,
                 rknn_suffix='',
                 warmup_sec=args.warmup, measure_sec=args.measure,
-                collect_npu_load=False, collect_cpu_load=False,
+                collect_npu_load=False, collect_cpu_load=True,
             ), throttle_timeout=args.throttle_timeout)
             sys.stderr.write(f'[ИНФО] ONNX CPU FPS={bench["fps"]} '
                              f'(n={bench["n_frames"]}, {bench["elapsed_s"]}с, '
