@@ -8,6 +8,7 @@ services:
       - /dev/dri/renderD129:/dev/dri/renderD129
     volumes:
       - /proc/device-tree/compatible:/proc/device-tree/compatible:ro
+      - /sys/kernel/debug:/sys/kernel/debug:ro
       - /usr/lib/librknnrt.so:/usr/lib/librknnrt.so:ro
       - /usr/lib/librknn_api.so:/usr/lib/librknn_api.so:ro
       - ../model:/app/convert/model

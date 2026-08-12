@@ -27,83 +27,11 @@ sys.path.insert(0, '/app')
 from pipeline import Pipeline  # noqa: E402
 from config import Backend  # noqa: E402
 
-NPU_LOAD_PATH = '/sys/kernel/debug/rknpu/load'
-NPU_TEMP_PATH = '/sys/class/thermal/thermal_zone6/temp'
-NPU_FREQ_PATH = '/sys/kernel/debug/rknpu/freq'
-NPU_MAX_FREQ_HZ = 1_000_000_000      # RK3588: макс. частота NPU
-THROTTLE_TEMP_C = 80.0               # порог температуры (любая зона) → троттлинг
-THROTTLE_FREQ_RATIO = 0.9            # avg-частота < 90% от max → троттлинг
-
-
-def _read_npu_temp() -> float | None:
-    """Температура NPU из thermal-зоны (в °C) или None."""
-    try:
-        with open(NPU_TEMP_PATH) as f:
-            return float(f.read().strip()) / 1000.0
-    except (FileNotFoundError, PermissionError, OSError, ValueError):
-        return None
-
-
-def _read_npu_freq() -> int | None:
-    """Текущая частота NPU в Hz из sysfs (или None)."""
-    try:
-        with open(NPU_FREQ_PATH) as f:
-            return int(f.read().strip())
-    except (FileNotFoundError, PermissionError, OSError, ValueError):
-        return None
-
-
-def _cpu_core_max_freq(core_id: int) -> int | None:
-    """Максимальная частота CPU-ядра в Hz (из cpuinfo_max_freq)."""
-    try:
-        p = Path(f'/sys/devices/system/cpu/cpu{core_id}/cpufreq/cpuinfo_max_freq')
-        return int(p.read_text().strip())
-    except (OSError, ValueError):
-        return None
-
-
-def _read_cpu_freqs() -> dict[int, int]:
-    """Текущая частота каждого CPU-ядра в Hz."""
-    freqs = {}
-    for d in sorted(Path('/sys/devices/system/cpu').glob('cpu[0-9]*')):
-        try:
-            cid = int(d.name[3:])
-            cur = (d / 'cpufreq' / 'scaling_cur_freq').read_text().strip()
-            freqs[cid] = int(cur)
-        except (OSError, ValueError):
-            pass
-    return freqs
-
-
-def _read_thermal_max() -> float | None:
-    """Максимальная температура по всем thermal-зонам в °C (или None)."""
-    temps = []
-    for z in sorted(Path('/sys/class/thermal').glob('thermal_zone*')):
-        try:
-            temps.append(float((z / 'temp').read_text().strip()) / 1000.0)
-        except (OSError, ValueError):
-            pass
-    return max(temps) if temps else None
-
-
-def _is_throttled_now() -> tuple[bool, str]:
-    """Троттлинг ПРЯМО СЕЙЧАС (для ожидания между тестами): температура любой зоны."""
-    t = _read_thermal_max()
-    if t is not None and t >= THROTTLE_TEMP_C:
-        return True, f'temp={t:.0f}C>={THROTTLE_TEMP_C:.0f}C'
-    return False, 'ok'
-
-
-def _wait_no_throttle(timeout_sec: int, poll: float = 5.0) -> bool:
-    """Ждать выхода из троттлинга. True — готово к замеру, False — таймаут."""
-    deadline = time.monotonic() + max(0, timeout_sec)
-    while True:
-        throttled, _ = _is_throttled_now()
-        if not throttled:
-            return True
-        if time.monotonic() >= deadline:
-            return False
-        time.sleep(poll)
+from telemetry import (  # noqa: E402
+    NPU_LOAD_PATH,
+    read_npu_temp, read_npu_freq, read_cpu_freqs, read_cpu_stat_per_core,
+    cpu_core_max_freq, read_thermal_max, throttle_reasons, wait_no_throttle,
+)
 
 
 def _sample_telemetry(npu_temp_samples: list[float], npu_freq_samples: list[int],
@@ -111,15 +39,15 @@ def _sample_telemetry(npu_temp_samples: list[float], npu_freq_samples: list[int]
                       thermal_samples: list[float], stop_event: threading.Event) -> None:
     """Сэмплирование температуры NPU, частот NPU/CPU и температуры всех зон."""
     while not stop_event.is_set():
-        t = _read_npu_temp()
+        t = read_npu_temp()
         if t is not None:
             npu_temp_samples.append(t)
-        f = _read_npu_freq()
+        f = read_npu_freq()
         if f is not None:
             npu_freq_samples.append(f)
-        for cid, f in _read_cpu_freqs().items():
+        for cid, f in read_cpu_freqs().items():
             cpu_freq_per_core.setdefault(cid, []).append(f)
-        t = _read_thermal_max()
+        t = read_thermal_max()
         if t is not None:
             thermal_samples.append(t)
         stop_event.wait(0.2)
@@ -159,30 +87,12 @@ def _sample_npu_load_per_core(samples_per_core: dict[int, list[float]], stop_eve
         stop_event.wait(0.2)
 
 
-def _read_cpu_stat_per_core() -> dict[int, tuple[int, int]]:
-    """Прочитать время CPU per-core из /proc/stat. Возвращает {core: (idle, total)}."""
-    stats = {}
-    try:
-        with open('/proc/stat') as f:
-            for line in f:
-                if line.startswith('cpu') and not line.startswith('cpu '):
-                    parts = line.split()
-                    core_id = int(parts[0][3:])
-                    values = [int(x) for x in parts[1:9]]
-                    idle = values[3] + values[4]
-                    total = sum(values)
-                    stats[core_id] = (idle, total)
-    except (OSError, ValueError):
-        pass
-    return stats
-
-
 def _sample_cpu_load_per_core(samples_per_core: dict[int, list[float]], stop_event: threading.Event) -> None:
     """Сэмплирование загрузки CPU per-core из /proc/stat."""
-    prev_stats = _read_cpu_stat_per_core()
+    prev_stats = read_cpu_stat_per_core()
     while not stop_event.is_set():
         stop_event.wait(0.5)
-        cur_stats = _read_cpu_stat_per_core()
+        cur_stats = read_cpu_stat_per_core()
         for core_id, (cur_idle, cur_total) in cur_stats.items():
             if core_id in prev_stats:
                 prev_idle, prev_total = prev_stats[core_id]
@@ -335,7 +245,7 @@ def benchmark_backend(
     if cpu_freq_per_core:
         ratios = []
         for cid, vals in cpu_freq_per_core.items():
-            mx = _cpu_core_max_freq(cid)
+            mx = cpu_core_max_freq(cid)
             if not mx:
                 continue
             loads = cpu_load_per_core.get(cid)
@@ -345,14 +255,7 @@ def benchmark_backend(
             ratios.append(float(np.mean(vals)) / mx)
         cpu_freq_ratio = round(min(ratios), 2) if ratios else None
 
-    reasons = []
-    if (npu_freq_avg is not None and npu_load_avg is not None and npu_load_avg > 50.0
-            and npu_freq_avg < NPU_MAX_FREQ_HZ / 1e6 * THROTTLE_FREQ_RATIO):
-        reasons.append(f'npu_freq={npu_freq_avg:.0f}MHz@load={npu_load_avg:.0f}%')
-    if cpu_freq_ratio is not None and cpu_freq_ratio < THROTTLE_FREQ_RATIO:
-        reasons.append(f'cpu_freq={cpu_freq_ratio:.2f}')
-    if thermal_max is not None and thermal_max >= THROTTLE_TEMP_C:
-        reasons.append(f'temp={thermal_max:.0f}C')
+    reasons = throttle_reasons(npu_freq_avg, npu_load_avg, cpu_freq_ratio, thermal_max)
 
     return {
         'backend': backend.value,
@@ -390,7 +293,7 @@ def _bench_median(repeats: int, bench_fn, throttle_timeout: int = 600) -> dict:
     """
     runs = []
     for _ in range(max(1, repeats)):
-        if not _wait_no_throttle(throttle_timeout):
+        if not wait_no_throttle(throttle_timeout):
             return {'fps': -1, 'fps_std': None, 'n_frames': 0, 'n_warmup': 0,
                     'elapsed_s': None, 'input_size': None,
                     'npu_load_avg': None, 'npu_load_per_core': {},

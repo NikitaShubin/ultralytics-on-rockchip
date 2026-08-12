@@ -885,29 +885,21 @@ def compute_obb_map(gt_boxes_xywha: list, pred_boxes_xywha: list,
 # ---------------------------------------------------------------------------
 
 def _big_core_count() -> int:
-    """Число производительных ядер CPU для пула параллельного NMS.
+    """Число ядер CPU для пула параллельного NMS.
 
-    Определяется автоматически: берутся ядра с максимальной тактовой частотой
-    (на RK3588 — 4×A76, на однородных CPU — все ядра). Медленные E-ядра не
-    включаются — они снижают общую скорость (проверено замером 4 vs 8 воркеров).
+    В eval (conf=0.001) постпроцесс — узкое место, NPU почти простаивает
+    (>95% idle). Замер probe_parallel (2026-08-12): N=4 даёт 3.0–3.5x,
+    N=8 добавляет ~9% на detect и ~0% на segment, но равномернее грузит
+    A55. По решению пользователя используем ВСЕ ядра — CPU должен быть
+    загружен максимально (троттлинга нет: tmax≤66°C при N=8).
     """
     try:
-        cpus = list(os.sched_getaffinity(0))
-        freqs = []
-        for c in cpus:
-            p = f'/sys/devices/system/cpu/cpu{c}/cpufreq/cpuinfo_max_freq'
-            try:
-                with open(p) as f:
-                    freqs.append(int(f.read().strip()))
-            except OSError:
-                freqs.append(0)
-        if not freqs:
-            return min(4, len(cpus))
-        mx = max(freqs)
-        n_big = sum(1 for f in freqs if f >= mx * 0.9)
-        return max(1, n_big)
+        cpus = os.sched_getaffinity(0)
+        if cpus:
+            return max(1, len(cpus))
     except Exception:
-        return min(4, os.cpu_count() or 1)
+        pass
+    return os.cpu_count() or 4
 
 
 def _detect_pre_nms(pp, outputs):
@@ -971,6 +963,97 @@ def _detect_nms_finish(pp, x, scale, pad, orig_shape, fast_nms):
     return results
 
 
+def _seg_pre_nms(pp, outputs):
+    """Шаги 1-3 сегментного постпроцесса до NMS: decode → conf-filter → multi-label expand → cap.
+
+    Возвращает (x, proto) или None. Точная копия шагов
+    segment_postprocess.py:151-194 (без NMS/masks — они в _seg_nms_finish).
+    """
+    orig_h, orig_w = (640, 640)  # не используется до NMS
+    single_output = (len(outputs) == 2)
+    if single_output:
+        pred = outputs[0][0].astype(np.float32)  # (4+nc+NM, total)
+        nc = pred.shape[0] - 4 - pp.NM
+        proto = outputs[1]
+        if proto.ndim == 4:
+            proto = proto[0]
+        pred[:4] = pp.xywh2xyxy(pred[:4].T).T
+        pred = pred.T                            # (total, 4+nc+NM)
+        box = pred[:, :4]
+        cls = pred[:, 4:4 + nc]
+        coeffs = pred[:, 4 + nc:]
+    else:
+        proto = outputs[-1]
+        if proto.ndim == 4:
+            proto = proto[0]
+        box, cls, coeffs = pp._decode_per_stride(outputs)
+    xc = cls.max(axis=1) > pp.CONF_THRESH
+    box = box[xc]
+    cls = cls[xc]
+    coeffs = coeffs[xc]
+    if len(box) == 0:
+        return None
+    i, j = np.where(cls > pp.CONF_THRESH)
+    if len(i) == 0:
+        return None
+    x = np.column_stack([box[i], cls[i, j, None], j[:, None].astype(np.float32), coeffs[i]])
+    if x.shape[0] > pp.MAX_NMS:
+        filt = x[:, 4].argsort()[::-1][:pp.MAX_NMS]
+        x = x[filt]
+    return x, proto
+
+
+def _seg_nms_finish(pp, x, proto, scale, pad, orig_shape, fast_nms):
+    """Шаги 4-8 сегментного постпроцесса: class-aware NMS → masks_160 → формат."""
+    c = x[:, 5:6] * pp.MAX_WH
+    boxes_nms = x[:, :4] + c
+    keep = fast_nms(boxes_nms, x[:, 4], pp.IOU_THRESH)
+    keep = keep[:pp.MAX_DET]
+    x = x[keep]
+    if len(x) == 0:
+        return []
+    bboxes_letter = x[:, :4].copy()
+    masks_160 = pp.process_mask_160(proto, x[:, 6:], bboxes_letter)
+    orig_h, orig_w = orig_shape
+    pad_left = round(pad[0] / 2 - 0.1)
+    pad_top = round(pad[1] / 2 - 0.1)
+    gain = scale
+    x[:, 0] = (x[:, 0] - pad_left) / gain
+    x[:, 1] = (x[:, 1] - pad_top) / gain
+    x[:, 2] = (x[:, 2] - pad_left) / gain
+    x[:, 3] = (x[:, 3] - pad_top) / gain
+    if not pp.EVAL_PRECISE:
+        x[:, [0, 2]] = np.clip(x[:, [0, 2]], 0, orig_w)
+        x[:, [1, 3]] = np.clip(x[:, [1, 3]], 0, orig_h)
+    results = []
+    for i in range(len(x)):
+        cid = int(x[i, 5])
+        x1, y1, x2, y2 = x[i, :4]
+        if not pp.EVAL_PRECISE:
+            x1, y1, x2, y2 = (int(x1), int(y1), int(x2), int(y2))
+            mask_crop = np.zeros((orig_h, orig_w), dtype=np.uint8)
+            bx1, by1 = max(0, x1), max(0, y1)
+            bx2, by2 = min(orig_w, x2), min(orig_h, y2)
+            if bx2 > bx1 and by2 > by1:
+                m = cv2.resize(masks_160[i].astype(np.uint8), (orig_w, orig_h),
+                               interpolation=cv2.INTER_NEAREST)
+                mask_crop[by1:by2, bx1:bx2] = m[by1:by2, bx1:bx2] * 255
+            seg = mask_crop
+        else:
+            seg = masks_160[i]
+        obj = {
+            "bbox": [float(x1), float(y1), float(x2), float(y2)],
+            "score": float(x[i, 4]),
+            "class_id": cid,
+            "class_name": pp.COCO_CLASSES[cid] if cid < len(pp.COCO_CLASSES) else str(cid),
+            "masks_160": masks_160[i],
+        }
+        if not pp.EVAL_PRECISE:
+            obj["segmentation"] = seg
+        results.append(obj)
+    return results
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -1010,6 +1093,13 @@ def evaluate(task: str, data_dir: str, model_dir: str = '/app/model',
     sys.stderr.write(f'[EVAL] Модель: {model_name} (backend={backend})\n')
     pipeline = Pipeline(model_dir=str(model_path), model_name=model_name, backend=backend,
                         rknn_suffix=rknn_suffix)
+
+    # Мониторинг троттлинга: частоты NPU/CPU, температуры на время eval.
+    # Диагностика — в результат добавляются npu_freq_avg, cpu_freq_ratio,
+    # npu_temp_*, thermal_max_c, throttled (критерии — как в fps_bench/telemetry).
+    from telemetry import TelemetrySampler
+    sampler = TelemetrySampler(collect_cpu=True, interval=2.0)
+    sampler.start()
 
     # Eval mode: минимальный порог чтобы pycocotools сам выбрал оптимальный
     import sys as _sys2
@@ -1207,7 +1297,39 @@ def evaluate(task: str, data_dir: str, model_dir: str = '/app/model',
                         'class_id': obj['class_id'],
                     })
         else:
-            # segment/pose: обычный путь (кандидатов мало — NMS не узкое место)
+            # segment: NMS+masks при conf=0.001 — то же узкое место, что у detect
+            # (NMS на 30000 кандидатов + process_mask_160) → распараллеливаем
+            # финиш (NMS → masks → формат) в ThreadPool по числу больших ядер.
+            # pose: обычный путь (кандидатов мало — NMS не узкое место).
+            if task == 'segment' and post_mod is not None and hasattr(post_mod, 'nms'):
+                _orig_nms = post_mod.nms
+                try:
+                    import torch
+                    import torchvision
+                    torch.set_num_threads(1)
+                    _tv_nms = torchvision.ops.nms
+                except ImportError:
+                    _tv_nms = None
+                if _tv_nms is not None:
+                    def _fast_nms(boxes, scores, iou_threshold):
+                        try:
+                            tb = torch.from_numpy(np.ascontiguousarray(boxes, dtype=np.float32))
+                            ts = torch.from_numpy(np.ascontiguousarray(scores, dtype=np.float32))
+                            keep = _tv_nms(tb, ts, iou_threshold)
+                            return keep.numpy().astype(np.int64)
+                        except Exception:
+                            return _orig_nms(boxes, scores, iou_threshold)
+                    post_mod.nms = _fast_nms
+                    sys.stderr.write(f'[EVAL] segment parallel NMS: {_big_core_count()} workers\n')
+                    n_workers = _big_core_count()
+                    _pool = _cf.ThreadPoolExecutor(max_workers=n_workers)
+                else:
+                    _pool = None
+            else:
+                _pool = None
+
+            futures = {}
+            meta_by_img = {}
             for img_id, img_info in images.items():
                 if limit and total >= limit:
                     break
@@ -1215,6 +1337,28 @@ def evaluate(task: str, data_dir: str, model_dir: str = '/app/model',
                 frame = cv2.imread(img_path)
                 if frame is None:
                     errors += 1
+                    continue
+                if _pool is not None:
+                    h, w = frame.shape[:2]
+                    from percept.io import letterbox
+                    canvas, scale, pad = letterbox(frame, pipeline.input_size)
+                    rgb = cv2.cvtColor(canvas, cv2.COLOR_BGR2RGB).astype(np.float32)
+                    tensor = np.expand_dims(rgb.transpose(2, 0, 1), axis=0)
+                    if pipeline._backend.backend == 'cpu':
+                        tensor = tensor / 255.0
+                    outputs = pipeline._backend.infer(tensor)
+                    meta_by_img[img_id] = (scale, pad, (h, w))
+                    pre = _seg_pre_nms(post_mod, outputs)
+                    if pre is not None:
+                        x, proto = pre
+                        futures[img_id] = _pool.submit(
+                            _seg_nms_finish, post_mod, x, proto, scale, pad, (h, w), _fast_nms)
+                    else:
+                        futures[img_id] = None
+                    eval_img_ids.append(img_id)
+                    total += 1
+                    if total % 500 == 0:
+                        sys.stderr.write(f'[EVAL] {total}/{len(images)}\n')
                     continue
                 objects, meta = pipeline.detect(frame)
                 coco_results.extend(detections_to_coco(objects, img_id, cat_ids))
@@ -1258,6 +1402,40 @@ def evaluate(task: str, data_dir: str, model_dir: str = '/app/model',
                 total += 1
                 if total % 500 == 0:
                     sys.stderr.write(f'[EVAL] {total}/{len(images)}\n')
+
+            if _pool is not None:
+                _pool.shutdown()
+                for img_id, fut in futures.items():
+                    futures[img_id] = fut.result() if fut is not None else []
+                for img_id in eval_img_ids:
+                    objects = futures[img_id]
+                    scale, pad, (h, w) = meta_by_img[img_id]
+                    coco_results.extend(detections_to_coco(objects, img_id, cat_ids))
+                    pad_left = round(pad[0] / 2 - 0.1)
+                    pad_top = round(pad[1] / 2 - 0.1)
+                    isz = pipeline.input_size
+                    sx = (isz - pad[0]) / w
+                    sy = (isz - pad[1]) / h
+                    scales_pads[img_id] = (sx, sy, pad_left, pad_top)
+                    preds_by_img[img_id] = []
+                    for obj in objects:
+                        x1, y1, x2, y2 = obj['bbox']
+                        preds_by_img[img_id].append({
+                            'bbox_xyxy_letter': [
+                                x1 * scale + pad_left, y1 * scale + pad_top,
+                                x2 * scale + pad_left, y2 * scale + pad_top,
+                            ],
+                            'kpts_letter': None,
+                            'score': obj['score'],
+                            'class_id': obj['class_id'],
+                        })
+                    anns = [a for a in ann_by_img.get(img_id, []) if not a.get('iscrowd', 0)]
+                    tp_m, conf, pred_cls, gt_cls = _seg_tp_per_image(
+                        anns, objects, sx, sy, pad_left, pad_top)
+                    seg_tp.append(tp_m)
+                    seg_conf.append(conf)
+                    seg_pred_cls.append(pred_cls)
+                    seg_gt_cls.append(gt_cls)
 
         sys.stderr.write(f'[EVAL] mAP ({len(coco_results)} pred)...\n')
         if os.environ.get('EVAL_DUMP_PREDS'):
@@ -1424,6 +1602,9 @@ def evaluate(task: str, data_dir: str, model_dir: str = '/app/model',
     metrics['elapsed_s'] = round(elapsed, 1)
     metrics['model'] = model_name
     metrics['task'] = task
+
+    sampler.stop()
+    metrics.update(sampler.summarize())
 
     sys.stderr.write(f'[EVAL] Готово за {elapsed:.0f}с: {json.dumps(metrics)}\n')
     return metrics

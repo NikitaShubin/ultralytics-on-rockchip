@@ -102,6 +102,7 @@ RKNN-деплой отложен по решению пользователя. �
 - **ВНИМАНИЕ (2026-08-07): `/tmp/opencode` ОЧИЩЕН при перезагрузке** — все бэкапы и ad-hoc скрипты утеряны. Не полагаться на /tmp/opencode.
 
 ### Completed (технические фиксы, без значений метрик)
+- **Телеметрия в eval (2026-08-11)**: (1) `benchmark/telemetry.py` НЕ импортировал numpy → eval падал в `summarize()` с `NameError: name 'np' is not defined`. Фикс: добавлен `import numpy as np`. (2) NPU-частота/загрузка НЕ читались внутри контейнера (`/sys/kernel/debug` недоступен) → `npu_freq_avg/load` были null. Фикс: в `convert/docker-compose.yml` добавлен mount `/sys/kernel/debug:/sys/kernel/debug:ro`. Теперь eval возвращает полную телеметрию (freq=1000 МГц, load, temps, cpu_freq_ratio, throttled).
 - **ПРОБЛЕМА one2one РЕШЕНА (2026-08-07)**: yolo26 end2end-модели: ультралайтс `model.fuse()` (Exporter, exporter.py:801-817) для end2end-голов УДАЛЯЕТ cv2/cv3 (one2many) и оставляет ТОЛЬКО one2one_cv2/one2one_cv3 → наш патч `_resolve_heads` неявно брал one2one → RK-opt давал другие логиты. **Фикс**: в `export_onnx_only`/`export_and_compile` перед export ставим `m.end2end=False` на всех модулях + `model.end2end=False` → fuse() оставляет cv2/cv3, RK-opt = one2many как std. Переэкспортированы все 6 RK-opt ONNX (проверено: model.23 cv3=30, one2one=0).
 - **YOLO12n = стандартная голова Detect** (reg_max=16, DFL, end2end=False, выход [1,84,8400]) — RK-opt патчи и шаблоны yolo11 подошли БЕЗ изменений; отличие только в backbone (A2C2f attention). Официальных весов yolo12 для seg/pose/obb/cls НЕТ — только detect n/s/m/l/x.
 - **Pose: GT в letterboxed-пространстве**: у ultralytics `Format(normalize=True)` нормализует bboxes/kpts по letterboxed-изображению 640×640 (LetterBox уже применил scale+pad); `_prepare_batch` умножает на imgsz → GT в letterboxed 640-пространстве. GT маппится как `orig_px*scale + pad` (НЕ `orig_px/iw*640`). letterbox percept `round`→`ceil` (ultralytics использует `min(math.ceil(w*scale), imgsz)`) → входы pixel-идентичны.
@@ -125,13 +126,23 @@ RKNN-деплой отложен по решению пользователя. �
   → NMS = **1.35с/кадр** на ARM (у ultralytics `.val()` ТО ЖЕ САМОЕ — тот же `torchvision.ops.nms`
   на тех же 30000; int8 быстрый, т.к. квантование обнуляет шум). **Фикс**: детект-ветка eval.py
   переведена на конвейер — infer (NPU) последовательно в главном потоке, pre-NMS шаги
-  (decode/expand/sort) там же, NMS+reverse+format — в `ThreadPoolExecutor` по числу "больших" ядер
-  (`_big_core_count()` — авто через `/sys/devices/system/cpu/cpu*/cpufreq/cpuinfo_max_freq`, на RK3588 = 4×A76;
-  8 воркеров ХУЖЕ из-за 4×A55: замер 4=11.8с vs 8=17.2с на 8 кадрах). torchvision NMS освобождает GIL →
-  потоки дают реальный параллелизм. Ускорение: 1500→507мс/кадр (2.7x, 93% от теоретического предела
-  для 4 ядер), полный fp16 eval yolo26n = **42 мин** вместо ~2ч. Результаты байт-в-байт совпадают с
-  шаблонным `postprocess` (сверка в prof_one_frame.py: OK). `_detect_pre_nms`/`_detect_nms_finish` —
-  точная копия шагов detect_postprocess.py:137-203. Батч-инференс не встроен (см. ниже).
+  (decode/expand/sort) там же, NMS+reverse+format — в `ThreadPoolExecutor` по числу ядер
+  (`_big_core_count()` = все ядра из sched_getaffinity, на RK3588 = 8; решение пользователя 2026-08-12:
+  прежний замер «8 хуже 4» (11.8с vs 17.2с на 8 кадрах) был артефактом методики — полный прогон
+  probe_parallel показал N=4→3.0-3.5x, N=8 ещё +9% на detect и ровную загрузку A55). torchvision NMS
+  освобождает GIL → потоки дают реальный параллелизм. Ускорение: 1500→507мс/кадр (2.7x, 93% от
+  теоретического предела для 4 ядер), полный fp16 eval yolo26n = **42 мин** вместо ~2ч.
+  Результаты байт-в-байт совпадают с шаблонным `postprocess` (сверка в prof_one_frame.py: OK).
+  `_detect_pre_nms`/`_detect_nms_finish` — точная копия шагов detect_postprocess.py:137-203.
+  Батч-инференс не встроен (см. ниже).
+- **Parallel segment NMS (2026-08-12)**: профиль показал, что в segment-ветке при conf=0.001
+  узкое место — постпроцесс 2.17с/кадр (NMS на 30000 кандидатов + process_mask_160), infer всего
+  77мс, coco-conv 1мс, seg_tp 61мс. **Фикс**: та же схема, что в detect — `_seg_pre_nms`
+  (decode→conf-filter→multi-label expand→cap, eval.py) на главном потоке, `_seg_nms_finish`
+  (class-aware NMS→process_mask_160→reverse letterbox→формат) в ThreadPool по `_big_core_count()`.
+  Проверено: 2.3с → 0.87с/кадр (2.6x); результаты байт-в-байт == шаблонному `postprocess`
+  (сверка в prof_seg_pipeline.py: 0/30 расхождений по bbox/score/class/masks_160).
+  Pose остаётся последовательным (кандидатов мало).
 - **Эксперимент батч-инференса (2026-08-10)**: `benchmark/prof_batch_infer.py` собрал std ONNX batch=8
   → RKNN fp16 static [8,3,640,640] (в /tmp/bs8_test_*, рабочие файлы НЕ тронуты) и замерил на реальном
   NPU: bs8×1 = 470ms на 8 кадров vs bs1×8 = 649ms → **1.38x** на yolo26n (nano — NPU недогружен и на
@@ -160,6 +171,39 @@ RKNN-деплой отложен по решению пользователя. �
   (8.4.105): пока образ не пересобран с новой версией — ничего не сломается.
 
 ### Active
+- **Исследование параллельности eval (probe_parallel.py, 2026-08-12)**: новый скрипт
+  `benchmark/probe_parallel.py` — ИЗОЛИРОВАННОЕ исследование без правок production-кода:
+  гоняет eval.py воркер-подпроцессом, monkeypatch `_big_core_count` через env
+  `PROBE_WORKERS` → подмена N воркеров ThreadPool; параллельно сэмплирует загрузку
+  CPU per-core (/proc/stat, interval 1с), частоты, NPU, температуры. Resume по
+  `cache/probe_parallel.json` (уже выполненные конфиги пропускаются), охлаждение до
+  `--max-cool-temp` (деф. 60°C) между прогонами, логи в `cache/probe_parallel_logs/`.
+  Авто-детект моделей из cache/ (по наличию .pt/.onnx/.rknn, задача по суффиксу имени),
+  датасеты по задаче (coco_val2017/dotav1/cityscapes/imagenet). ВАЖНО: воркеру нужен
+  `sys.path.insert(0, ROOT)` (eval.py лежит в /app/benchmark, а корень — /app);
+  `/app/benchmark` смонтирован `:ro` → результаты пишутся в `/app/cache` (writable).
+  Сравнение метрик в summary исключает телеметрию (npu_/cpu_/thermal_/throttled).
+- **ПОЛНЫЙ ПРОГОН (limit=300, fp16+onnx, 1/4/6/8, охлаждение 60°C, 2026-08-12)**:
+  | конфиг | N=1 | N=4 | N=6 | N=8 | выигрыш 1→4 |
+  |---|---|---|---|---|---|
+  | detect fp16 | 556с | 158с | 146с | 143с | **3.5x** |
+  | detect onnx | 47.7с | 48.1с | 47.0с | 47.5с | нет (все ядра в infer) |
+  | segment fp16 | 612с | 205с | 207с | 211с | **3.0x** |
+  | segment onnx | 107с | 104с | 105с | 106с | нет |
+  Метрики байт-в-байт эквивалентны по всем N. Загрузка A55 (fp16): detect 0→41→66→80%,
+  segment 8→62→66→65%. Троттлинга нет (tmax≤66°C, freq≥0.88). **Вывод**: N=4 даёт почти
+  весь выигрыш; N=8 добавляет лишь ~9% на detect (143 vs 158с), на segment — ничего
+  (плато после N=4, даже чуть хуже из-за перекоса медленных A55). ONNX-вариант не
+  распараллеливается (CPU-infer занял все ядра). **Решение пользователя (2026-08-12)**:
+  `_big_core_count()` переключен на ВСЕ ядра (8) — CPU должен быть загружен максимально
+  (равномерная загрузка A55 65–80%, проверено 8 workers). ВНИМАНИЕ: при N=8 телеметрия eval
+  может давать `throttled=true` c `cpu_freq≈0.80` — это НЕ тепловой троттлинг (tmax≤66°C),
+  а просто A55 на ondemand не держат max-частоту под полной нагрузкой; метрики не зависят.
+  pose/obb/sem/cls не прогонялись (нет кэшей) — при добавлении использовать probe_parallel.py
+  с теми же N. **N>8 проверен (2026-08-12)**: воркеры сверх числа ядер ВРЕДНЫ — detect
+  10/12/16 = 162/163/160с vs N=8 = 143с (+12%), segment 10/12/16 = 275/264/288с vs N=8 = 211с
+  (+25–35%); переключение контекста + GIL-контеншн (A76/A55 и так 94/88%). Метрики
+  эквивалентны. Оптимум = число ядер.
 - **Мониторинг троттлинга в fps_bench (2026-08-11)**: во время measure-окна сэмплируются
   NPU-частота (`/sys/kernel/debug/rknpu/freq`), NPU-температура (thermal_zone6), максимум температур
   всех thermal-зон и частоты CPU per-core (`scaling_cur_freq`). В результат: `npu_temp_avg/min/max`,
@@ -197,17 +241,23 @@ RKNN-деплой отложен по решению пользователя. �
   obb input 1024 → grid [128,64,32]).
 
 ### Next Move
-1. **Полный бенчмарк yolo26n-det** — планируется: `cd benchmark && python3 benchmark.py --phase all --model yolo26n`.
-   Полный eval **fp16** (5000, NPU) уже завершён напрямую eval.py (42 мин): map50=0.568, map50_95=0.408
-   (эталон на onnx-вариант benchmark.py возьмёт из eval.py onnx/cpu). Осталось прогнать
-   onnx(cpu)/int8/int8-calib варианты + validate/bench фазы. Оценка: ~3-4ч суммарно (все варианты
-   с параллельным NMS по ~45 мин каждый).
-2. **Interleaved runner**: smoke-тесты всех 6 задач ПРОЙДЕНЫ (col1==col2==col3, diverged=0).
+1. **Полный бенчмарк yolo26n-det ЗАВЕРШЁН (2026-08-11)**: `benchmark.py --phase all --model yolo26n`.
+   validate OK (58с), bench: CPU=5.2 / FP16=12.98 / INT8=17.31 / INT8-calib=17.29 fps.
+   eval (5000): **onnx map50=0.5684/map50_95=0.4085**, fp16 0.5677/0.4082, int8 0.5590/0.3986,
+   int8-calib 0.5576/0.3961. Все варианты throttled=false, NPU 1000 МГц, temp ≤65°C.
+   Результаты — `benchmark/results/results.json` + `summary.tsv`.
+2. **Полный бенчмарк yolo26n-seg ЗАВЕРШЁН (2026-08-12, 02:43)**: `benchmark.py --phase all --model yolo26n-seg`.
+   validate max_diff_avg=0.34 (OK), bench: CPU=3.62 / FP16=6.94 / INT8=8.06 / INT8-calib=8.03 fps.
+   eval (5000): **onnx seg50=0.5331/seg95=0.3321** (inmem_seg, mask-метрика), fp16 0.5320/0.3315,
+   int8 0.5206/0.3237, int8-calib 0.5176/0.3207. pycoco map50=0.33 (BOX-метрика, НЕ mask — см. SEG эквивалентность).
+   Все варианты throttled=false. Суммарное время eval: onnx 34 мин, fp16 3.2ч, int8 2.35ч, int8-calib 3.1ч
+   (segment-ветка медленнее detect — process_mask на CPU).
+3. **Interleaved runner**: smoke-тесты всех 6 задач ПРОЙДЕНЫ (col1==col2==col3, diverged=0).
    Полные прогоны (limit 500/5000) — по желанию пользователя.
-3. **YOLO26/YOLO12/YOLO11 3-way ЗАВЕРШЕНЫ** — см. PLAN.md. RKNN-деплой (int8) — отложен по решению пользователя.
-4. **obb на нативный 1024 — ЗАВЕРШЁН**: эталон всегда ultra .val на std ONNX (task='obb'); колонки col2/col3
+4. **YOLO26/YOLO12/YOLO11 3-way ЗАВЕРШЕНЫ** — см. PLAN.md. RKNN-деплой (int8) — отложен по решению пользователя.
+5. **obb на нативный 1024 — ЗАВЕРШЁН**: эталон всегда ultra .val на std ONNX (task='obb'); колонки col2/col3
    байт-в-байт; не-нативные артефакты удалены.
-5. **Регрессия конвертера** (mini-метрики на конвертерных файлах) — по желанию пользователя.
+6. **Регрессия конвертера** (mini-метрики на конвертерных файлах) — по желанию пользователя.
 
 ### Relevant Files
 - `PLAN.md` — план/статус всей работы (источник истины)
@@ -220,4 +270,4 @@ RKNN-деплой отложен по решению пользователя. �
 - `benchmark/export_std_onnx.py` — штатный экспорт std ONNX на нативном imgsz (без override) + перегенерация postprocess
 - `percept/inference/__init__.py`: `/255.0` moved from `infer()` to default letterbox path only
 - `benchmark/eval.py`: MIN_WH=1/MAX_DET=300/DEDUP_ENABLED=False в eval mode; `compute_inmemory_box_map`, `compute_inmemory_pose_map` (GT=orig_px*scale+pad), `compute_inmemory_obb_map` + `xyxyxyxy2xywhr_np`, `compute_inmemory_seg_map` (polygons2masks_overlap + декод + gt_cls[order]); EVAL_DUMP_PREDS→`benchmark/dump_preds.pkl`; ветка detect/pose/segment собирает preds_by_img/scales_pads; **per-image tp-функции `_box/_pose/_seg/_obb_tp_per_image` + `_ap_finalize(prefix=...)`, `_seg_finalize` — обёртка над `_ap_finalize` (2026-08-08)**; `load_yolo_as_coco` возвращает 4 значения (`images, ann_by_img, cat_ids, tmp.name`); **parallel NMS конвейер в detect-ветке (2026-08-10)**: `_detect_pre_nms` + `_detect_nms_finish` + `_big_core_count()`, NMS в ThreadPool по числу "больших" ядер, infer последовательно — полный fp16 eval yolo26n 5000 кадров за 42 мин (2.7x)
-- `benchmark/prof_one_frame.py` — поэтапный профиль 1 кадра (letterbox/pre-NMS/NMS/finish) + сверка конвейерной пары == шаблонный postprocess (OK); `benchmark/prof_nms.py` — torchvision vs ultralytics NMS на 30000 кандидатов; `benchmark/prof_nms_parallel.py` — ThreadPool (4) vs ProcessPool (8) vs sequential; `benchmark/prof_batch_infer.py` — RKNN батч-8 vs bs1×8 на реальном NPU (1.38x)
+- `benchmark/prof_one_frame.py` — поэтапный профиль 1 кадра (letterbox/pre-NMS/NMS/finish) + сверка конвейерной пары == шаблонный postprocess (OK); `benchmark/prof_nms.py` — torchvision vs ultralytics NMS на 30000 кандидатов; `benchmark/prof_nms_parallel.py` — ThreadPool (4) vs ProcessPool (8) vs sequential; `benchmark/prof_batch_infer.py` — RKNN батч-8 vs bs1×8 на реальном NPU (1.38x); `benchmark/prof_seg_pipeline.py` — поэтапный профиль segment-ветки (infer/pp/coco-conv/seg_tp) + сверка конвейерной пары `_seg_pre_nms`+`_seg_nms_finish` == шаблонный postprocess (0/30 расхождений); `benchmark/probe_parallel.py` — исследование числа воркеров eval (см. Active): воркер-подпроцесс + cpu-load sampler, resume, охлаждение; результаты в `cache/probe_parallel*.json`, логи в `cache/probe_parallel_logs/`

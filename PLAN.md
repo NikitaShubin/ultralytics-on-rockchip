@@ -75,8 +75,9 @@ deploy.sh <model> --fp16|--int8|--onnx
   ровно то же самое — тот же `torchvision.ops.nms` на тех же 30000 (int8 быстрый: квантование
   обнуляет шум).
 - **Фикс** (детект-ветка eval.py): infer на NPU — последовательно в главном потоке; pre-NMS шаги
-  (decode/expand/sort) там же; NMS+reverse+format — в `ThreadPoolExecutor` по числу "больших" ядер
-  (`_big_core_count()`: авто по `cpuinfo_max_freq`, RK3588 → 4×A76; 8 воркеров хуже — 4×A55 тормозят).
+  (decode/expand/sort) там же; NMS+reverse+format — в `ThreadPoolExecutor` по числу ядер
+  (`_big_core_count()` = все ядра из sched_getaffinity, RK3588 = 8; решение пользователя 2026-08-12,
+  подробности — AGENTS.md «Исследование параллельности eval»).
   torchvision NMS освобождает GIL → реальный параллелизм без ProcessPool-оверхеда.
 - **Результат**: 1500→507мс/кадр (**2.7x**, 93% теоретического предела для 4 ядер); полный fp16 eval
   yolo26n (5000 кадров) = **2535с (42 мин)** вместо ~2ч. Метрики байт-в-байт совпадают с шаблонным
