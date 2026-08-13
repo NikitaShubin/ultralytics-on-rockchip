@@ -17,6 +17,24 @@ CITYSCAPES_HF_REPO = 'Antreas/Cityscapes'
 IMAGENET_VAL_URL = 'https://image-net.org/data/ILSVRC/2012/ILSVRC2012_img_val.tar'
 IMAGENET_VALPREP_URL = 'https://raw.githubusercontent.com/soumith/imagenetloader.torch/master/valprep.sh'
 
+# COCO: официальный источник images.cocodataset.org может быть недоступен
+# (DPI/гео-блокировка), поэтому указаны фолбэк-зеркала на HuggingFace.
+COCO_ANN_ZIP_URL = 'http://images.cocodataset.org/annotations/annotations_trainval2017.zip'
+# Зеркало аннотаций: по одному JSON на файл (instances + person_keypoints).
+COCO_ANN_MIRROR_JSONS = (
+    ('https://huggingface.co/datasets/merve/coco/resolve/main/annotations/instances_val2017.json',
+     'instances_val2017.json'),
+    ('https://huggingface.co/datasets/merve/coco/resolve/main/annotations/person_keypoints_val2017.json',
+     'person_keypoints_val2017.json'),
+)
+# Изображения val2017: официальный zip или зеркало (kaggle-дамп 5000 jpg).
+COCO_IMAGES_URLS = (
+    'http://images.cocodataset.org/zips/val2017.zip',
+    'https://huggingface.co/datasets/baohao/coco2017/resolve/main/coco_val2017.zip',
+)
+# У зеркала baohao/coco2017 файлы лежат во вложенных папках kaggle/input/...
+COCO_IMAGES_STRIP_PREFIXES = ('kaggle/input/coco-2017-dataset/coco2017/',)
+
 # Встроенные мини-датасеты ultralytics, используемые для INT8-конвертации
 # (TASK2CALIBRATIONDATA) и smoke-проверок. Ключи — задачи проекта.
 MINI_DATASETS = {
@@ -50,30 +68,81 @@ def ensure_dir(path: Path) -> None:
         sys.exit(1)
 
 
-def download_file(url: str, dest: Path) -> None:
+def download_file(urls, dest: Path) -> None:
     """Загрузка файла: сначала в .tmp, потом rename (защита от битых загрузок).
 
-    Поддерживает докачку: если .tmp существует и больше нуля, curl -C - продолжит.
+    Принимает один URL или список URL (фолбэк-источники — перебираются по порядку,
+    пока один не скачается полностью). Поддерживает докачку (-C -): если .tmp
+    существует и больше нуля, загрузка продолжится с места обрыва.
     """
+    if isinstance(urls, str):
+        urls = [urls]
+    if not urls:
+        raise ValueError('Нет источников для скачивания')
+
     if dest.exists() and dest.stat().st_size > 0:
         print(f'Файл уже существует: {dest}')
         return
+
     tmp = dest.with_suffix('.tmp')
-    # Не удаляем .tmp если он большой — возможно это частичная загрузка (докачка)
-    if tmp.exists() and tmp.stat().st_size > 1_000_000:
-        print(f'Докачка {tmp} ({tmp.stat().st_size // (1024*1024)} MB)...')
-    else:
-        tmp.unlink(missing_ok=True)
-    print(f'Загрузка {url}...')
-    subprocess.run(
-        ['curl', '-fSL', '--progress-bar', '-C', '-', '-o', str(tmp), url],
-        check=True,
+    last_err = None
+    for idx, url in enumerate(urls):
+        # Докачка возможна только если .tmp остался от ТОГО ЖЕ источника (первая попытка);
+        # при смене URL другой файл докачивать нельзя.
+        resume = idx == 0 and tmp.exists() and tmp.stat().st_size > 1_000_000
+        if not resume:
+            tmp.unlink(missing_ok=True)
+        if resume:
+            print(f'Докачка {tmp} ({tmp.stat().st_size // (1024*1024)} MB)...')
+        print(f'Загрузка {url}...')
+        try:
+            subprocess.run(
+                ['curl', '-fSL', '--progress-bar', '-L', '--retry', '2',
+                 '--retry-delay', '5', '--connect-timeout', '20',
+                 '--speed-limit', '1000', '--speed-time', '15',
+                 '-C', '-', '-o', str(tmp), url],
+                check=True,
+            )
+            if tmp.stat().st_size == 0:
+                tmp.unlink(missing_ok=True)
+                raise RuntimeError(f'Загрузка вернула пустой файл: {url}')
+            tmp.rename(dest)
+            print(f'Загружен: {dest} ({dest.stat().st_size // (1024*1024)} MB)')
+            return
+        except (subprocess.CalledProcessError, RuntimeError) as e:
+            last_err = e
+            print(f'    Не удалось ({e}). Пробую следующий источник...', file=sys.stderr)
+            tmp.unlink(missing_ok=True)
+
+    raise RuntimeError(
+        f'Все источники недоступны: {urls}\nПоследняя ошибка: {last_err}'
     )
-    if tmp.stat().st_size == 0:
-        tmp.unlink(missing_ok=True)
-        raise RuntimeError(f'Загрузка вернула пустой файл: {url}')
-    tmp.rename(dest)
-    print(f'Загружен: {dest} ({dest.stat().st_size // (1024*1024)} MB)')
+
+
+def _extract_zip(zip_path: Path, dest: Path, strip_prefixes=()) -> None:
+    """Распаковать zip-архив в dest, опционально убирая префикс путей.
+
+    strip_prefixes — кортеж префиксов; для каждой записи первый совпавший префикс
+    вырезается из пути (нужно для зеркал, где архив лежит во вложенных папках,
+    напр. kaggle/input/.../).
+    """
+    validate_zip(zip_path)
+    with zipfile.ZipFile(zip_path, 'r') as z:
+        for entry in z.namelist():
+            name = entry
+            for pref in strip_prefixes:
+                if entry.startswith(pref):
+                    name = entry[len(pref):]
+                    break
+            if not name or name.startswith('__MACOSX/') or name.startswith('.DS_Store'):
+                continue
+            target = dest / name
+            if entry.endswith('/'):
+                target.mkdir(parents=True, exist_ok=True)
+            else:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                with z.open(entry) as src, open(target, 'wb') as dst:
+                    dst.write(src.read())
 
 
 def validate_zip(path: Path) -> None:
@@ -108,6 +177,38 @@ def validate_tar(path: Path) -> None:
         )
 
 
+def _ensure_coco_annotations(coco_dir: Path, ann_dir: Path) -> None:
+    """Аннотации COCO: официальный zip или фолбэк-зеркало на HF (по одному JSON).
+
+    Возможные файлы (detect/seg/obb используют instances, pose — person_keypoints).
+    """
+    ann_zip = DATASETS_DIR / 'annotations_trainval2017.zip'
+    try:
+        download_file(COCO_ANN_ZIP_URL, ann_zip)
+    except RuntimeError as e:
+        print(f'Официальный источник недоступен ({e}).', file=sys.stderr)
+        print('Качаю аннотации с зеркала HuggingFace (merve/coco)...')
+        ann_dir.mkdir(parents=True, exist_ok=True)
+        for url, name in COCO_ANN_MIRROR_JSONS:
+            dest = ann_dir / name
+            if not dest.exists() or dest.stat().st_size == 0:
+                download_file(url, dest)
+        return
+
+    print('Распаковка аннотаций...')
+    _extract_zip(ann_zip, coco_dir)
+    ann_zip.unlink(missing_ok=True)
+
+
+def _ensure_coco_images(coco_dir: Path, images_dir: Path) -> None:
+    """Изображения COCO val2017: официальный zip или зеркало HF (kaggle-дамп)."""
+    img_zip = DATASETS_DIR / 'val2017.zip'
+    download_file(COCO_IMAGES_URLS, img_zip)
+    print('Распаковка изображений (это может занять время)...')
+    _extract_zip(img_zip, coco_dir / 'images', COCO_IMAGES_STRIP_PREFIXES)
+    img_zip.unlink(missing_ok=True)
+
+
 def setup_coco_val2017() -> None:
     """Загрузка COCO val2017 (5000 изображений + аннотации)."""
     coco_dir = DATASETS_DIR / 'coco_val2017'
@@ -127,33 +228,11 @@ def setup_coco_val2017() -> None:
 
     # Аннотации
     if not (ann_dir.exists() and any(ann_dir.glob('*.json'))):
-        ann_url = 'http://images.cocodataset.org/annotations/annotations_trainval2017.zip'
-        ann_zip = DATASETS_DIR / 'annotations_trainval2017.zip'
-        if not ann_zip.exists():
-            download_file(ann_url, ann_zip)
-
-        print('Распаковка аннотаций...')
-        validate_zip(ann_zip)
-        with zipfile.ZipFile(ann_zip, 'r') as z:
-            z.extractall(coco_dir)
-
-        # Архив успешно распакован — удаляем, чтобы не занимать место
-        ann_zip.unlink(missing_ok=True)
+        _ensure_coco_annotations(coco_dir, ann_dir)
 
     # Изображения
     if not (images_dir.exists() and any(images_dir.glob('*.jpg'))):
-        img_url = 'http://images.cocodataset.org/zips/val2017.zip'
-        img_zip = DATASETS_DIR / 'val2017.zip'
-        if not img_zip.exists():
-            download_file(img_url, img_zip)
-
-        print('Распаковка изображений (это может занять время)...')
-        validate_zip(img_zip)
-        with zipfile.ZipFile(img_zip, 'r') as z:
-            z.extractall(coco_dir / 'images')
-
-        # Архив успешно распакован — удаляем, чтобы не занимать место
-        img_zip.unlink(missing_ok=True)
+        _ensure_coco_images(coco_dir, images_dir)
 
     print(f'COCO val2017 готова: {coco_dir}')
 

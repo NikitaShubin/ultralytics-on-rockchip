@@ -106,6 +106,7 @@ def ensure_dataset(model) -> None:
         [sys.executable, str(SETUP_SCRIPT), flag],
         cwd=str(PROJECT_DIR),
         timeout=7200,
+        check=True,
     )
 
 
