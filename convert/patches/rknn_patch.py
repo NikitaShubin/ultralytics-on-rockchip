@@ -91,7 +91,7 @@ def _rknn_semantic_segment(self, x):
     Возвращает upsampled logits [B, nc, H, W] (без argmax — он перенесён
     в постпроцесс, см. semantic_postprocess.py). Апсэмпл ОБЯЗАН быть bilinear
     (align_corners=False) — тем же, что в std-экспорте (SemanticSegment.forward),
-    иначе RK-opt logits не совпадут со std и col3 просядет (~0.03 mIoU на
+    иначе RK-opt logits не совпадут со std и rko просядет (~0.03 mIoU на
     cityscapes8 из-за nearest). RKNN-поддержка bilinear Upsample: в целевом
     runtime на NPU может исполняться на CPU — проверить при RKNN-деплое.
     """

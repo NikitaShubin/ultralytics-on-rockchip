@@ -1116,7 +1116,7 @@ def evaluate(task: str, data_dir: str, model_dir: str = '/app/model',
 
         # Fast NMS: RKNN-квантование даёт шум в cls_scores → при conf=0.001
         # сотни тысяч кандидатов → numpy-цикл NMS = секунды на кадр.
-        # Используем torchvision.ops.nms (C++, тот же greedy, что у col1/ultralytics),
+        # Используем torchvision.ops.nms (C++, тот же greedy, что у ref/ultralytics),
         # если torch доступен; иначе fallback на numpy. Продакшен-рантайм не трогаем.
         if hasattr(post_mod, 'nms'):
             _orig_nms = post_mod.nms

@@ -25,9 +25,9 @@
 
 ### Доказать для КАЖДОЙ модели (yolo11n, yolo12n, yolo26n) и каждой задачи
 (det / seg / pose / cls / obb / sem):
-- col1 = ultralytics `.val()` (эталон)
-- col2 = `benchmark/eval.py` Pipeline на std ONNX (должен совпасть с col1)
-- col3 = `benchmark/eval.py` Pipeline на RK-opt ONNX (= формат выхода RKNN, что деплоится)
+- ref = ultralytics `.val()` (эталон)
+- std = `benchmark/eval.py` Pipeline на std ONNX (должен совпасть с ref)
+- rko = `benchmark/eval.py` Pipeline на RK-opt ONNX (= формат выхода RKNN, что деплоится)
 - **Вывод в PLAN: развёрнутый конвертером postprocess обязан совпадать с доказанным.**
 
 ## 2. Поток деплоя (что проверяем)
@@ -50,8 +50,8 @@ deploy.sh <model> --fp16|--int8|--onnx
 
 ## 3. ТЕКУЩИЙ СТАТУС (2026-08-09)
 
-### 3.1 Доказанная эквивалентность col2 == col1
-Все 3-way проверки (col1/col2/col3) по задачам и линейкам ЗАВЕРШЕНЫ — три колонки
+### 3.1 Доказанная эквивалентность std == ref
+Все 3-way проверки (ref/std/rko) по задачам и линейкам ЗАВЕРШЕНЫ — три колонки
 совпадали (см. раздел «Работа по этапам»). Числовые значения удалены по решению
 пользователя; бенчмарки переснимаются заново через `benchmark/benchmark.py`.
 
@@ -112,19 +112,19 @@ deploy.sh <model> --fp16|--int8|--onnx
 Перегенерировать postprocess конвертером для yolo11n_std и прогнать eval.
 Значения после перегенерации НЕ должны измениться (эквивалентность не должна сломаться).
 
-### Этап C. RK-opt (col3) и RKNN деплой
+### Этап C. RK-opt (rko) и RKNN деплой
 - 3-way по yolo11n ЗАВЕРШЁН (RK-opt conversion loss для большинства задач = 0 —
-  col3 байт-в-байт == col2; для detect — малый conversion loss). Значения удалены.
-- **obb на нативном 1024**: эквивалентность пайплайнов доказана (col1/col2/col3 на одном
+  rko байт-в-байт == std; для detect — малый conversion loss). Значения удалены.
+- **obb на нативном 1024**: эквивалентность пайплайнов доказана (ref/std/rko на одном
   1024 байт-в-байт). НЕнативный 640 давал заниженные метрики и переделан на 1024.
-- **ВАЖНО про pose col1**: прежнее значение было снято на БИТЫХ yolo-лейблах (до их
-  регенерации). Корректный col1 — на исправленных лейблах (совпадал с col2).
+- **ВАЖНО про pose ref**: прежнее значение было снято на БИТЫХ yolo-лейблах (до их
+  регенерации). Корректный ref — на исправленных лейблах (совпадал с std).
 - Осталось: RKNN деплой (int8), регрессия конвертера.
 
 ### Этап D. yolo26
 - Скачать yolo26n (.pt), сконвертировать std ONNX + RK-opt ONNX.
 - Разобрать голову yolo26 (Detect26 etc.) и её постпроцесс (зонд выходов).
-- Валидировать col1/col2/col3 по всем задачам. sem тоже.
+- Валидировать ref/std/rko по всем задачам. sem тоже.
 - Учесть: `rknn_patch.py` уже содержит `_patch_detect26`-и-подобные для yolo26.
 
 **Статус: все 6 задач (detect/pose/seg/obb/cls/sem) ЗАВЕРШЕНЫ — три колонки совпадали
@@ -135,10 +135,10 @@ deploy.sh <model> --fp16|--int8|--onnx
 - **one2one-проблема РЕШЕНА**: `m.end2end=False` перед export в convert.py — иначе fuse()
   удаляет cv2/cv3 и оставляет только one2one-головы → RK-opt давал другие логиты.
 - **sem**: eval.py semantic ветка реализована (compute_inmemory_sem_map, letterbox_semantic_gt
-  pad=255, apply_cityscapes_label_mapping). Метод col1 подтверждён (`SemanticSegmentationValidator`
-  есть в 8.4.105). **Фикс col3 (2026-08-07)**: `_rknn_semantic_segment` (rknn_patch.py:96)
-  РАНЬШЕ заменял bilinear→nearest → col3 != col2. Переведён на bilinear align_corners=False
-  (как std) + переэкспорт RK-opt ONNX → col3 == col2 байт-в-байт.
+  pad=255, apply_cityscapes_label_mapping). Метод ref подтверждён (`SemanticSegmentationValidator`
+  есть в 8.4.105). **Фикс rko (2026-08-07)**: `_rknn_semantic_segment` (rknn_patch.py:96)
+  РАНЬШЕ заменял bilinear→nearest → rko != std. Переведён на bilinear align_corners=False
+  (как std) + переэкспорт RK-opt ONNX → rko == std байт-в-байт.
   RKNN-поддержка bilinear Upsample на NPU — проверить при RKNN-деплое (иначе упадёт на CPU).
 - **БАГ порога raw mask** в eval.py: был `gt.max() > 50`, а cityscapes8 маски — raw labelIds
   7..33 (max 33) → label_mapping не применялся. Фикс: порог `> 18` (trainId всегда 0..18).
@@ -197,8 +197,8 @@ deploy.sh <model> --fp16|--int8|--onnx
 
 Открытая аномалия: наш RK-opt fp32 (0.523) на ~3.5% ниже std (0.542) на полном val2017
 (на coco128: 0.64 vs 0.6744, -5%), хотя ранее доказывалась байт-в-байт эквивалентность
-col1/col2/col3 для yolo11n detect. Возможная причина — RK-opt ONNX после force-перегенерации
-или разные конфиги eval. Требует проверки (interleaved col2 vs col3).
+ref/std/rko для yolo11n detect. Возможная причина — RK-opt ONNX после force-перегенерации
+или разные конфиги eval. Требует проверки (interleaved std vs rko).
 
 ### Этап G. Sweep nano-моделей от версии 3 (ЗАВЕРШЕН)
 Причина: пользователь хотел проверить эквивалентность всех непроверенных nano-моделей,
@@ -212,16 +212,16 @@ col1/col2/col3 для yolo11n detect. Возможная причина — RK-o
   end2end=False → raw).
 - yolo11n / yolo12n / yolo26n — уже ЗАВЕРШЕНЫ.
 
-**yolov8n detect 3-way ЗАВЕРШЁН** (полный прогон): col1 == col2 == col3 байт-в-байт
+**yolov8n detect 3-way ЗАВЕРШЁН** (полный прогон): ref == std == rko байт-в-байт
 (разница 1 pred на повторе = tie-break NMS; метрики равны).
-- **Фикс col1**: `datasets/coco8` был СИМЛИНКОМ на хостовый абсолютный путь
+- **Фикс ref**: `datasets/coco8` был СИМЛИНКОМ на хостовый абсолютный путь
   (`convert/datasets/coco8`) → внутри контейнера битый → `check_det_dataset` падал
   ("images not found, missing path ..."). Заменён реальной копией.
   УРОК: в `datasets/` НЕ должно быть симлинков на хостовые пути — только реальные директории.
 
 **Полный свип всех линеек ЗАВЕРШЁН (2026-08-09, ночь)** — 9 прогонов
 (yolov8n detect/seg/pose/obb/cls, yolov5nu, yolov3-tinyu, yolov9t, yolov10n),
-ВЕЗДЕ col1==col2==col3, errors 0. Значения удалены.
+ВЕЗДЕ ref==std==rko, errors 0. Значения удалены.
 - **Diverged (всего ~25 кадров из ~38k) — подтверждённый near-tie**: у ultralytics-NMS
   и нашего NMS при почти/равном score (разница ≤ 1e-6) редкие кадры выбирают разных
   кандидатов; повторы могут давать разное число preds (недетерминизм torch-NMS).
@@ -265,7 +265,7 @@ RT-DETR / YOLOE / YOLO-World / YOLO-NAS — НЕ включаются (RKNN не
 ### Этап H. Interleaved runner (benchmark/run_3way_eval.py)
 `benchmark/run_3way_eval.py` переписан на interleaved-режим (единственный). Вместо трёх
 отдельных прогонов по задачам (старый per-column) — ОДИН цикл по кадрам: на каждом кадре
-col1 (ultralytics NMS на том же std-тензоре), col2 (наш std постпроцесс), col3 (наш RK-opt
+ref (ultralytics NMS на том же std-тензоре), std (наш std постпроцесс), rko (наш RK-opt
 постпроцесс); сразу сравнение preds (допуски: score 1e-6, bbox 1e-3, angle 1e-4, kpts 1e-3,
 mask 0.01; class_id строго), инкрементальные per-image tp-агрегаты (`_box/_pose/_seg/_obb_tp_per_image`
 + `_ap_finalize(prefix=...)`), diverged-счётчики (при расхождении сохраняются только эти изображения).
@@ -273,23 +273,23 @@ mask 0.01; class_id строго), инкрементальные per-image tp-�
 **Ключевые технические решения**:
 - Pipeline не используется — `Pipeline._load_postprocess` грузит глобальный `sys.modules['postprocess_mod']`;
   работаем с `ModelBackend` напрямую, постпроцессы загружаются под уникальными именами (`pp_std`, `pp_rko`).
-- col1 = `non_max_suppression(max_time_img=1000)` из `ultralytics.utils.nms` (НЕ ops) на std_raw
-  (letterboxed-пространство); col2/col3 — наш постпроцесс (orig) → перевод в letterboxed через `x*scale+pad_left`.
-- pycoco в интерливе не нужен; classify/semantic: col1 == col2 по построению (тот же std_raw);
+- ref = `non_max_suppression(max_time_img=1000)` из `ultralytics.utils.nms` (НЕ ops) на std_raw
+  (letterboxed-пространство); std/rko — наш постпроцесс (orig) → перевод в letterboxed через `x*scale+pad_left`.
+- pycoco в интерливе не нужен; classify/semantic: ref == std по построению (тот же std_raw);
   semantic — инкрементальная confusion-матрица per-image (OOM-фикс).
-- Результат: `cache/3way_results/<model>-<task>_interleaved.json` (col1/col2/col3, diverged-счётчики,
+- Результат: `cache/3way_results/<model>-<task>_interleaved.json` (ref/std/rko, diverged-счётчики,
   equal-флаги, preds). Флаги: `--limit/--force/--save-diverged/--diverged-dir`.
 
-**Статус**: smoke-тесты всех 6 задач ПРОЙДЕНЫ (col1==col2==col3, diverged=0), mini-прогоны
+**Статус**: smoke-тесты всех 6 задач ПРОЙДЕНЫ (ref==std==rko, diverged=0), mini-прогоны
 всех 6 задач ЗАВЕРШЕНЫ, полный свип всех линеек ЗАВЕРШЁН. Значения удалены.
 
 **Исправлено 4 бага (2026-08-08)**:
 1. **nms-мутация std_raw**: `_nms_det` без `.copy()` портил буфер std_raw (xywh→xyxy инплейс через
-   transpose-вью) → col2 ломался. Фикс `.copy()` (run_3way_eval.py:678).
-2. **'masks' vs 'masks_160'**: canon_col1 писал 'masks', остальные ждали 'masks_160' → KeyError.
+   transpose-вью) → std ломался. Фикс `.copy()` (run_3way_eval.py:678).
+2. **'masks' vs 'masks_160'**: canon_ref писал 'masks', остальные ждали 'masks_160' → KeyError.
    Унифицировано на 'masks_160'.
 3. **segment/pose постпроцессы клипали bbox ВСЕГДА** (не под `if not EVAL_PRECISE` как detect) →
-   col1 vs col2 bbox diff. Фикс в шаблонах + патч сгенерированных кэш-файлов.
+   ref vs std bbox diff. Фикс в шаблонах + патч сгенерированных кэш-файлов.
 4. **semantic-ветка** использовала постпроцесс (orig-пространство) при GT в letterboxed → TypeError;
    переведена на raw argmax (`raw[0][0].argmax(0)`).
 
@@ -346,8 +346,8 @@ mask 0.01; class_id строго), инкрементальные per-image tp-�
     берётся из исходного .pt (args.imgsz). Еval НЕ заменяет разрешение.
 14. **Ультралайтс не определяет task для obb-ONNX** — нужно `YOLO(onnx, task='obb')`,
     иначе val идёт как detect (нули).
-15. **obb col1: ультралайтс NMS имеет time_limit** (2.0+max_time_img*bs) и под CPU-нагрузкой
-    урезает preds. Для честного col1 задавать max_time_img=1000 (monkeypatch
+15. **obb ref: ультралайтс NMS имеет time_limit** (2.0+max_time_img*bs) и под CPU-нагрузкой
+    урезает preds. Для честного ref задавать max_time_img=1000 (monkeypatch
     nms.non_max_suppression) или сравнивать по capture preds.
 16. **Данные — не в git**: `benchmark/data/`, `benchmark/results/`, `convert/datasets/`,
     `cache/`, логи, `.tsv`-результаты — запрещено коммитить (AGENTS.md).
@@ -355,7 +355,7 @@ mask 0.01; class_id строго), инкрементальные per-image tp-�
 ## 6. Команды
 
 ```bash
-# col2 (std ONNX)
+# std (std ONNX)
 docker run --rm --memory=4g --entrypoint python -w /app/percept \
   -v /home/orangepi/work/percept:/app/percept \
   -v /home/orangepi/work/percept/datasets:/app/datasets \
@@ -375,7 +375,7 @@ docker compose -f convert/docker-compose.yml run --rm \
   --model-dir /app/cache/yolo11n --model-name yolo11n \
   --backend npu --rknn-suffix _fp16
 
-# col1 (эталон) — /tmp/opencode/rec_*.py (rec_detect_full.py, rec_pose_full.py,
+# ref (эталон) — /tmp/opencode/rec_*.py (rec_detect_full.py, rec_pose_full.py,
 # rec_seg_mini.py, rec_obb.py), результаты в *.pkl
 
 # Конвертация модели

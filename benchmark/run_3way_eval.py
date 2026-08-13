@@ -1,25 +1,30 @@
 #!/usr/bin/env python3
-"""Универсальный интерливный 3-way runner: col1 | col2 | col3 за один проход.
+"""Универсальный интерливный 3-way runner: ref | std | rko за один проход.
+
+Термины (см. также README → «Сравнение постпроцессов (ref/std/rko)»):
+  ref  = эталонный NMS из ultralytics (non_max_suppression) — то, что даёт .val()
+  std  = наш штатный постпроцесс (продакшен-Pipeline)
+  rko  = наш RK-opt постпроцесс (per-stride, для NPU)
 
 Один цикл по кадрам, на каждом кадре:
   - letterbox + /255 один раз → один тензор (NCHW float32)
-  - std_raw  = std_backend.infer(tensor)              (std ONNX, cache/<model>_std/)
-  - col1     = ultralytics non_max_suppression(std_raw) — эталонный NMS, letterboxed
-  - col2     = наш std постпроцесс(std_raw)            — orig, затем обратно в letterboxed
-  - rko_raw  = rko_backend.infer(tensor)              (RK-opt ONNX, cache/<model>/)
-  - col3     = наш RK-opt постпроцесс(rko_raw)
+  - std_raw = std_backend.infer(tensor)   (std ONNX, cache/<model>_std/)
+  - ref     = ultralytics non_max_suppression(std_raw) — эталонный NMS, letterboxed
+  - std     = наш std постпроцесс(std_raw)  — orig, затем обратно в letterboxed
+  - rko_raw = rko_backend.infer(tensor)   (RK-opt ONNX, cache/<model>/)
+  - rko     = наш RK-opt постпроцесс(rko_raw)
 
-Сравнение preds с допуском (float round-trip): col1-vs-col2 (наш постпроцесс vs
-ultralytics NMS) и col2-vs-col3 (std vs RK-opt). Кадры с расхождением попадают в
+Сравнение preds с допуском (float round-trip): ref-vs-std (наш постпроцесс vs
+ultralytics NMS) и std-vs-rko (std vs RK-opt). Кадры с расхождением попадают в
 diverged-список; --save-diverged копирует сами изображения в каталог.
 
 Метрики всех трёх колонок считаются ОДНИМ и тем же in-memory кодом
 (_box/_pose/_seg/_obb_tp_per_image + _ap_finalize) с общим GT — если preds
 совпадают, метрики совпадают автоматически. Это строже прежнего подхода, где
-col1 = отдельный ultralytics .val().
+ref = отдельный ultralytics .val().
 
-Порядок preds не зависит от пространства: col1 (nms) рождается сразу в
-letterboxed, col2/col3 переводятся из orig обратно через x*scale+pad_left.
+Порядок preds не зависит от пространства: ref (nms) рождается сразу в
+letterboxed, std/rko переводятся из orig обратно через x*scale+pad_left.
 
 CLI:
   python run_3way_eval.py <model> [task] [--pt PATH] [--data-dir DIR]
@@ -295,8 +300,8 @@ def _bbox_letter(x, scale, pad_left, pad_top, xywh=False):
             x2 * scale + pad_left, y2 * scale + pad_top]
 
 
-def canon_col1(det, std_raw, task, pp, imgsz):
-    """col1 (ultralytics nms) — сразу в letterboxed-пространстве."""
+def canon_ref(det, std_raw, task, pp, imgsz):
+    """ref (ultralytics nms) — сразу в letterboxed-пространстве."""
     out = []
     for row in det:
         rec = {
@@ -322,7 +327,7 @@ def canon_col1(det, std_raw, task, pp, imgsz):
 
 
 def canon_objs(objects, scale, pad_left, pad_top, task):
-    """col2/col3 (наш постпроцесс) — orig → letterboxed."""
+    """std/rko (наш постпроцесс) — orig → letterboxed."""
     out = []
     for obj in objects:
         rec = {
@@ -422,12 +427,12 @@ def interleaved_detect_like(task, cfg, std_be, rko_be, std_pp, rko_pp, limit, st
         images, ann_by_img, cat_ids, _ = load_yolo_as_coco(data_dir)
 
     agg = {c: {'tp': [], 'conf': [], 'pred_cls': [], 'gt_cls': []}
-           for c in ('col1', 'col2', 'col3')}
+           for c in ('ref', 'std', 'rko')}
     if task == 'pose':
         pose_agg = {c: {'tp': [], 'conf': [], 'pred_cls': [], 'gt_cls': []}
-                    for c in ('col1', 'col2', 'col3')}
+                    for c in ('ref', 'std', 'rko')}
 
-    preds_count = {'col1': 0, 'col2': 0, 'col3': 0}
+    preds_count = {'ref': 0, 'std': 0, 'rko': 0}
 
     total = state['total']
     errors = state['errors']
@@ -450,22 +455,22 @@ def interleaved_detect_like(task, cfg, std_be, rko_be, std_pp, rko_pp, limit, st
         rko_raw = rko_be.infer(tensor)
 
         det = std_pp._nms_det(std_raw)  # (N, 6+extra) letterboxed
-        col1 = canon_col1(det, std_raw, task, std_pp, isz)
+        ref = canon_ref(det, std_raw, task, std_pp, isz)
 
         pad_left = round(pad[0] / 2 - 0.1)
         pad_top = round(pad[1] / 2 - 0.1)
         objs2 = std_pp.postprocess(std_raw, scale, pad, (h, w))
-        col2 = canon_objs(objs2, scale, pad_left, pad_top, task)
+        std = canon_objs(objs2, scale, pad_left, pad_top, task)
 
         objs3 = rko_pp.postprocess(rko_raw, scale, pad, (h, w))
-        col3 = canon_objs(objs3, scale, pad_left, pad_top, task)
+        rko = canon_objs(objs3, scale, pad_left, pad_top, task)
 
-        ok12, reason12 = compare_preds(col1, col2, task)
-        ok23, reason23 = compare_preds(col2, col3, task)
-        if not ok12:
-            state['diverged_12'].append((img_path, reason12))
-        if not ok23:
-            state['diverged_23'].append((img_path, reason23))
+        ok_ref_std, reason_ref_std = compare_preds(ref, std, task)
+        ok_std_rko, reason_std_rko = compare_preds(std, rko, task)
+        if not ok_ref_std:
+            state['diverged_ref_std'].append((img_path, reason_ref_std))
+        if not ok_std_rko:
+            state['diverged_std_rko'].append((img_path, reason_std_rko))
 
         sx = (isz - pad[0]) / w
         sy = (isz - pad[1]) / h
@@ -473,7 +478,7 @@ def interleaved_detect_like(task, cfg, std_be, rko_be, std_pp, rko_pp, limit, st
         if task == 'segment':
             anns = [a for a in anns if not a.get('iscrowd', 0)]
 
-        for c, preds in (('col1', col1), ('col2', col2), ('col3', col3)):
+        for c, preds in (('ref', ref), ('std', std), ('rko', rko)):
             preds_count[c] += len(preds)
             if task == 'pose':
                 tp, conf, pcls, gcls = _box_tp_per_image(anns, preds, sx, sy, pad_left, pad_top)
@@ -501,7 +506,7 @@ def interleaved_detect_like(task, cfg, std_be, rko_be, std_pp, rko_pp, limit, st
 
     from benchmark.eval import _ap_finalize
     cols = {}
-    for c in ('col1', 'col2', 'col3'):
+    for c in ('ref', 'std', 'rko'):
         a = agg[c]
         cols[c] = _ap_finalize(a['tp'], a['conf'], a['pred_cls'], a['gt_cls'])
         if task == 'pose':
@@ -528,8 +533,8 @@ def interleaved_obb(task, cfg, std_be, rko_be, std_pp, rko_pp, limit, state):
     )
 
     agg = {c: {'tp': [], 'conf': [], 'pred_cls': [], 'gt_cls': []}
-           for c in ('col1', 'col2', 'col3')}
-    preds_count = {'col1': 0, 'col2': 0, 'col3': 0}
+           for c in ('ref', 'std', 'rko')}
+    preds_count = {'ref': 0, 'std': 0, 'rko': 0}
     total = state['total']
     errors = state['errors']
 
@@ -551,21 +556,21 @@ def interleaved_obb(task, cfg, std_be, rko_be, std_pp, rko_pp, limit, state):
         rko_raw = rko_be.infer(tensor)
 
         det = std_pp._nms_det(std_raw)  # (N, 7) [cx,cy,w,h,conf,cls,angle]
-        col1 = canon_col1(det, std_raw, 'obb', std_pp, isz)
+        ref = canon_ref(det, std_raw, 'obb', std_pp, isz)
 
         pad_left = round(pad[0] / 2 - 0.1)
         pad_top = round(pad[1] / 2 - 0.1)
         objs2 = std_pp.postprocess(std_raw, scale, pad, (h, w))
-        col2 = canon_objs(objs2, scale, pad_left, pad_top, 'obb')
+        std = canon_objs(objs2, scale, pad_left, pad_top, 'obb')
         objs3 = rko_pp.postprocess(rko_raw, scale, pad, (h, w))
-        col3 = canon_objs(objs3, scale, pad_left, pad_top, 'obb')
+        rko = canon_objs(objs3, scale, pad_left, pad_top, 'obb')
 
-        ok12, reason12 = compare_preds(col1, col2, 'obb')
-        ok23, reason23 = compare_preds(col2, col3, 'obb')
-        if not ok12:
-            state['diverged_12'].append((img_path, reason12))
-        if not ok23:
-            state['diverged_23'].append((img_path, reason23))
+        ok_ref_std, reason_ref_std = compare_preds(ref, std, 'obb')
+        ok_std_rko, reason_std_rko = compare_preds(std, rko, 'obb')
+        if not ok_ref_std:
+            state['diverged_ref_std'].append((img_path, reason_ref_std))
+        if not ok_std_rko:
+            state['diverged_std_rko'].append((img_path, reason_std_rko))
 
         sx = (isz - pad[0]) / w
         sy = (isz - pad[1]) / h
@@ -584,7 +589,7 @@ def interleaved_obb(task, cfg, std_be, rko_be, std_pp, rko_pp, limit, state):
             gt_letter = np.empty((0, 5), dtype=np.float32)
             gt_cls = np.array([], dtype=np.float32)
 
-        for c, preds in (('col1', col1), ('col2', col2), ('col3', col3)):
+        for c, preds in (('ref', ref), ('std', std), ('rko', rko)):
             preds_count[c] += len(preds)
             if preds:
                 pr_letter = np.array([p['bbox'] + [p['angle']] for p in preds], dtype=np.float32)
@@ -607,18 +612,18 @@ def interleaved_obb(task, cfg, std_be, rko_be, std_pp, rko_pp, limit, state):
     state['preds'] = preds_count
 
     cols = {}
-    for c in ('col1', 'col2', 'col3'):
+    for c in ('ref', 'std', 'rko'):
         a = agg[c]
         cols[c] = _ap_finalize(a['tp'], a['conf'], a['pred_cls'], a['gt_cls'])
     return cols
 
 
 def interleaved_classify(cfg, std_be, rko_be, std_pp, rko_pp, limit, state):
-    """classify: col1 == col2 по построению (тот же std_raw); col3 = RK-opt."""
+    """classify: ref == std по построению (тот же std_raw); rko = RK-opt."""
     from benchmark.eval import load_imagenet, compute_imagenet_accuracy
 
     img_paths, gt_labels = load_imagenet(cfg['eval_data'])
-    preds = {'col2': [], 'col3': []}
+    preds = {'std': [], 'rko': []}
     total = state['total']
     errors = state['errors']
 
@@ -634,19 +639,19 @@ def interleaved_classify(cfg, std_be, rko_be, std_pp, rko_pp, limit, state):
         rko_raw = rko_be.infer(tensor)
         objs2 = std_pp.postprocess(std_raw, 1.0, (0, 0), frame.shape[:2])
         objs3 = rko_pp.postprocess(rko_raw, 1.0, (0, 0), frame.shape[:2])
-        preds['col2'].append(objs2[0]['class_id'] if objs2 else -1)
-        preds['col3'].append(objs3[0]['class_id'] if objs3 else -1)
+        preds['std'].append(objs2[0]['class_id'] if objs2 else -1)
+        preds['rko'].append(objs3[0]['class_id'] if objs3 else -1)
         total += 1
 
     state['total'] = total
     state['errors'] = errors
-    acc2 = compute_imagenet_accuracy(preds['col2'], gt_labels)
-    acc3 = compute_imagenet_accuracy(preds['col3'], gt_labels)
-    return {'col1': acc2, 'col2': acc2, 'col3': acc3}
+    acc_std = compute_imagenet_accuracy(preds['std'], gt_labels)
+    acc_rko = compute_imagenet_accuracy(preds['rko'], gt_labels)
+    return {'ref': acc_std, 'std': acc_std, 'rko': acc_rko}
 
 
 def interleaved_semantic(cfg, std_be, rko_be, std_pp, rko_pp, limit, state):
-    """semantic: col1 == col2 по построению; col3 = RK-opt; miou через confusion."""
+    """semantic: ref == std по построению; rko = RK-opt; miou через confusion."""
     from benchmark.eval import (load_cityscapes, apply_cityscapes_label_mapping,
                                 letterbox_semantic_gt, sem_metrics_from_matrix)
     from percept.io import letterbox
@@ -661,8 +666,8 @@ def interleaved_semantic(cfg, std_be, rko_be, std_pp, rko_pp, limit, state):
         str(Path(cfg['eval_data']) / 'masks' / 'val'),
     )
 
-    matrix = {'col2': np.zeros((num_cls, num_cls), dtype=np.float64),
-              'col3': np.zeros((num_cls, num_cls), dtype=np.float64)}
+    matrix = {'std': np.zeros((num_cls, num_cls), dtype=np.float64),
+              'rko': np.zeros((num_cls, num_cls), dtype=np.float64)}
     total = state['total']
     errors = state['errors']
 
@@ -695,11 +700,11 @@ def interleaved_semantic(cfg, std_be, rko_be, std_pp, rko_pp, limit, state):
                 pm = pm.argmax(axis=0)
             return pm.astype(np.int64)
 
-        pm2 = _sem_map(std_raw)
-        pm3 = _sem_map(rko_raw)
+        pm_std = _sem_map(std_raw)
+        pm_rko = _sem_map(rko_raw)
 
         gt_map = letterbox_semantic_gt(gt, scale, pad, isz).astype(np.int64)
-        for pm, key in ((pm2, 'col2'), (pm3, 'col3')):
+        for pm, key in ((pm_std, 'std'), (pm_rko, 'rko')):
             valid = (gt_map != 255) & (pm >= 0) & (pm < num_cls) & (gt_map >= 0) & (gt_map < num_cls)
             np.add.at(matrix[key], (gt_map[valid], pm[valid]), 1)
 
@@ -707,9 +712,9 @@ def interleaved_semantic(cfg, std_be, rko_be, std_pp, rko_pp, limit, state):
 
     state['total'] = total
     state['errors'] = errors
-    m2 = sem_metrics_from_matrix(matrix['col2'], num_cls)
-    m3 = sem_metrics_from_matrix(matrix['col3'], num_cls)
-    return {'col1': m2, 'col2': m2, 'col3': m3}
+    m_std = sem_metrics_from_matrix(matrix['std'], num_cls)
+    m_rko = sem_metrics_from_matrix(matrix['rko'], num_cls)
+    return {'ref': m_std, 'std': m_std, 'rko': m_rko}
 
 
 # ---------------------------------------------------------------------------
@@ -755,7 +760,7 @@ def _make_nms_fn(std_pp, task):
 
 def _save_diverged(state, diverged_dir, force):
     """Сохранить diverged-списки; при --save-diverged — копировать изображения."""
-    for key in ('diverged_12', 'diverged_23'):
+    for key in ('diverged_ref_std', 'diverged_std_rko'):
         entries = state.get(key, [])
         if not entries:
             continue
@@ -763,7 +768,7 @@ def _save_diverged(state, diverged_dir, force):
             {'image': p, 'reason': r} for p, r in entries]}
         (diverged_dir / f'{key}.json').write_text(json.dumps(out, indent=2))
     if state.get('save_diverged') and diverged_dir:
-        for key in ('diverged_12', 'diverged_23'):
+        for key in ('diverged_ref_std', 'diverged_std_rko'):
             for img_path, _reason in state.get(key, []):
                 stem = Path(img_path).stem
                 dst = diverged_dir / key / f'{stem}.jpg'
@@ -836,8 +841,8 @@ def main():
     state = {
         'total': 0,
         'errors': 0,
-        'diverged_12': [],
-        'diverged_23': [],
+        'diverged_ref_std': [],
+        'diverged_std_rko': [],
         'save_diverged': args.save_diverged,
     }
 
@@ -862,15 +867,15 @@ def main():
     _save_diverged(state, diverged_dir, args.force)
 
     result = {
-        'col1': cols['col1'],
-        'col2': cols['col2'],
-        'col3': cols['col3'],
+        'ref': cols['ref'],
+        'std': cols['std'],
+        'rko': cols['rko'],
         'total': state['total'],
         'errors': state['errors'],
         'preds': state.get('preds', {}),
         'diverged': {
-            'col1_vs_col2': len(state['diverged_12']),
-            'col2_vs_col3': len(state['diverged_23']),
+            'ref_vs_std': len(state['diverged_ref_std']),
+            'std_vs_rko': len(state['diverged_std_rko']),
         },
         'diverged_dir': str(diverged_dir),
         'elapsed_s': round(time.time() - t_start, 1),
@@ -878,8 +883,8 @@ def main():
         'task': task,
         'imgsz': cfg['imgsz'],
         'equal': {
-            'col1_vs_col2': not state['diverged_12'],
-            'col2_vs_col3': not state['diverged_23'],
+            'ref_vs_std': not state['diverged_ref_std'],
+            'std_vs_rko': not state['diverged_std_rko'],
         },
     }
     result_file.write_text(json.dumps(result, indent=2))

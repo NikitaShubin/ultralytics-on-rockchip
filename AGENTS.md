@@ -20,7 +20,7 @@
 ## Work State (автообновляемое)
 
 ### Objective
-**Эквивалентность eval.py vs ultralytics .val (col1/col2/col3)**. Проверено для yolo11n (все 5 задач),
+**Эквивалентность eval.py vs ultralytics .val (ref/std/rko)**. Проверено для yolo11n (все 5 задач),
 yolo26n (все 6 задач), yolo12n (detect) и всей линейки real-time моделей — все три колонки совпадают.
 RKNN-деплой отложен по решению пользователя. Пайплайн и постпроцесс — часть проекта; постпроцесс обязан
 использоваться в конверторе (шаблоны convert/templates/). Полный план и статус — в `PLAN.md`
@@ -50,19 +50,19 @@ RKNN-деплой отложен по решению пользователя. �
 - **Мини-датасеты**: `datasets/{coco128,coco8-pose,imagenet100,...}` добавлены в `.gitignore`.
 
 ### Interleaved runner (benchmark/run_3way_eval.py)
-- Один цикл по кадрам: на каждом кадре col1 (ultralytics nms на том же std-тензоре), col2 (наш std
-  постпроцесс), col3 (наш RK-opt постпроцесс); сразу сравнивать preds, копить только tp-агрегаты и счётчики
+- Один цикл по кадрам: на каждом кадре ref (ultralytics nms на том же std-тензоре), std (наш std
+  постпроцесс), rko (наш RK-opt постпроцесс); сразу сравнивать preds, копить только tp-агрегаты и счётчики
   расхождений; при расхождении сохранять только эти изображения (diverged-список).
 - Конфликт Pipeline решён: `Pipeline._load_postprocess` грузит глобальный `sys.modules['postprocess_mod']` —
   поэтому работаем с `ModelBackend` напрямую и загружаем постпроцессы под уникальными именами (`pp_std`, `pp_rko`).
-- col1 = `non_max_suppression(max_time_img=1000)` из `ultralytics.utils.nms` (НЕ ops) на std_raw
-  (letterboxed-пространство); col2/col3 — наш постпроцесс (orig) → перевод в letterboxed через `x*scale+pad_left`.
+- ref = `non_max_suppression(max_time_img=1000)` из `ultralytics.utils.nms` (НЕ ops) на std_raw
+  (letterboxed-пространство); std/rko — наш постпроцесс (orig) → перевод в letterboxed через `x*scale+pad_left`.
 - Сравнение с допуском: score 1e-6, bbox 1e-3, angle 1e-4, kpts 1e-3, mask 0.01; class_id строго.
 - Метрики — инкрементальные per-image tp (`_box/_pose/_seg/_obb_tp_per_image` + `_ap_finalize(prefix=...)`);
   pycoco в интерливе не нужен.
-- classify/semantic: col1 == col2 по построению (тот же std_raw); semantic — инкрементальная confusion-матрица
+- classify/semantic: ref == std по построению (тот же std_raw); semantic — инкрементальная confusion-матрица
   per-image (OOM-фикс, см. ниже).
-- Результат: `cache/3way_results/<model>-<task>_interleaved.json` (col1/col2/col3, diverged-счётчики, equal-флаги, preds).
+- Результат: `cache/3way_results/<model>-<task>_interleaved.json` (ref/std/rko, diverged-счётчики, equal-флаги, preds).
 - **ВАЖНО: имена моделей для задач** — std_model_dir/rko_model_dir строятся из МОДЕЛИ, а не task:
   `yolov8n-seg segment`, `yolov8n-pose pose`, `yolov8n-cls classify`, `yolo11n-obb obb`, `yolo26n-sem semantic`
   (иначе загружается detect-кэш `yolov8n_std` → `std_raw[1]` IndexError).
@@ -108,19 +108,19 @@ RKNN-деплой отложен по решению пользователя. �
 - **Pose: GT в letterboxed-пространстве**: у ultralytics `Format(normalize=True)` нормализует bboxes/kpts по letterboxed-изображению 640×640 (LetterBox уже применил scale+pad); `_prepare_batch` умножает на imgsz → GT в letterboxed 640-пространстве. GT маппится как `orig_px*scale + pad` (НЕ `orig_px/iw*640`). letterbox percept `round`→`ceil` (ultralytics использует `min(math.ceil(w*scale), imgsz)`) → входы pixel-идентичны.
 - **Segment: mask_overlap=True по умолчанию**: SegValidator val использует `Format(mask_overlap=True)` → `polygons2masks_overlap((640,640), letterboxed_segments, ratio=4)` даёт один (160,160) int-слой со значениями 1..N (1 = инстанс с максимальной площадью, N = минимальной; маленькие рисуются поверх больших через `np.maximum`). Инстансы и cls сортируются по площади (desc). `_prepare_batch` декодирует per-instance: `masks = (overlap == i+1)`. Метрика: `mask_iou` + `match_predictions` + `ap_per_class`. Реализовано в `compute_inmemory_seg_map`.
 - **OBB**: GT `rboxes = xyxyxyxy2xywhr` (orig) → letterboxed `bbox[..., :4].mul_(imgsz[[1,0,1,0]])` (cx,cy,w,h×640); метрика `batch_probiou` + `match_predictions` + `ap_per_class`. `ratio_pad` в pbatch = `((gain,gain),(pad_x,pad_y))`. Реализовано в `compute_inmemory_obb_map` + `xyxyxyxy2xywhr_np` (numpy-реплика cv2.minAreaRect, правило w<h swap).
-- **obb col1**: ультралайтс NMS имеет time_limit (2.0+max_time_img*bs) и под CPU-нагрузкой урезает preds. Для честного col1 задавать max_time_img=1000 (monkeypatch nms.non_max_suppression) или сравнивать по capture preds. Ультралайтс не определяет task для obb-ONNX — нужно `YOLO(onnx, task='obb')`, иначе val идёт как detect (нули).
-- **sem-этап**: eval.py semantic ветка реализована (`compute_inmemory_sem_map` — реплика SemanticMetrics: confusion [gt,pred], pad GT=255, mIoU только по present классам, pixacc) + `letterbox_semantic_gt` (NEAREST к new_unpad=isz-pad + copyMakeBorder 255) + `load_cityscapes` + `apply_cityscapes_label_mapping`. Порог определения raw mask: `gt.max() > 18` (trainId всегда 0..18). **ВАЖНО для col3 (ИСПРАВЛЕНО 2026-08-07)**: `_rknn_semantic_segment` (convert/patches/rknn_patch.py:96) РАНЬШЕ заменял bilinear-апсэмпл на nearest → col3 != col2. **Фикс: переведён на bilinear align_corners=False (как std)**.
+- **obb ref**: ультралайтс NMS имеет time_limit (2.0+max_time_img*bs) и под CPU-нагрузкой урезает preds. Для честного ref задавать max_time_img=1000 (monkeypatch nms.non_max_suppression) или сравнивать по capture preds. Ультралайтс не определяет task для obb-ONNX — нужно `YOLO(onnx, task='obb')`, иначе val идёт как detect (нули).
+- **sem-этап**: eval.py semantic ветка реализована (`compute_inmemory_sem_map` — реплика SemanticMetrics: confusion [gt,pred], pad GT=255, mIoU только по present классам, pixacc) + `letterbox_semantic_gt` (NEAREST к new_unpad=isz-pad + copyMakeBorder 255) + `load_cityscapes` + `apply_cityscapes_label_mapping`. Порог определения raw mask: `gt.max() > 18` (trainId всегда 0..18). **ВАЖНО для rko (ИСПРАВЛЕНО 2026-08-07)**: `_rknn_semantic_segment` (convert/patches/rknn_patch.py:96) РАНЬШЕ заменял bilinear-апсэмпл на nearest → rko != std. **Фикс: переведён на bilinear align_corners=False (как std)**.
 - **OOM-фикс semantic (исправлен)**: semantic-ветка копила все pred/gt-карты (1024² int64) → OOM-kill; фикс — инкрементальный confusion matrix per-image + `sem_metrics_from_matrix()`.
-- **Метод col1 sem подтверждён**: `SemanticSegmentationValidator` ЕСТЬ в 8.4.105 (models/yolo/semantic/val.py), `.val()` на std ONNX (task='semantic') работает и даёт mIoU байт-в-байт == eval.py. Ключи результата: 'metrics/mIoU' и 'metrics/pixel_acc'.
+- **Метод ref sem подтверждён**: `SemanticSegmentationValidator` ЕСТЬ в 8.4.105 (models/yolo/semantic/val.py), `.val()` на std ONNX (task='semantic') работает и даёт mIoU байт-в-байт == eval.py. Ключи результата: 'metrics/mIoU' и 'metrics/pixel_acc'.
 - **EVAL_PRECISE=True** (detect/seg/obb): bbox float, БЕЗ `int()`/`clip()` — метрика ultralytics не клипает. eval-режим: `MIN_WH=1, MAX_DET=300, DEDUP_ENABLED=False`.
 - **OBB эквивалентность**: фикс multi_label=True NMS в obb-постпроцессе (single-label давал меньше preds и заниженную метрику). GT-маппинг per-axis (sx=(isz-pad_w)/w, sy=(isz-pad_h)/h).
 - **Поза equivalence**: исправлены БИТЫЕ yolo-лейблы (регенерация) — прежняя дельта была из них.
 - **DETECT эквивалентность**: `EVAL_PRECISE=True` в std-постпроцессе (float bbox без int()/clip — ultralytics метрика не клипает).
 - **SEG эквивалентность**: `r.box.map50` — это BOX-метрика, НЕ mask! mask-метрика из tp_m. Pred-маски байтово идентичны.
-- **cls col2**: two bugs fixed — (1) wrong preprocessing (PIL Resize(224)+CenterCrop(224)+ToTensor vs letterbox), (2) double `/255.0` in `infer()`.
+- **cls std**: two bugs fixed — (1) wrong preprocessing (PIL Resize(224)+CenterCrop(224)+ToTensor vs letterbox), (2) double `/255.0` in `infer()`.
 - **detect eval mode**: now sets `MIN_WH=1, MAX_DET=300, DEDUP_ENABLED=False` to match ultralytics postprocessing. Previously `MIN_WH=40` filtered small objects.
 - **`load_yolo_as_coco` keypoints**: now extracts 17 keypoints (x,y,v) from YOLO pose labels (56-value format: `class cx cy w h x1 y1 v1 ... x17 y17 v17`). Previously ignored keypoints entirely — caused pose eval to return all -1.0.
-- **col1 падал с "Dataset ... images not found, missing path .../convert/datasets/coco8/images/val"**: `datasets/coco8` был симлинком на абсолютный хостовый путь → внутри контейнера битый. **Фикс**: заменить симлинк на реальную копию. УРОК: в `datasets/` не должно быть симлинков на абсолютные хостовые пути — только реальные директории.
+- **ref падал с "Dataset ... images not found, missing path .../convert/datasets/coco8/images/val"**: `datasets/coco8` был симлинком на абсолютный хостовый путь → внутри контейнера битый. **Фикс**: заменить симлинк на реальную копию. УРОК: в `datasets/` не должно быть симлинков на абсолютные хостовые пути — только реальные директории.
 - **Parallel NMS в eval.py (2026-08-10)**: полный eval fp16/onnx на 5000 кадров упирался в
   torchvision NMS на 30000 кандидатов: при conf=0.001 fp16-шум > 0.001 → expand даёт 672000 кандидатов
   → NMS = **1.35с/кадр** на ARM (у ultralytics `.val()` ТО ЖЕ САМОЕ — тот же `torchvision.ops.nms`
@@ -151,7 +151,7 @@ RKNN-деплой отложен по решению пользователя. �
   Конвертер под батч НЕ переделывали.
 
 ### Interleaved runner — исправленные баги (2026-08-08)
-(1) **nms-мутация std_raw**: `_nms_det` без `.copy()` портил буфер std_raw (xywh→xyxy инплейс) → col2 постпроцесс ломался. Фикс `.copy()` в run_3way_eval.py:678. (2) **'masks' vs 'masks_160'**: canon_col1 писал 'masks', а canon_objs/_seg_tp_per_image/compare_preds ждали 'masks_160' → KeyError. Унифицировано на 'masks_160'. (3) **segment/pose постпроцессы клипали bbox ВСЕГДА** (не под `if not EVAL_PRECISE` как detect) → col1 vs col2 bbox diff. Фикс в шаблонах `convert/templates/{segment,pose}_postprocess.py` + патч сгенерированных кэш-файлов. (4) **semantic-ветка** использовала постпроцесс (возвращает orig-пространство) при GT в letterboxed → TypeError 'dict'; переведена на raw argmax (`raw[0][0].argmax(0)`) как eval.py (run_3way_eval.py:633-647).
+(1) **nms-мутация std_raw**: `_nms_det` без `.copy()` портил буфер std_raw (xywh→xyxy инплейс) → std постпроцесс ломался. Фикс `.copy()` в run_3way_eval.py:678. (2) **'masks' vs 'masks_160'**: canon_ref писал 'masks', а canon_objs/_seg_tp_per_image/compare_preds ждали 'masks_160' → KeyError. Унифицировано на 'masks_160'. (3) **segment/pose постпроцессы клипали bbox ВСЕГДА** (не под `if not EVAL_PRECISE` как detect) → ref vs std bbox diff. Фикс в шаблонах `convert/templates/{segment,pose}_postprocess.py` + патч сгенерированных кэш-файлов. (4) **semantic-ветка** использовала постпроцесс (возвращает orig-пространство) при GT в letterboxed → TypeError 'dict'; переведена на raw argmax (`raw[0][0].argmax(0)`) как eval.py (run_3way_eval.py:633-647).
 
 ### Решение пользователя (2026-08-10): старый пайплайн остаётся основным
 - **НЕ переходим на новый ultralytics-RKNN пайплайн (B-путь) полностью**: точность int8 в нём падает
@@ -252,10 +252,10 @@ RKNN-деплой отложен по решению пользователя. �
    int8 0.5206/0.3237, int8-calib 0.5176/0.3207. pycoco map50=0.33 (BOX-метрика, НЕ mask — см. SEG эквивалентность).
    Все варианты throttled=false. Суммарное время eval: onnx 34 мин, fp16 3.2ч, int8 2.35ч, int8-calib 3.1ч
    (segment-ветка медленнее detect — process_mask на CPU).
-3. **Interleaved runner**: smoke-тесты всех 6 задач ПРОЙДЕНЫ (col1==col2==col3, diverged=0).
+3. **Interleaved runner**: smoke-тесты всех 6 задач ПРОЙДЕНЫ (ref==std==rko, diverged=0).
    Полные прогоны (limit 500/5000) — по желанию пользователя.
 4. **YOLO26/YOLO12/YOLO11 3-way ЗАВЕРШЕНЫ** — см. PLAN.md. RKNN-деплой (int8) — отложен по решению пользователя.
-5. **obb на нативный 1024 — ЗАВЕРШЁН**: эталон всегда ultra .val на std ONNX (task='obb'); колонки col2/col3
+5. **obb на нативный 1024 — ЗАВЕРШЁН**: эталон всегда ultra .val на std ONNX (task='obb'); колонки std/rko
    байт-в-байт; не-нативные артефакты удалены.
 6. **Регрессия конвертера** (mini-метрики на конвертерных файлах) — по желанию пользователя.
 
@@ -266,7 +266,7 @@ RKNN-деплой отложен по решению пользователя. �
 - `convert/templates/pose_postprocess.py` — kpts `(offset*2.0+grid-0.5)*stride`, sigmoid(cls/kpts), оба формата
 - `convert/templates/segment_postprocess.py` — process_mask_160 (без sigmoid, `>0`≡`sigmoid>0.5`), clip всегда, оба формата (std=2 выхода, RK-opt=10 с proto в конце)
 - `convert/templates/classify_postprocess.py` — PIL Resize(224)+CenterCrop(224)+ToTensor, top-1 raw score
-- `benchmark/run_3way_eval.py` — interleaved-режим: один цикл по кадрам (col1 nms / col2 std / col3 rko), `compare_preds` с допусками, инкрементальные tp-агрегаты, diverged-список; результат в `cache/3way_results/<model>-<task>_interleaved.json`; флаги `--limit/--force/--save-diverged/--diverged-dir`
+- `benchmark/run_3way_eval.py` — interleaved-режим: один цикл по кадрам (ref nms / std std / rko rko), `compare_preds` с допусками, инкрементальные tp-агрегаты, diverged-список; результат в `cache/3way_results/<model>-<task>_interleaved.json`; флаги `--limit/--force/--save-diverged/--diverged-dir`
 - `benchmark/export_std_onnx.py` — штатный экспорт std ONNX на нативном imgsz (без override) + перегенерация postprocess
 - `percept/inference/__init__.py`: `/255.0` moved from `infer()` to default letterbox path only
 - `benchmark/eval.py`: MIN_WH=1/MAX_DET=300/DEDUP_ENABLED=False в eval mode; `compute_inmemory_box_map`, `compute_inmemory_pose_map` (GT=orig_px*scale+pad), `compute_inmemory_obb_map` + `xyxyxyxy2xywhr_np`, `compute_inmemory_seg_map` (polygons2masks_overlap + декод + gt_cls[order]); EVAL_DUMP_PREDS→`benchmark/dump_preds.pkl`; ветка detect/pose/segment собирает preds_by_img/scales_pads; **per-image tp-функции `_box/_pose/_seg/_obb_tp_per_image` + `_ap_finalize(prefix=...)`, `_seg_finalize` — обёртка над `_ap_finalize` (2026-08-08)**; `load_yolo_as_coco` возвращает 4 значения (`images, ann_by_img, cat_ids, tmp.name`); **parallel NMS конвейер в detect-ветке (2026-08-10)**: `_detect_pre_nms` + `_detect_nms_finish` + `_big_core_count()`, NMS в ThreadPool по числу "больших" ядер, infer последовательно — полный fp16 eval yolo26n 5000 кадров за 42 мин (2.7x)

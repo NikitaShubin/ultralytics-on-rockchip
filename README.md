@@ -348,6 +348,20 @@ python eval.py detect ../datasets/coco_val2017 \
 Сопоставление задач (models.py → eval.py): `detect`→`detect`, `seg`→`segment`,
 `cls`→`classify`, `pose`→`pose`, `obb`→`obb`, `sem`→`semantic`.
 
+### Сравнение постпроцессов (ref/std/rko)
+
+3-way проверка (`benchmark/run_3way_eval.py`) за один проход гоняет три колонки на
+одном и том же тензоре и сравнивает preds с допуском:
+
+- **ref** — эталонный NMS из ultralytics (`non_max_suppression` на том же std-тензоре),
+  т.е. ровно то, что даёт штатный `.val()`. Байт-в-байт эталон.
+- **std** — наш штатный постпроцесс (тот же, что в продакшен-Pipeline `percept/`);
+  предсказания в orig-пространстве, затем перевод в letterboxed через `x*scale+pad_left`.
+- **rko** — наш RK-opt постпроцесс (per-stride, формат выхода RKNN-деплоя).
+
+Дальше в коде, конфигах и документации используются только сокращения `ref`/`std`/`rko`;
+равенство колонок обозначается как `ref==std==rko`.
+
 ## Стресс-тест
 
 Нагрузочный тест CPU + NPU + RAM с мониторингом температур и загрузки.
