@@ -7,6 +7,17 @@
 Все тестовые данные (датасеты, артефакты бенчмарков, логи) скачиваются скриптами on-demand.
 Запрещено коммитить: `benchmark/data/`, `benchmark/results/`, `convert/datasets/`, `cache/`, логи, `.tsv`-результаты.
 Скрипты автозагрузки: `setup_datasets.py`, `benchmark/setup_datasets.py`.
+YOLO-labels (detect/seg/pose) для эталонного ultralytics `.val()` генерируются из COCO JSON
+скриптом `convert/setup_coco_labels.py` **внутри convert-контейнера** (numpy+cv2+ultralytics;
+на хосте numpy нет). Ручной запуск:
+`docker compose -f convert/docker-compose.yml run --rm --entrypoint python convert /app/convert/setup_coco_labels.py --all`.
+Авто-вызов — из `convert.py:_ensure_coco_labels` (срабатывает при int8-calib для detect/segment/pose).
+Калибровке и `eval.py` labels НЕ нужны (читают JSON напрямую). Структура как в ../percept:
+`coco_val2017/labels/val2017` (detect, 5 колонок), `coco_pose/labels/val2017` (pose, 56 колонок),
+`coco_seg/labels/val2017` (seg, полигоны); images coco_pose/coco_seg — hardlink'и на
+`coco_val2017/images/val2017` (одна inode). iscrowd: в detect/pose ВКЛЮЧЁН (eval.py не фильтрует),
+в seg отфильтрован. Файл на каждое из 5000 изображений (пустой `\n` без аннотаций).
+Формат чисел — полная точность float64 (не %g).
 
 ### Относительные пути
 Все пути в скриптах и конфигах — относительно корня проекта (`$(dirname "$0")` или `./`).

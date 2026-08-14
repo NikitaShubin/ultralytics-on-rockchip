@@ -261,6 +261,21 @@ def _dataset_name(task: str) -> str:
     }.get(task, "COCO val2017")
 
 
+def _ensure_coco_labels(task: str) -> None:
+    """Сгенерировать yolo-labels (detect/pose/seg) для эталонного .val().
+
+    Нужны только для ad-hoc .val() ultralytics (eval/калибровка читают JSON напрямую).
+    Генерация идемпотентна — при готовых labels мгновенный skip.
+    """
+    if task not in ("detect", "segment", "pose"):
+        return
+    try:
+        from setup_coco_labels import ensure_coco_labels
+        ensure_coco_labels(task)
+    except Exception as e:
+        log(f"Предупреждение: не удалось сгенерировать labels для {task}: {e}")
+
+
 def _ensure_dataset(task: str = "detect") -> Path:
     """Проверить наличие нужного датасета для калибровки.
 
@@ -301,6 +316,7 @@ def _ensure_dataset(task: str = "detect") -> Path:
         n = sum(1 for _ in img_dir.iterdir()) if img_dir.is_dir() else 0
         if n > 0:
             log(f"Датасет для {task} уже есть: {n} файлов в {img_dir}")
+            _ensure_coco_labels(task)
             return root_dir
 
     log(f"Датасет для {task} не найден, скачиваю...")
@@ -318,6 +334,7 @@ def _ensure_dataset(task: str = "detect") -> Path:
 
     # Повторная проверка после скачивания
     if img_dir.exists() and any(img_dir.iterdir()):
+        _ensure_coco_labels(task)
         return root_dir
 
     raise RuntimeError(
