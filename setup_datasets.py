@@ -119,6 +119,34 @@ def download_file(urls, dest: Path) -> None:
     )
 
 
+def _ensure_pip() -> None:
+    """Установить pip для системного python (если нет даже ensurepip).
+
+    Системный python в Ubuntu/Debian часто поставляется без pip; get-pip.py —
+    официальный bootstrap с pypa.io, работает без sudo.
+    """
+    try:
+        subprocess.run([sys.executable, '-m', 'pip', '--version'], check=True,
+                       capture_output=True)
+        return
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        pass
+    try:
+        subprocess.run([sys.executable, '-m', 'ensurepip', '--user'], check=True,
+                       capture_output=True)
+        return
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        pass
+    print('  pip не найден — загрузка get-pip.py...')
+    get_pip = DATASETS_DIR / 'get-pip.py'
+    subprocess.run(['curl', '-fSL', '-L', '-o', str(get_pip),
+                    'https://bootstrap.pypa.io/get-pip.py'], check=True)
+    try:
+        subprocess.run([sys.executable, str(get_pip), '--user'], check=True)
+    finally:
+        get_pip.unlink(missing_ok=True)
+
+
 def _extract_zip(zip_path: Path, dest: Path, strip_prefixes=()) -> None:
     """Распаковать zip-архив в dest, опционально убирая префикс путей.
 
@@ -350,13 +378,22 @@ def setup_cityscapes_val() -> None:
             import pyarrow
         except ImportError:
             print('Установка pyarrow...')
+            _ensure_pip()
             subprocess.check_call([
                 sys.executable, '-m', 'pip', 'install', '--user', 'pyarrow', '-q',
             ])
             import pyarrow.parquet as pq
 
     from io import BytesIO
-    from PIL import Image
+    try:
+        from PIL import Image
+    except ImportError:
+        print('Установка Pillow...')
+        _ensure_pip()
+        subprocess.check_call([
+            sys.executable, '-m', 'pip', 'install', '--user', 'Pillow', '-q',
+        ])
+        from PIL import Image
 
     idx = 0
     for url in parquet_urls:
@@ -366,7 +403,7 @@ def setup_cityscapes_val() -> None:
         if not cache_path.exists():
             print(f'Загрузка {fname}...')
             subprocess.run(
-                ['curl', '-fSL', '-o', str(cache_path), url],
+                ['curl', '-fSL', '-L', '-o', str(cache_path), url],
                 check=True,
             )
 
@@ -412,9 +449,10 @@ def setup_cityscapes_val() -> None:
 
 
 def normalize_image_extensions(root: Path) -> int:
-    """Привести расширения изображений к нижнему регистру (.JPEG → .jpg).
+    """Привести расширения изображений к нижнему регистру (.JPEG/.jpeg → .jpg).
 
-    rknn-toolkit2 поддерживает только .jpg .jpeg .png .bmp (нижний регистр).
+    rknn-toolkit2 поддерживает только .jpg .jpeg .png .bmp (нижний регистр);
+    остальной код (бенчмарк, eval) считает изображения по *.jpg.
     Возвращает количество переименованных файлов.
     """
     renamed = 0
@@ -422,14 +460,18 @@ def normalize_image_extensions(root: Path) -> int:
         if not p.is_file():
             continue
         ext = p.suffix
-        if ext and ext != ext.lower():
-            new_path = p.with_suffix(ext.lower())
-            # Если файл с таким именем уже есть — удаляем текущий (дубликат)
-            if new_path.exists() and new_path != p:
-                p.unlink()
-            else:
-                p.rename(new_path)
-            renamed += 1
+        if not ext:
+            continue
+        new_ext = '.jpg' if ext.lower() == '.jpeg' else ext.lower()
+        if ext == new_ext:
+            continue
+        new_path = p.with_suffix(new_ext)
+        # Если файл с таким именем уже есть — удаляем текущий (дубликат)
+        if new_path.exists() and new_path != p:
+            p.unlink()
+        else:
+            p.rename(new_path)
+        renamed += 1
     return renamed
 
 
@@ -501,7 +543,8 @@ def setup_imagenet_val() -> None:
     # Всё уже на месте
     if val_dir.exists():
         n_classes = len([d for d in val_dir.iterdir() if d.is_dir()])
-        n_images = sum(1 for _ in val_dir.rglob('*.JPEG'))
+        n_images = sum(1 for f in val_dir.rglob('*')
+                       if f.is_file() and f.suffix.lower() in ('.jpg', '.jpeg'))
         if n_classes >= 999 and n_images >= 49000:
             print(f'ImageNet val уже загружена: {n_images} изображений, {n_classes} классов')
             normalize_image_extensions(val_dir)
@@ -542,7 +585,7 @@ def setup_imagenet_val() -> None:
     if not valprep_sh.exists():
         print('Скачивание valprep.sh...')
         subprocess.run(
-            ['curl', '-fSL', '-o', str(valprep_sh), IMAGENET_VALPREP_URL],
+            ['curl', '-fSL', '-L', '-o', str(valprep_sh), IMAGENET_VALPREP_URL],
             check=True,
         )
     flat_in_val = list(val_dir.glob('ILSVRC*.JPEG'))

@@ -150,7 +150,9 @@ def load_imagenet(val_dir: str):
     class_map = {d.name: i for i, d in enumerate(class_dirs)}
     images, labels = [], []
     for name, cid in class_map.items():
-        for f in sorted((val_path / name).glob('*.JPEG')):
+        files = [f for f in (val_path / name).iterdir()
+                 if f.is_file() and f.suffix.lower() in ('.jpg', '.jpeg')]
+        for f in sorted(files):
             images.append(str(f))
             labels.append(cid)
     return images, labels
