@@ -218,6 +218,11 @@ class ModelBackend:
         with self._infer_lock:
             if custom_preprocess:
                 tensor, scale, pad = custom_preprocess(frame)
+                # custom_preprocess (cls) возвращает [0,1] (ToTensor/255). RKNN-модель
+                # собрана с std=255 и САМА делит вход на 255 → для NPU нужен [0,255],
+                # иначе двойная нормализация (вход ≈ 0 → случайные классы).
+                if self.backend != 'cpu':
+                    tensor = tensor * 255.0
             else:
                 canvas, scale, pad = letterbox(frame, self.input_size)
                 rgb = cv2.cvtColor(canvas, cv2.COLOR_BGR2RGB).astype(np.float32)

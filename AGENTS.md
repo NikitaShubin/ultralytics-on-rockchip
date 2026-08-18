@@ -28,6 +28,10 @@ YOLO-labels (detect/seg/pose) для эталонного ultralytics `.val()` �
 запускать в фон (`& disown`), а не блокируя терминал.
 Логировать вывод в файл (`> /tmp/xxx.log 2>&1 & disown`).
 Периодически проверять аутпут через `tail` или `grep`.
+**ВАЖНО (2026-08-14): `nohup ... &` из bash-инструмента НЕ работает** — инструмент убивает фоновые
+процессы своей сессии (eval молча исчезал без traceback, JSON не писался). Для фоновых docker-прогонов
+обязательно использовать **tmux**: `tmux new-session -d -s eval 'docker compose ... > /tmp/xxx.log 2>&1'`,
+потом `tail -f /tmp/xxx.log` / `ps aux | grep [e]val.py`. Сессию снять: `tmux kill-session -t eval`.
 
 ## Work State (автообновляемое)
 
@@ -251,6 +255,41 @@ RKNN-деплой отложен по решению пользователя. �
   каждый обрабатывает ОБА формата (std single-output + RK-opt per-stride); `_generate_postprocess`
   генерирует все 5 без плейсхолдеров, py_compile OK; info из .pt корректна (nm=32, num_kpts=17,
   obb input 1024 → grid [128,64,32]).
+
+### Completed (2026-08-14: отчётность, OOM-фикс eval, cls NPU)
+- **Этап 1 — честная отчётность**: `benchmark.py` теперь проверяет только ОЖИДАЕМЫЕ по сценарию поля
+  (`model_is_complete(result, phases, quantize)` + `_eval_done`/`_bench_done`/`_validate_done`/`missing_parts`),
+  `recompute_status(results, quantize)` пересчитывает status всех записей, `sys.exit(1)` при FAILURES
+  или незавершённых фазах, `processed`-список в `[ИТОГ]`, сценарный resume bench (для onnx-сценария
+  ждём только cpu-fps). `run_nano.sh` → `exit 1` при FAILED>0. `convert.py:_calib_img_dir` принимает
+  jpg/jpeg/png/bmp (sem int8), `setup_datasets.py` curl `-sS`. run_fps переехал в convert-контейнер
+  (cls/obb bench теперь работают: yolo26n-cls CPU_fps=24.73 вместо -1). Лимит памяти — `mem_limit: 4g`
+  в convert/docker-compose.yml (НЕ `docker compose run --memory=4g` — такого флага нет!); eval/bench
+  перезапуск — флаг `--force` в benchmark.py (обходит BOTH скипов: верхний `model_is_complete`
+  и пофайловые done_keys). **Почему 5.5g, а не 4g**: при conf=0.001 fp16/pose/seg на 5000 кадров
+  дают 1.5M записей (max 300/кадр) → pycoco-накопление требует ~4.2-4.5GB; obb (вход 1024 + torch)
+  на старте берёт ~4.2GB. При 4g — OOM-kill (exit 137). Хост 8GB — держать один контейнер за раз.
+- **Этап 2 — рефакторинг eval.py (OOM-фикс, exit 137)**: причина OOM — пул копил futures ВСЕХ кадров
+  (masks_160 25KB×детекция → seg падал на ~2500/5000). Единый пайплайн: `_Accumulator` (инкрементальные
+  tp-агрегаты + pycoco + dump), `_drain_one` — FIFO-окно futures `window=max(2, n_workers*2)`, `_preprocess`,
+  `_letter_meta`, `_install_fast_nms`, `_wrap_det_preds`. **GIL-инсайт**: numpy (process_mask_160,
+  polygons2masks_overlap, box_iou) в 8 воркерах ДЕГРАДИРУЕТ от GIL-контеншна (segment 2.5с/кадр вместо
+  0.98с). Итоговая архитектура: cpu (onnx) — БЕЗ пула (infer занимает все ядра; пул лишь вредил: 143→270с);
+  npu detect — пул 8, `_detect_tp_worker` (NMS C++ + box_iou); npu segment — пул 8 только `_seg_nms_only`
+  (NMS C++), а masks+tp на ГЛАВНОМ (`_seg_finish` + `_seg_tp_per_image`). Эквивалентность подтверждена
+  --limit 300 байт-в-байт vs старый код для onnx det/seg/pose (MATCH). Скорость npu: detect 59с/100,
+  segment 165с/100.
+- **Этап 3 — cls NPU top1≈0.001 → 0.9**: причина — RKNN-модель собрана с `std=255` (NPU САМ делит вход
+  на 255), а custom_preprocess (cls ToTensor) возвращал [0,1] → двойная нормализация (вход≈0 → случайные
+  классы). letterbox-путь отдаёт NPU [0,255] — согласован. **Фикс**: `percept/inference/__init__.py:detect()`
+  для custom_preprocess при backend != 'cpu' умножает тензор на 255. CPU-путь не тронут (top1=0.71394).
+- **Базлайны (старый код, --limit 300 onnx)**: yolo26n det map50=0.6476/inmem 0.6395; seg map50=0.3757/
+  inmem_seg 0.6092; pose map50=0.8145/inmem 0.6244/inmem_pose 0.4919. Файлы `/tmp/base_*.json` + скрипт
+  `/tmp/cmp_eval.py` (исключает телеметрию). Новый код MATCH по всем трём.
+- **Ещё не сделано (на 2026-08-14 вечер)**: eval для yolo26n-seg (все 4, пустые {} в results.json), pose
+  (fp16/int8/int8-calib), obb (fp16/int8 + fps через convert), cls (np-варианты после фикса + fps npu),
+  sem (int8-calib конвертация + eval/fps int8). Ночной прогон — `bash /tmp/phase5.sh` в tmux-сессии `eval`,
+  лог `/tmp/phase5_all.log`.
 
 ### Next Move
 1. **Полный бенчмарк yolo26n-det ЗАВЕРШЁН (2026-08-11)**: `benchmark.py --phase all --model yolo26n`.

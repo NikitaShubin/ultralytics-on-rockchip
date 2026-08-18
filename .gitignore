@@ -39,6 +39,7 @@ benchmark/data/
 
 # Benchmark results and logs
 benchmark/results/
+nano.log
 
 # Active model directory (deployed on device)
 model/

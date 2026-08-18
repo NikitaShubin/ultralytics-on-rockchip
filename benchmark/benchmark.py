@@ -36,7 +36,6 @@ CACHE_DIR = PROJECT_DIR / 'cache'
 DATA_DIR = BENCHMARK_DIR / 'data'
 RESULTS_DIR = BENCHMARK_DIR / 'results'
 CONVERT_COMPOSE = PROJECT_DIR / 'convert' / 'docker-compose.yml'
-WEB_COMPOSE = PROJECT_DIR / 'docker-compose.yml'
 RESULTS_FILE = RESULTS_DIR / 'results.json'
 SUMMARY_TSV = RESULTS_DIR / 'summary.tsv'
 LOG_FILE = RESULTS_DIR / 'benchmark.log'
@@ -75,6 +74,15 @@ QUANTIZE_TO_EVAL = {
     'int8': ['int8'],
     'int8-calib': ['int8-calib'],
     'all': ['onnx', 'fp16', 'int8', 'int8-calib'],
+}
+
+# Ожидаемые ключи FPS по сценарию квантизации (fps_bench.py → results.json)
+QUANTIZE_TO_FPS = {
+    'onnx': ['cpu'],
+    'none': ['npu_none'],
+    'int8': ['npu_int8'],
+    'int8-calib': ['npu_int8-calib'],
+    'all': ['cpu', 'npu_none', 'npu_int8', 'npu_int8-calib'],
 }
 
 # Имена задач: models.py → eval.py
@@ -117,6 +125,17 @@ def log(msg: str) -> None:
     LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
     with open(LOG_FILE, 'a') as f:
         f.write(line + '\n')
+
+
+# Сбои в текущем прогоне: («модель [фаза]», причина). Непустой список → exit != 0.
+FAILURES: list[str] = []
+
+
+def _fail(where: str, detail: str) -> None:
+    """Зафиксировать сбой этапа в текущем прогоне (влияет на exit code)."""
+    msg = f'{where}: {detail}'
+    FAILURES.append(msg)
+    log(f'[ПРОВАЛ] {msg}')
 
 
 # ---------------------------------------------------------------------------
@@ -208,43 +227,49 @@ def _container_dataset_root(data_dir: Path) -> str:
 # Фаза: convert
 # ---------------------------------------------------------------------------
 
-def run_converter(model_name: str, task: str, output_dir: Path, data_dir: Path) -> dict | None:
-    output_dir.mkdir(parents=True, exist_ok=True)
-    data_path = _container_data_path(data_dir)
-    cmd = [
-        'docker', 'compose', '-f', str(CONVERT_COMPOSE), 'run', '--rm',
-        '-v', f'{BENCHMARK_DIR}:/app/benchmark',
-        '-v', f'{PROJECT_DIR / "datasets"}:/app/datasets',
-        '-e', f'CONVERT_QUANTIZE={QUANTIZE}',
-        '-e', 'KEEP_MODELS=1',
-        '--entrypoint', 'python',
-        'convert',
-        '/app/benchmark/convert_bench.py',
-        model_name, task, f'/app/cache/{model_name}',
-        data_path,
-    ]
+def _run_container(compose_file: Path, service: str, args: list[str],
+                   timeout: int, tag: str,
+                   env: list[str] | None = None,
+                   volumes: list[str] | None = None,
+                   entrypoint: str = 'python') -> subprocess.CompletedProcess | None:
+    """Общий запуск скрипта в docker-compose контейнере.
+
+    Возвращает CompletedProcess при успешном выходе (rc==0), None при
+    таймауте или ненулевом коде. stdout/stderr логируются построчно.
+    """
+    cmd = ['docker', 'compose', '-f', str(compose_file), 'run', '--rm']
+    for v in (volumes or []):
+        cmd += ['-v', v]
+    for e in (env or []):
+        cmd += ['-e', e]
+    cmd += ['--entrypoint', entrypoint, service] + args
     log(f'ЗАПУСК: {" ".join(cmd[:-6])} ...')
     t0 = time.time()
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=CONVERT_TIMEOUT)
-        elapsed = time.time() - t0
-        log(f'[ТАЙМИНГ] convert завершён за {elapsed:.0f}с')
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        log(f'[ТАЙМИНГ] {tag} завершён за {time.time() - t0:.0f}с')
     except subprocess.TimeoutExpired:
-        log(f'[ОШИБКА] конвертер превысил таймаут {CONVERT_TIMEOUT}с')
+        log(f'[ОШИБКА] {tag} превысил таймаут {timeout}с')
         return None
 
     if result.stdout:
         for line in result.stdout.strip().split('\n'):
-            log(f'[convert stdout] {line}')
+            log(f'[{tag} stdout] {line}')
     if result.stderr:
         for line in result.stderr.strip().split('\n'):
-            log(f'[convert stderr] {line}')
+            log(f'[{tag} stderr] {line}')
 
     if result.returncode != 0:
-        log(f'[ОШИБКА] конвертер завершился с кодом {result.returncode}')
+        log(f'[ОШИБКА] {tag} завершился с кодом {result.returncode}')
         return None
+    return result
 
-    for line in reversed(result.stdout.strip().split('\n')):
+
+def _last_json_line(stdout: str) -> dict | None:
+    """Последняя JSON-строка в stdout (результат запущенного скрипта)."""
+    if not stdout:
+        return None
+    for line in reversed(stdout.strip().split('\n')):
         line = line.strip()
         if line.startswith('{'):
             try:
@@ -252,6 +277,19 @@ def run_converter(model_name: str, task: str, output_dir: Path, data_dir: Path) 
             except json.JSONDecodeError:
                 continue
     return None
+
+
+def run_converter(model_name: str, task: str, output_dir: Path, data_dir: Path) -> dict | None:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    data_path = _container_data_path(data_dir)
+    result = _run_container(
+        CONVERT_COMPOSE, 'convert',
+        ['/app/benchmark/convert_bench.py', model_name, task, f'/app/cache/{model_name}', data_path],
+        CONVERT_TIMEOUT, 'convert',
+        env=[f'CONVERT_QUANTIZE={QUANTIZE}', 'KEEP_MODELS=1'],
+        volumes=[f'{BENCHMARK_DIR}:/app/benchmark', f'{PROJECT_DIR / "datasets"}:/app/datasets'],
+    )
+    return _last_json_line(result.stdout) if result else None
 
 
 # ---------------------------------------------------------------------------
@@ -260,45 +298,14 @@ def run_converter(model_name: str, task: str, output_dir: Path, data_dir: Path) 
 
 def run_validate(model_name: str, task: str, temp_dir: Path, data_dir: Path, input_size: int = 640) -> dict | None:
     data_path = _container_data_path(data_dir)
-    cmd = [
-        'docker', 'compose', '-f', str(CONVERT_COMPOSE), 'run', '--rm',
-        '-v', f'{BENCHMARK_DIR}:/app/benchmark',
-        '-v', f'{PROJECT_DIR / "datasets"}:/app/datasets',
-        '--entrypoint', 'python',
-        'convert',
-        '/app/benchmark/validate_bench.py',
-        model_name, task, f'/app/cache/{model_name}',
-        data_path, str(input_size),
-    ]
-    log(f'ЗАПУСК: {" ".join(cmd[:-6])} ...')
-    t0 = time.time()
-    try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
-        elapsed = time.time() - t0
-        log(f'[ТАЙМИНГ] validate завершён за {elapsed:.0f}с')
-    except subprocess.TimeoutExpired:
-        log(f'[ОШИБКА] валидация превысила таймаут 1800с')
-        return None
-
-    if result.stdout:
-        for line in result.stdout.strip().split('\n'):
-            log(f'[validate stdout] {line}')
-    if result.stderr:
-        for line in result.stderr.strip().split('\n'):
-            log(f'[validate stderr] {line}')
-
-    if result.returncode != 0:
-        log(f'[ОШИБКА] валидация завершилась с кодом {result.returncode}')
-        return None
-
-    for line in reversed(result.stdout.strip().split('\n')):
-        line = line.strip()
-        if line.startswith('{'):
-            try:
-                return json.loads(line)
-            except json.JSONDecodeError:
-                continue
-    return None
+    result = _run_container(
+        CONVERT_COMPOSE, 'convert',
+        ['/app/benchmark/validate_bench.py', model_name, task, f'/app/cache/{model_name}',
+         data_path, str(input_size)],
+        1800, 'validate',
+        volumes=[f'{BENCHMARK_DIR}:/app/benchmark', f'{PROJECT_DIR / "datasets"}:/app/datasets'],
+    )
+    return _last_json_line(result.stdout) if result else None
 
 
 # ---------------------------------------------------------------------------
@@ -307,45 +314,29 @@ def run_validate(model_name: str, task: str, temp_dir: Path, data_dir: Path, inp
 
 def run_fps(model_name: str, task: str, cache_dir: Path, data_dir: Path,
             quantize: str = 'both') -> dict | None:
+    """FPS-бенчмарк в convert-контейнере (НЕ percept!): там есть PIL/torch/
+    torchvision/ultralytics (их требуют cls/obb постпроцессы) + rknn-библиотеки
+    и /dev/dri для реального NPU."""
     data_path = _container_data_path(data_dir)
-    cmd = [
-        'docker', 'compose', '-f', str(WEB_COMPOSE), 'run', '--rm',
-        '-v', f'{BENCHMARK_DIR}:/app/benchmark',
-        '-v', f'{CACHE_DIR}:/app/cache',
-        '-v', f'{PROJECT_DIR / "datasets"}:/app/datasets',
-        '-e', 'TEST_MODE=1',
-        '-e', 'WEB_MODE=0',
-        '-e', 'CAM_MODE=file',
-        '-e', 'PYTHONPATH=/app',
-        '-e', f'BENCH_WARMUP={WARMUP_S}',
-        '-e', f'BENCH_MEASURE={MEASURE_S}',
-        'percept', 'python3', '/app/benchmark/fps_bench.py',
-        model_name, task,
-        '--temp-dir', f'/app/cache/{model_name}',
-        '--data-dir', data_path,
-        '--warmup', str(WARMUP_S),
-        '--measure', str(MEASURE_S),
-        '--repeats', str(BENCH_REPEATS),
-        '--quantize', quantize,
-    ]
-    log(f'ЗАПУСК: {" ".join(cmd[:-9])} ...')
-    try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=1200)
-    except subprocess.TimeoutExpired:
-        log(f'[ОШИБКА] FPS-тест превысил таймаут 1200с')
+    env = ['TEST_MODE=1', 'WEB_MODE=0', 'CAM_MODE=file', 'PYTHONPATH=/app',
+           f'BENCH_WARMUP={WARMUP_S}', f'BENCH_MEASURE={MEASURE_S}']
+    result = _run_container(
+        CONVERT_COMPOSE, 'convert',
+        ['/app/benchmark/fps_bench.py', model_name, task,
+         '--temp-dir', f'/app/cache/{model_name}',
+         '--data-dir', data_path,
+         '--warmup', str(WARMUP_S),
+         '--measure', str(MEASURE_S),
+         '--repeats', str(BENCH_REPEATS),
+         '--quantize', quantize],
+        1200, 'bench',
+        env=env,
+        volumes=[f'{BENCHMARK_DIR}:/app/benchmark',
+                 f'{CACHE_DIR}:/app/cache',
+                 f'{PROJECT_DIR / "datasets"}:/app/datasets'],
+    )
+    if result is None:
         return None
-
-    if result.stdout:
-        for line in result.stdout.strip().split('\n'):
-            log(f'[percept stdout] {line}')
-    if result.stderr:
-        for line in result.stderr.strip().split('\n'):
-            log(f'[percept stderr] {line}')
-
-    if result.returncode != 0:
-        log(f'[ОШИБКА] percept завершился с кодом {result.returncode}')
-        return None
-
     marker = '{"model"'
     idx = result.stdout.rfind(marker)
     if idx < 0:
@@ -366,86 +357,107 @@ def run_eval(model_name: str, task: str, model_dir: Path, data_dir: Path,
 
     onnx → backend cpu; rknn (fp16/int8/int8-calib) → backend npu
     (реальный NPU через rknnlite в convert-контейнере), суффикс через --rknn-suffix.
+    Бросает FileNotFoundError, если файла модели нет (ожидаемый вариант не
+    тестируется) — вызывающий код отличает это от сбоя процесса eval.
     """
     v = EVAL_VARIANTS[variant]
     model_file = model_dir / v['file'](model_name)
     if not model_file.exists():
-        log(f'[ПРОПУСК] eval {variant}: нет модели {model_file}')
-        return None
+        raise FileNotFoundError(f'нет модели {model_file} (конвертация не выполнена)')
     data_path = _container_dataset_root(data_dir)
     task_arg = TASK_TO_EVAL.get(task, task)
-    cmd = [
-        'docker', 'compose', '-f', str(CONVERT_COMPOSE), 'run', '--rm',
-        '-v', f'{BENCHMARK_DIR}:/app/benchmark',
-        '-v', f'{PROJECT_DIR / "datasets"}:/app/datasets',
-        '--entrypoint', 'python',
-        'convert',
-        '/app/benchmark/eval.py',
-        task_arg, data_path,
-        '--model-dir', f'/app/cache/{model_name}',
-        '--model-name', model_name,
-        '--backend', v['backend'],
-    ]
+    args = ['/app/benchmark/eval.py', task_arg, data_path,
+            '--model-dir', f'/app/cache/{model_name}',
+            '--model-name', model_name,
+            '--backend', v['backend']]
     if v['suffix']:
-        cmd += ['--rknn-suffix', v['suffix']]
-    log(f'ЗАПУСК eval {variant}: {" ".join(cmd[-10:])} ...')
-    t0 = time.time()
-    try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=EVAL_TIMEOUT)
-        elapsed = time.time() - t0
-        log(f'[ТАЙМИНГ] eval {variant} завершён за {elapsed:.0f}с')
-    except subprocess.TimeoutExpired:
-        log(f'[ОШИБКА] eval {variant} превысил таймаут {EVAL_TIMEOUT}с')
-        return None
-
-    if result.stdout:
-        for line in result.stdout.strip().split('\n'):
-            log(f'[eval stdout] {line}')
-    if result.stderr:
-        for line in result.stderr.strip().split('\n'):
-            log(f'[eval stderr] {line}')
-
-    if result.returncode != 0:
-        log(f'[ОШИБКА] eval {variant} завершился с кодом {result.returncode}')
-        return None
-
-    for line in reversed(result.stdout.strip().split('\n')):
-        line = line.strip()
-        if line.startswith('{'):
-            try:
-                return json.loads(line)
-            except json.JSONDecodeError:
-                continue
-    return None
+        args += ['--rknn-suffix', v['suffix']]
+    result = _run_container(
+        CONVERT_COMPOSE, 'convert', args, EVAL_TIMEOUT, f'eval {variant}',
+        env=['MALLOC_ARENA_MAX=2'],
+        volumes=[f'{BENCHMARK_DIR}:/app/benchmark', f'{PROJECT_DIR / "datasets"}:/app/datasets'],
+    )
+    return _last_json_line(result.stdout) if result else None
 
 
 # ---------------------------------------------------------------------------
 # Утилиты
 # ---------------------------------------------------------------------------
 
-def model_is_complete(result: dict) -> bool:
-    """Проверить, завершены ли все фазы для модели (convert + validate + bench + eval)."""
-    if result.get('conversion_status') != 'OK':
-        return False
-    v = result.get('validation', {})
-    has_val = (v.get('fp16', {}).get('max_diff_avg', -1) >= 0
-               or v.get('int8', {}).get('max_diff_avg', -1) >= 0)
-    if not has_val:
-        return False
-    fps = result.get('fps', {})
-    has_fps = any(
-        fps.get(k, {}).get('fps', -1) > 0
-        for k in ['cpu', 'npu_none', 'npu_int8', 'npu_int8-calib']
-    )
-    if not has_fps:
-        return False
-    eval_result = result.get('eval', {}) or {}
+def _eval_done(entry: dict, quantize: str) -> bool:
+    """Все ожидаемые (по сценарию квантизации) eval-варианты выполнены."""
+    eval_result = entry.get('eval', {}) or {}
     done_keys = {k for k, val in eval_result.items()
                  if isinstance(val, dict) and val.get('elapsed_s', 0) > 0}
-    need_keys = QUANTIZE_TO_EVAL.get(QUANTIZE, ['onnx', 'fp16', 'int8', 'int8-calib'])
-    if not all(vr in done_keys for vr in need_keys):
+    need_keys = QUANTIZE_TO_EVAL.get(quantize, ['onnx', 'fp16', 'int8', 'int8-calib'])
+    return all(vr in done_keys for vr in need_keys)
+
+
+def _bench_done(entry: dict, quantize: str) -> bool:
+    """Все ожидаемые (по сценарию квантизации) FPS-замеры получены."""
+    fps = entry.get('fps', {})
+    need = QUANTIZE_TO_FPS.get(quantize, ['cpu', 'npu_none', 'npu_int8', 'npu_int8-calib'])
+    return all(fps.get(k, {}).get('fps', -1) > 0 for k in need)
+
+
+def _validate_done(entry: dict) -> bool:
+    v = entry.get('validation', {})
+    return (v.get('fp16', {}).get('max_diff_avg', -1) >= 0
+            or v.get('int8', {}).get('max_diff_avg', -1) >= 0)
+
+
+def _convert_files_missing(model_cache_dir: Path, model_name: str, quantize: str) -> list[str]:
+    """Недостающие файлы конвертации по сценарию квантизации."""
+    need_convert = QUANTIZE_TO_EVAL.get(quantize, ['onnx', 'fp16', 'int8', 'int8-calib'])
+    return [
+        v for v in need_convert
+        if not (model_cache_dir / EVAL_VARIANTS[v]['file'](model_name)).exists()
+    ]
+
+
+def model_is_complete(result: dict, phases: list[str], quantize: str) -> bool:
+    """Завершены ли запрошенные фазы для модели (сценарно-зависимо).
+
+    Проверяются только те фазы, которые входят в `phases`; ожидаемые eval/fps
+    варианты определяются `quantize`. Для частичных сценариев (например
+    `--phase bench --quantize int8`) не требует невыполненных фаз.
+    """
+    if phase_is(phases, 'convert') and result.get('conversion_status') != 'OK':
+        return False
+    if phase_is(phases, 'validate') and not _validate_done(result):
+        return False
+    if phase_is(phases, 'bench') and not _bench_done(result, quantize):
+        return False
+    if phase_is(phases, 'eval') and not _eval_done(result, quantize):
         return False
     return True
+
+
+def missing_parts(entry: dict, phases: list[str], quantize: str) -> list[str]:
+    """Список незавершённых фаз/вариантов (только из запрошенного сценария)."""
+    parts = []
+    if phase_is(phases, 'convert') and entry.get('conversion_status') != 'OK':
+        parts.append('convert')
+    if phase_is(phases, 'validate') and not _validate_done(entry):
+        parts.append('validate')
+    if phase_is(phases, 'bench'):
+        need = QUANTIZE_TO_FPS.get(quantize, ['cpu', 'npu_none', 'npu_int8', 'npu_int8-calib'])
+        fps = entry.get('fps', {})
+        parts += [f'bench:{k}' for k in need if fps.get(k, {}).get('fps', -1) <= 0]
+    if phase_is(phases, 'eval'):
+        eval_result = entry.get('eval', {}) or {}
+        done_keys = {k for k, val in eval_result.items()
+                     if isinstance(val, dict) and val.get('elapsed_s', 0) > 0}
+        need_keys = QUANTIZE_TO_EVAL.get(quantize, ['onnx', 'fp16', 'int8', 'int8-calib'])
+        parts += [f'eval:{k}' for k in need_keys if k not in done_keys]
+    return parts
+
+
+def recompute_status(results: list[dict], quantize: str) -> None:
+    """Итоговый статус по фактическим данным (полный сценарий, честно)."""
+    full = ['convert', 'validate', 'bench', 'eval']
+    for r in results:
+        r['status'] = 'ПРОЙДЕНО' if model_is_complete(r, full, quantize) else 'ПРОВАЛ'
 
 
 def load_results() -> list[dict]:
@@ -590,6 +602,8 @@ def main() -> None:
                         help="Запуск для одной модели (напр. yolo26x-seg)")
     parser.add_argument("--pilot", action="store_true",
                         help="Только PILOT-модели (минимальные размеры)")
+    parser.add_argument("--force", action="store_true",
+                        help="Перезапускать eval/bench даже если результат уже есть в results.json")
     cli_args, _ = parser.parse_known_args()
 
     global QUANTIZE
@@ -613,6 +627,7 @@ def main() -> None:
     log(f'Mоделей={len(models)}, Warmup={WARMUP_S}с, Measure={MEASURE_S}с')
 
     existing = load_results()
+    processed: list[str] = []  # модели, обработанные в этом прогоне (для итога)
 
     # Остановить percept перед bench-фазой (освободить NPU)
     percept_was_running = False
@@ -638,24 +653,28 @@ def main() -> None:
             # Убедиться что датасет готов (скачивание если нужно)
             ensure_dataset(model)
 
-            # Полный skip если все фазы уже завершены
+            # Полный skip если все фазы уже завершены (кроме --force).
+            # Для convert фазы дополнительно проверяем наличие файлов: conversion_status
+            # мог быть выставлен 'OK' раньше, когда дособрались не все варианты
+            # (например sem: onnx+fp16 готовы, а int8/int8-calib нет) — тогда не скипаем.
             existing_entry = next((r for r in existing if r['model'] == model.name), None)
-            if existing_entry and model_is_complete(existing_entry):
-                log(f'[ПРОПУСК] все фазы завершены')
-                continue
+            if existing_entry and not cli_args.force and model_is_complete(existing_entry, phases, QUANTIZE):
+                if phase_is(phases, 'convert') and _convert_files_missing(model_cache_dir, model.name, QUANTIZE):
+                    log(f'[ИНФО] convert неполон: {", ".join(_convert_files_missing(model_cache_dir, model.name, QUANTIZE))} — дособираю')
+                else:
+                    log(f'[ПРОПУСК] все фазы завершены')
+                    continue
+            processed.append(model.name)
 
             # --- Фаза: convert ---
             if phase_is(phases, 'convert'):
                 # Resume: пропускаем convert только если ВСЕ нужные файлы на месте.
                 # (ранее проверялся только _fp16.rknn — это была дыра: при наличии fp16
                 # отсутствующие int8/int8-calib тихо пропускались и не дособирались)
-                need_convert = QUANTIZE_TO_EVAL.get(QUANTIZE, ['onnx', 'fp16', 'int8', 'int8-calib'])
-                missing = [
-                    v for v in need_convert
-                    if not (model_cache_dir / EVAL_VARIANTS[v]['file'](model.name)).exists()
-                ]
+                missing = _convert_files_missing(model_cache_dir, model.name, QUANTIZE)
                 if not missing:
-                    log(f'[ПРОПУСК] convert: все файлы ({", ".join(need_convert)}) уже на месте')
+                    all_convert = QUANTIZE_TO_EVAL.get(QUANTIZE, ['onnx', 'fp16', 'int8', 'int8-calib'])
+                    log(f'[ПРОПУСК] convert: все файлы ({", ".join(all_convert)}) уже на месте')
                     if model.name not in {r['model'] for r in existing}:
                         existing.append({
                             'model': model.name,
@@ -670,7 +689,9 @@ def main() -> None:
                 else:
                     conv_result = run_converter(model.name, model.task, model_cache_dir, model_data_dir)
                     if conv_result is None or conv_result.get('status') != 'OK':
-                        log(f'[ПРОВАЛ] конвертация не удалась для {model.name}')
+                        _fail(f'{model.name} [convert]',
+                              conv_result.get('error', 'конвертация не удалась') if conv_result
+                              else 'конвертация вернула None/таймаут')
                         result_entry = {
                             'model': model.name,
                             'task': model.task,
@@ -716,7 +737,7 @@ def main() -> None:
                     val_result = run_validate(model.name, model.task, model_cache_dir, model_data_dir,
                                              input_size=model.input_size)
                     if val_result is None:
-                        log(f'[ПРОВАЛ] валидация не удалась для {model.name}')
+                        _fail(f'{model.name} [validate]', 'валидация не удалась')
                         if model.name not in {r['model'] for r in existing}:
                             existing.append({
                                 'model': model.name,
@@ -776,19 +797,21 @@ def main() -> None:
                     save_results(existing)
 
                 bench_done = False
+                need_fps = QUANTIZE_TO_FPS.get(QUANTIZE, ['cpu', 'npu_none', 'npu_int8', 'npu_int8-calib'])
                 for r in existing:
                     if r['model'] == model.name:
                         fps_existing = r.get('fps', {})
-                        if any(fps_existing.get(k, {}).get('fps', -1) > 0
-                               for k in ['cpu', 'npu_none', 'npu_int8', 'npu_int8-calib']):
+                        if not cli_args.force and all(fps_existing.get(k, {}).get('fps', -1) > 0 for k in need_fps):
                             log(f'[ПРОПУСК] bench: уже замерено (results.json)')
                             bench_done = True
+                        elif cli_args.force:
+                            log('[--force] bench: перезамер всех вариантов')
                         break
 
                 if not bench_done:
                     if not (model_cache_dir / f'{model.name}.onnx').exists() and \
                        not (model_cache_dir / f'{model.name}_fp16.rknn').exists():
-                        log(f'[ПРОВАЛ] bench: нет моделей в cache/ и нет результатов')
+                        _fail(f'{model.name} [bench]', 'нет моделей в cache/ и нет результатов')
                         for j, r in enumerate(existing):
                             if r['model'] == model.name:
                                 existing[j]['fps'] = {}
@@ -799,7 +822,7 @@ def main() -> None:
                         fps_result = run_fps(model.name, model.task, model_cache_dir, model_data_dir,
                                              quantize=QUANTIZE)
                         if fps_result is None:
-                            log(f'[ПРОВАЛ] FPS-тест не удалась для {model.name}')
+                            _fail(f'{model.name} [bench]', 'FPS-тест не удался')
                             fps = {}
                         else:
                             fps = {}
@@ -830,14 +853,14 @@ def main() -> None:
                         for j, r in enumerate(existing):
                             if r['model'] == model.name:
                                 existing[j]['fps'] = fps
-                                has_data = any(
-                                    fps.get(k, {}).get('fps', -1) > 0
-                                    for k in ['cpu', 'npu_none', 'npu_int8', 'npu_int8-calib']
-                                )
-                                if has_data:
-                                    existing[j]['status'] = 'ПРОЙДЕНО'
-                                elif fps:
+                                missing_fps = [k for k in need_fps
+                                               if fps.get(k, {}).get('fps', -1) <= 0]
+                                if missing_fps:
+                                    _fail(f'{model.name} [bench]',
+                                          f'не получены FPS: {", ".join(missing_fps)}')
                                     existing[j]['status'] = 'ПРОВАЛ'
+                                else:
+                                    existing[j]['status'] = 'ПРОЙДЕНО'
                                 break
                         save_results(existing)
 
@@ -871,17 +894,23 @@ def main() -> None:
                     eval_results = next(r for r in existing if r['model'] == model.name)['eval'] or {}
                 done_keys = {k for k, val in eval_results.items()
                              if isinstance(val, dict) and val.get('elapsed_s', 0) > 0}
-                if all(vr in done_keys for vr in eval_variants):
+                if not cli_args.force and all(vr in done_keys for vr in eval_variants):
                     log(f'[ПРОПУСК] eval: все варианты уже выполнены (results.json)')
                 else:
+                    if cli_args.force:
+                        log('[--force] eval: пересчёт всех вариантов')
                     for variant in eval_variants:
-                        if variant in done_keys:
+                        if not cli_args.force and variant in done_keys:
                             log(f'[ПРОПУСК] eval {variant}: уже выполнено (results.json)')
                             continue
-                        eval_result = run_eval(model.name, model.task, model_cache_dir,
-                                               model_data_dir, variant)
+                        try:
+                            eval_result = run_eval(model.name, model.task, model_cache_dir,
+                                                   model_data_dir, variant)
+                        except FileNotFoundError as e:
+                            _fail(f'{model.name} [eval]', f'{variant}: {e}')
+                            eval_result = {'error': str(e)}
                         if eval_result is None:
-                            log(f'[ОШИБКА] eval {variant} не удался для {model.name}')
+                            _fail(f'{model.name} [eval]', f'{variant}: процесс упал/таймаут')
                             eval_result = {}
                         eval_results[variant] = eval_result
                     for j, r in enumerate(existing):
@@ -894,20 +923,48 @@ def main() -> None:
     except (KeyboardInterrupt, Exception) as e:
         if isinstance(e, KeyboardInterrupt):
             log(f'[ПРЕРВАНО] Ctrl+C')
+            _fail('main', 'Ctrl+C')
         else:
             log(f'[ОШИБКА] {e}')
+            _fail('main', f'необработанное исключение: {e}')
     finally:
         restart_percept(percept_was_running)
 
+    recompute_status(existing, QUANTIZE)
     write_tsv(existing)
 
     log(f'\n{"="*60}')
     log(f'БЕНЧМАРК ЗАВЕРШЁН: {len(existing)} моделей')
+
+    incomplete: list[tuple[str, list[str]]] = []
+    for name in processed:
+        entry = next((r for r in existing if r['model'] == name), None)
+        if entry is None:
+            continue
+        missing = missing_parts(entry, phases, QUANTIZE)
+        if missing:
+            incomplete.append((name, missing))
+            log(f'[ИТОГ] {name}: НЕПОЛНО ({", ".join(missing)})')
+        else:
+            log(f'[ИТОГ] {name}: OK')
+
+    if FAILURES:
+        log(f'\nСбои в прогоне ({len(FAILURES)}):')
+        for failure in FAILURES:
+            log(f'  - {failure}')
+    for name, missing in incomplete:
+        log(f'  [ИТОГ] {name}: не хватает {", ".join(missing)}')
+
     log(f'Результаты: {RESULTS_FILE}')
     log(f'Сводка: {SUMMARY_TSV}')
 
     print(f'\nСводка ({SUMMARY_TSV}):')
     print(SUMMARY_TSV.read_text() if SUMMARY_TSV.exists() else '(пусто)')
+
+    if FAILURES or incomplete:
+        log(f'БЕНЧМАРК ЗАВЕРШЁН С ОШИБКАМИ (exit=1)')
+        sys.exit(1)
+    log(f'БЕНЧМАРК ЗАВЕРШЁН УСПЕШНО (exit=0)')
 
 
 if __name__ == '__main__':

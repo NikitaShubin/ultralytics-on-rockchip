@@ -4,6 +4,7 @@ services:
     image: percept-converter:latest
     network_mode: host
     privileged: true
+    mem_limit: 5.5g
     devices:
       - /dev/dri/renderD129:/dev/dri/renderD129
     volumes:

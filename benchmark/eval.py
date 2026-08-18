@@ -15,6 +15,7 @@ import json
 import os
 import sys
 import time
+from collections import deque
 from pathlib import Path
 
 import cv2
@@ -1005,16 +1006,26 @@ def _seg_pre_nms(pp, outputs):
     return x, proto
 
 
-def _seg_nms_finish(pp, x, proto, scale, pad, orig_shape, fast_nms):
-    """Шаги 4-8 сегментного постпроцесса: class-aware NMS → masks_160 → формат."""
+def _seg_nms_only(pp, x, fast_nms):
+    """NMS-стадия сегментного постпроцесса (вызывается В ПУЛЕ, C++ NMS параллелится).
+
+    Возвращает (x_keep, bboxes_letter) или None (после NMS пусто). Маски НЕ считает:
+    process_mask_160/tp — тяжёлый numpy, который в 8 воркерах деградирует от
+    GIL-контеншна (эмпирически 2.5с/кадр вместо 0.98с), поэтому они выполняются
+    на главном потоке последовательно в _seg_finish.
+    """
     c = x[:, 5:6] * pp.MAX_WH
     boxes_nms = x[:, :4] + c
     keep = fast_nms(boxes_nms, x[:, 4], pp.IOU_THRESH)
     keep = keep[:pp.MAX_DET]
     x = x[keep]
     if len(x) == 0:
-        return []
-    bboxes_letter = x[:, :4].copy()
+        return None
+    return x, x[:, :4].copy()
+
+
+def _seg_finish(pp, x, bboxes_letter, proto, scale, pad, orig_shape):
+    """Масочная стадия (ГЛАВНЫЙ поток): masks_160 → reverse letterbox → формат."""
     masks_160 = pp.process_mask_160(proto, x[:, 6:], bboxes_letter)
     orig_h, orig_w = orig_shape
     pad_left = round(pad[0] / 2 - 0.1)
@@ -1054,6 +1065,237 @@ def _seg_nms_finish(pp, x, proto, scale, pad, orig_shape, fast_nms):
             obj["segmentation"] = seg
         results.append(obj)
     return results
+
+
+def _wrap_det_preds(objects, scale, pad_left, pad_top):
+    """objects → letterboxed-обёртка (bbox_xyxy_letter/score/class_id) для tp-функций."""
+    wrapped = []
+    for obj in objects:
+        b = obj['bbox']
+        wrapped.append({
+            'bbox_xyxy_letter': [
+                b[0] * scale + pad_left, b[1] * scale + pad_top,
+                b[2] * scale + pad_left, b[3] * scale + pad_top,
+            ],
+            'score': obj['score'],
+            'class_id': obj['class_id'],
+        })
+    return wrapped
+
+
+def _detect_tp_worker(pp, x, scale, pad, orig_shape, fast_nms, anns, sx, sy, pad_left, pad_top):
+    """detect-кадр в воркере: NMS-финиш + tp-агрегаты (всё тяжёлое numpy тут,
+    а не на главном потоке — иначе GIL блокирует остальных воркеров пула)."""
+    objects = _detect_nms_finish(pp, x, scale, pad, orig_shape, fast_nms)
+    wrapped = _wrap_det_preds(objects, scale, pad_left, pad_top)
+    tp, conf, pred_cls, gt_cls = _box_tp_per_image(anns, wrapped, sx, sy, pad_left, pad_top)
+    return tp, conf, pred_cls, gt_cls, objects
+
+
+def _install_fast_nms(post_mod):
+    """Единая установка быстрого NMS (torchvision.ops.nms, fallback numpy).
+
+    Патчит post_mod.nms (как для параллельных, так и для прямых путей) и
+    возвращает функцию для использования в пуле. None, если nms недоступен.
+    """
+    if post_mod is None or not hasattr(post_mod, 'nms'):
+        return None
+    _orig_nms = post_mod.nms
+    try:
+        import torch
+        import torchvision
+        torch.set_num_threads(1)
+        _tv_nms = torchvision.ops.nms
+    except ImportError:
+        _tv_nms = None
+    if _tv_nms is None:
+        return _orig_nms
+
+    def _fast_nms(boxes, scores, iou_threshold):
+        try:
+            tb = torch.from_numpy(np.ascontiguousarray(boxes, dtype=np.float32))
+            ts = torch.from_numpy(np.ascontiguousarray(scores, dtype=np.float32))
+            keep = _tv_nms(tb, ts, iou_threshold)
+            return keep.numpy().astype(np.int64)
+        except Exception:
+            return _orig_nms(boxes, scores, iou_threshold)
+
+    post_mod.nms = _fast_nms
+    return _fast_nms
+
+
+def _preprocess(pipeline, frame):
+    """Letterbox → RGB float32 → NCHW; /255 только для CPU (как в Pipeline).
+
+    Возвращает (tensor, scale, pad, (h, w)).
+    """
+    from percept.io import letterbox
+    h, w = frame.shape[:2]
+    canvas, scale, pad = letterbox(frame, pipeline.input_size)
+    rgb = cv2.cvtColor(canvas, cv2.COLOR_BGR2RGB).astype(np.float32)
+    tensor = np.expand_dims(rgb.transpose(2, 0, 1), axis=0)
+    if pipeline._backend.backend == 'cpu':
+        tensor = tensor / 255.0
+    return tensor, scale, pad, (h, w)
+
+
+def _letter_meta(scale, pad, isz, shape):
+    """scale/pad/изображение → (sx, sy, pad_left, pad_top) в letterboxed-пространстве."""
+    h, w = shape
+    pad_left = round(pad[0] / 2 - 0.1)
+    pad_top = round(pad[1] / 2 - 0.1)
+    return (isz - pad[0]) / w, (isz - pad[1]) / h, pad_left, pad_top
+
+
+class _Accumulator:
+    """Единое накопление результатов eval-кадра: pycoco + инкрементальные tp.
+
+    Устраняет хранение preds_by_img на все кадры (OOM на 5000 изображений):
+    per-image tp-агрегаты считаются сразу по мере поступления кадра и
+    накапливаются маленькими массивами. Заодно унифицирует detect/pose/segment:
+    у всех задач одинаковые tp-функции (anns, preds, sx, sy, pad_left, pad_top).
+    """
+
+    def __init__(self, task, ann_by_img, cat_ids, isz, dump=False, use_pool=False):
+        self.task = task
+        self.ann_by_img = ann_by_img
+        self.cat_ids = cat_ids
+        self.isz = isz
+        self.dump = dump
+        self.use_pool = use_pool
+        self.coco_results = []
+        self.eval_img_ids = []
+        self.lists: dict[str, dict] = {}
+        if task == 'detect':
+            self.tp_fns = [('inmem', _box_tp_per_image)]
+        elif task == 'pose':
+            self.tp_fns = [('inmem', _box_tp_per_image), ('inmem_pose', _pose_tp_per_image)]
+        elif task == 'segment':
+            self.tp_fns = [('inmem_seg', _seg_tp_per_image)]
+        else:
+            self.tp_fns = []
+        for name, _fn in self.tp_fns:
+            self.lists[name] = {'tp': [], 'conf': [], 'pred_cls': [], 'gt_cls': []}
+        self.dump_preds = {} if dump else None
+        self.dump_scales = {} if dump else None
+
+    def add_frame(self, img_id, objects, scale, pad, shape):
+        """Накопить один кадр: pycoco-детекции + tp-агрегаты (маленькие)."""
+        h, w = shape
+        sx, sy, pad_left, pad_top = _letter_meta(scale, pad, self.isz, shape)
+        self.eval_img_ids.append(img_id)
+        if self.dump:
+            self.dump_preds[img_id] = []
+            self.dump_scales[img_id] = (sx, sy, pad_left, pad_top)
+
+        anns = self.ann_by_img.get(img_id, [])
+        if self.task == 'segment':
+            anns = [a for a in anns if not a.get('iscrowd', 0)]
+
+        wrapped = []
+        if objects:
+            self.coco_results.extend(detections_to_coco(objects, img_id, self.cat_ids))
+            for obj in objects:
+                b = obj['bbox']
+                item = {
+                    'bbox_xyxy_letter': [
+                        b[0] * scale + pad_left, b[1] * scale + pad_top,
+                        b[2] * scale + pad_left, b[3] * scale + pad_top,
+                    ],
+                    'score': obj['score'],
+                    'class_id': obj['class_id'],
+                }
+                if self.task == 'pose':
+                    kpts_letter = []
+                    for k in (obj.get('keypoints') or []):
+                        if len(k) >= 3:
+                            kpts_letter.append([k[0] * scale + pad_left, k[1] * scale + pad_top, k[2]])
+                        else:
+                            kpts_letter.append([k[0] * scale + pad_left, k[1] * scale + pad_top, 0.0])
+                    item['kpts_letter'] = kpts_letter
+                if self.task == 'segment':
+                    item['masks_160'] = obj['masks_160']
+                wrapped.append(item)
+                if self.dump:
+                    self.dump_preds[img_id].append(item)
+
+        for name, fn in self.tp_fns:
+            tp, conf, pred_cls, gt_cls = fn(anns, wrapped, sx, sy, pad_left, pad_top)
+            self.lists[name]['tp'].append(tp)
+            self.lists[name]['conf'].append(conf)
+            self.lists[name]['pred_cls'].append(pred_cls)
+            self.lists[name]['gt_cls'].append(gt_cls)
+
+    def add_tp_result(self, img_id, objects, tp_tuple, scale, pad, shape):
+        """Вклад кадра из воркера: tp уже посчитан в _*_tp_worker, тут только
+        лёгкое накопление (pycoco + списки агрегатов + dump). Главный поток не
+        выполняет тяжёлого numpy (polygons2masks_overlap/box_iou) — это держало
+        GIL и сериализовало пул воркеров."""
+        h, w = shape
+        sx, sy, pad_left, pad_top = _letter_meta(scale, pad, self.isz, shape)
+        self.eval_img_ids.append(img_id)
+        if self.dump:
+            self.dump_preds[img_id] = []
+            self.dump_scales[img_id] = (sx, sy, pad_left, pad_top)
+        if objects:
+            self.coco_results.extend(detections_to_coco(objects, img_id, self.cat_ids))
+            if self.dump:
+                self.dump_preds[img_id] = _wrap_det_preds(objects, scale, pad_left, pad_top)
+        name, _fn = self.tp_fns[0]
+        tp, conf, pred_cls, gt_cls = tp_tuple
+        self.lists[name]['tp'].append(tp)
+        self.lists[name]['conf'].append(conf)
+        self.lists[name]['pred_cls'].append(pred_cls)
+        self.lists[name]['gt_cls'].append(gt_cls)
+
+    def finalize(self) -> dict:
+        """ap_per_class по накопленным агрегатам (все задачи унифицированы)."""
+        out = {}
+        for name, _fn in self.tp_fns:
+            l = self.lists[name]
+            out.update(_ap_finalize(l['tp'], l['conf'], l['pred_cls'], l['gt_cls'], prefix=name))
+        return out
+
+
+def _drain_one(pending, acc, post_mod):
+    """Забрать старейший future из окна и накопить его результат.
+
+    Окно futures ограничено (не все кадры разом) — пиковая память не растёт
+    с числом кадров: masks_160 (25KB/детекция) и остальные результаты живут
+    максимум в window кадрах, а не во всех 5000.
+
+    detect: tp посчитан в воркере (_detect_tp_worker) → только лёгкое накопление.
+    segment: воркер вернул (x, bboxes_letter) после NMS → маски/формат/tp делаются
+    ТУТ на главном потоке (_seg_finish), чтобы numpy не деградировал от
+    GIL-контеншна 8 воркеров. Пустой кадр (fut=None или пустой NMS) даёт пустой tp.
+    """
+    img_id, fut, meta, anns, proto = pending.popleft()
+    scale, pad, shape = meta
+    if acc.task == 'segment' and acc.use_pool:
+        if fut is not None and fut.result() is not None:
+            x, bboxes_letter = fut.result()
+            objects = _seg_finish(post_mod, x, bboxes_letter, proto, scale, pad, shape)
+            sx, sy, pad_left, pad_top = _letter_meta(scale, pad, acc.isz, shape)
+            tp, conf, pred_cls, gt_cls = _seg_tp_per_image(
+                anns, objects, sx, sy, pad_left, pad_top)
+            for obj in objects:
+                obj.pop('masks_160', None)
+            acc.add_tp_result(img_id, objects, (tp, conf, pred_cls, gt_cls), scale, pad, shape)
+        else:
+            sx, sy, pad_left, pad_top = _letter_meta(scale, pad, acc.isz, shape)
+            tp, conf, pred_cls, gt_cls = _seg_tp_per_image(anns, [], sx, sy, pad_left, pad_top)
+            acc.add_tp_result(img_id, [], (tp, conf, pred_cls, gt_cls), scale, pad, shape)
+        return
+    if fut is not None:
+        tp, conf, pred_cls, gt_cls, objects = fut.result()
+        acc.add_tp_result(img_id, objects, (tp, conf, pred_cls, gt_cls), scale, pad, shape)
+    else:
+        # Кадр без предсказаний (пустой выход после conf-фильтра): нужен
+        # пустой tp-вклад, чтобы финализация получила согласованные массивы.
+        name, fn = acc.tp_fns[0]
+        sx, sy, pad_left, pad_top = _letter_meta(scale, pad, acc.isz, shape)
+        tp, conf, pred_cls, gt_cls = fn(anns, [], sx, sy, pad_left, pad_top)
+        acc.add_tp_result(img_id, [], (tp, conf, pred_cls, gt_cls), scale, pad, shape)
 
 
 # ---------------------------------------------------------------------------
@@ -1106,6 +1348,7 @@ def evaluate(task: str, data_dir: str, model_dir: str = '/app/model',
     # Eval mode: минимальный порог чтобы pycocotools сам выбрал оптимальный
     import sys as _sys2
     post_mod = _sys2.modules.get('postprocess_mod')
+    fast_nms = None
     if post_mod is not None:
         post_mod.CONF_THRESH = 0.001
         post_mod.IOU_THRESH = 0.7
@@ -1120,25 +1363,9 @@ def evaluate(task: str, data_dir: str, model_dir: str = '/app/model',
         # сотни тысяч кандидатов → numpy-цикл NMS = секунды на кадр.
         # Используем torchvision.ops.nms (C++, тот же greedy, что у ref/ultralytics),
         # если torch доступен; иначе fallback на numpy. Продакшен-рантайм не трогаем.
-        if hasattr(post_mod, 'nms'):
-            _orig_nms = post_mod.nms
-            try:
-                import torch
-                import torchvision
-                _tv_nms = torchvision.ops.nms
-            except ImportError:
-                _tv_nms = None
-            if _tv_nms is not None:
-                def _fast_nms(boxes, scores, iou_threshold):
-                    try:
-                        tb = torch.from_numpy(np.ascontiguousarray(boxes, dtype=np.float32))
-                        ts = torch.from_numpy(np.ascontiguousarray(scores, dtype=np.float32))
-                        keep = _tv_nms(tb, ts, iou_threshold)
-                        return keep.numpy().astype(np.int64)
-                    except Exception:
-                        return _orig_nms(boxes, scores, iou_threshold)
-                post_mod.nms = _fast_nms
-                sys.stderr.write('[EVAL] fast NMS: torchvision.ops.nms (fallback: numpy)\n')
+        fast_nms = _install_fast_nms(post_mod)
+        if fast_nms is not None:
+            sys.stderr.write('[EVAL] fast NMS: torchvision.ops.nms (fallback: numpy)\n')
 
     # Загрузка датасета
     ann_file = None
@@ -1186,7 +1413,6 @@ def evaluate(task: str, data_dir: str, model_dir: str = '/app/model',
         sys.stderr.write(f'[EVAL] Cityscapes: {len(sem_pairs)} изображений\n')
 
     # Инференс через Pipeline
-    coco_results = []
     cls_predictions = []
     total = 0
     errors = 0
@@ -1209,258 +1435,89 @@ def evaluate(task: str, data_dir: str, model_dir: str = '/app/model',
         metrics['errors'] = errors
 
     elif task in ('detect', 'segment', 'pose'):
-        eval_img_ids = []
-        preds_by_img = {}
-        scales_pads = {}
-        seg_tp, seg_conf, seg_pred_cls, seg_gt_cls = [], [], [], []
-        if task == 'detect':
-            # Конвейер: letterbox+infer последовательно на NPU, NMS кадров —
-            # параллельно в пуле по числу производительных ядер. NMS на 30000
-            # кандидатов при conf=0.001 — единственное узкое место (1.35с/кадр),
-            # распараллеливание даёт ~3.4x без ущерба метрикам (тот же greedy NMS).
-            from percept.io import letterbox
-            n_workers = _big_core_count()
-            sys.stderr.write(f'[EVAL] parallel NMS: {n_workers} workers\n')
-            if post_mod is not None and hasattr(post_mod, 'nms'):
-                _orig_nms = post_mod.nms
-                try:
-                    import torch
-                    import torchvision
-                    torch.set_num_threads(1)
-                    _tv_nms = torchvision.ops.nms
-                except ImportError:
-                    _tv_nms = None
-                if _tv_nms is not None:
-                    def _fast_nms(boxes, scores, iou_threshold):
-                        tb = torch.from_numpy(np.ascontiguousarray(boxes, dtype=np.float32))
-                        ts = torch.from_numpy(np.ascontiguousarray(scores, dtype=np.float32))
-                        return _tv_nms(tb, ts, iou_threshold).numpy().astype(np.int64)
-                else:
-                    _fast_nms = _orig_nms
-            else:
-                _fast_nms = None
-            futures = {}
-            meta_by_img = {}
-            _pool = _cf.ThreadPoolExecutor(max_workers=n_workers) if _fast_nms is not None else None
-            for img_id, img_info in images.items():
-                if limit and total >= limit:
-                    break
-                img_path = find_img_path(img_info, data_dir)
-                frame = cv2.imread(img_path)
-                if frame is None:
-                    errors += 1
-                    continue
-                h, w = frame.shape[:2]
-                canvas, scale, pad = letterbox(frame, pipeline.input_size)
-                rgb = cv2.cvtColor(canvas, cv2.COLOR_BGR2RGB).astype(np.float32)
-                tensor = np.expand_dims(rgb.transpose(2, 0, 1), axis=0)
-                if pipeline._backend.backend == 'cpu':
-                    tensor = tensor / 255.0
-                outputs = pipeline._backend.infer(tensor)
-                meta_by_img[img_id] = (scale, pad, (h, w))
-                if _pool is not None:
-                    x = _detect_pre_nms(post_mod, outputs)
-                    if x is not None:
-                        futures[img_id] = _pool.submit(
-                            _detect_nms_finish, post_mod, x, scale, pad, (h, w), _fast_nms)
-                    else:
-                        futures[img_id] = None
-                else:
-                    objects = post_mod.postprocess(outputs, scale, pad, (h, w)) if post_mod else []
-                    futures[img_id] = objects
-                eval_img_ids.append(img_id)
-                total += 1
-                if total % 500 == 0:
-                    sys.stderr.write(f'[EVAL] {total}/{len(images)}\n')
-            if _pool is not None:
-                _pool.shutdown()
-                for img_id, fut in futures.items():
-                    futures[img_id] = fut.result() if fut is not None else []
-            for img_id in eval_img_ids:
-                objects = futures[img_id]
-                scale, pad, (h, w) = meta_by_img[img_id]
-                coco_results.extend(detections_to_coco(objects, img_id, cat_ids))
-                pad_left = round(pad[0] / 2 - 0.1)
-                pad_top = round(pad[1] / 2 - 0.1)
-                isz = pipeline.input_size
-                sx = (isz - pad[0]) / w
-                sy = (isz - pad[1]) / h
-                scales_pads[img_id] = (sx, sy, pad_left, pad_top)
-                preds_by_img[img_id] = []
-                for obj in objects:
-                    x1, y1, x2, y2 = obj['bbox']
-                    preds_by_img[img_id].append({
-                        'bbox_xyxy_letter': [
-                            x1 * scale + pad_left, y1 * scale + pad_top,
-                            x2 * scale + pad_left, y2 * scale + pad_top,
-                        ],
-                        'kpts_letter': None,
-                        'score': obj['score'],
-                        'class_id': obj['class_id'],
-                    })
+        # Единый цикл по кадрам: preprocess → infer → postprocess → накопление.
+        # detect/segment: NMS (и masks_160) — узкое место при conf=0.001 →
+        # финиш выполняется в пуле потоков (torchvision NMS освобождает GIL).
+        # Окно futures ограничено (2*workers), чтобы результаты кадров НЕ
+        # копились на все 5000 изображений (masks_160 = OOM, см. _drain_one).
+        # Пул воркеров для NMS/масок полезен только на NPU (infer быстрый, 77мс).
+        # На onnx/cpu infer занимает ВСЕ ядра (onnxruntime) — пул лишь добавляет
+        # GIL-контеншн и замедляет (segment: 143с → 270с). Для cpu — прямой путь
+        # (как pose): main делает postprocess + tp последовательно.
+        use_pool = (task in ('detect', 'segment') and fast_nms is not None and backend != 'cpu')
+        acc = _Accumulator(task, ann_by_img, cat_ids, pipeline.input_size,
+                           dump=os.environ.get('EVAL_DUMP_PREDS'), use_pool=use_pool)
+        n_workers = _big_core_count() if use_pool else 1
+        if use_pool:
+            sys.stderr.write(f'[EVAL] parallel {task} NMS: {n_workers} workers\n')
+            _pool = _cf.ThreadPoolExecutor(max_workers=n_workers)
+            window = max(2, n_workers * 2)
         else:
-            # segment: NMS+masks при conf=0.001 — то же узкое место, что у detect
-            # (NMS на 30000 кандидатов + process_mask_160) → распараллеливаем
-            # финиш (NMS → masks → формат) в ThreadPool по числу больших ядер.
-            # pose: обычный путь (кандидатов мало — NMS не узкое место).
-            if task == 'segment' and post_mod is not None and hasattr(post_mod, 'nms'):
-                _orig_nms = post_mod.nms
-                try:
-                    import torch
-                    import torchvision
-                    torch.set_num_threads(1)
-                    _tv_nms = torchvision.ops.nms
-                except ImportError:
-                    _tv_nms = None
-                if _tv_nms is not None:
-                    def _fast_nms(boxes, scores, iou_threshold):
-                        try:
-                            tb = torch.from_numpy(np.ascontiguousarray(boxes, dtype=np.float32))
-                            ts = torch.from_numpy(np.ascontiguousarray(scores, dtype=np.float32))
-                            keep = _tv_nms(tb, ts, iou_threshold)
-                            return keep.numpy().astype(np.int64)
-                        except Exception:
-                            return _orig_nms(boxes, scores, iou_threshold)
-                    post_mod.nms = _fast_nms
-                    sys.stderr.write(f'[EVAL] segment parallel NMS: {_big_core_count()} workers\n')
-                    n_workers = _big_core_count()
-                    _pool = _cf.ThreadPoolExecutor(max_workers=n_workers)
-                else:
-                    _pool = None
-            else:
-                _pool = None
+            _pool = None
+            window = 0
+        pending = deque()
 
-            futures = {}
-            meta_by_img = {}
-            for img_id, img_info in images.items():
-                if limit and total >= limit:
-                    break
-                img_path = find_img_path(img_info, data_dir)
-                frame = cv2.imread(img_path)
-                if frame is None:
-                    errors += 1
-                    continue
-                if _pool is not None:
-                    h, w = frame.shape[:2]
-                    from percept.io import letterbox
-                    canvas, scale, pad = letterbox(frame, pipeline.input_size)
-                    rgb = cv2.cvtColor(canvas, cv2.COLOR_BGR2RGB).astype(np.float32)
-                    tensor = np.expand_dims(rgb.transpose(2, 0, 1), axis=0)
-                    if pipeline._backend.backend == 'cpu':
-                        tensor = tensor / 255.0
-                    outputs = pipeline._backend.infer(tensor)
-                    meta_by_img[img_id] = (scale, pad, (h, w))
-                    pre = _seg_pre_nms(post_mod, outputs)
-                    if pre is not None:
-                        x, proto = pre
-                        futures[img_id] = _pool.submit(
-                            _seg_nms_finish, post_mod, x, proto, scale, pad, (h, w), _fast_nms)
-                    else:
-                        futures[img_id] = None
-                    eval_img_ids.append(img_id)
-                    total += 1
-                    if total % 500 == 0:
-                        sys.stderr.write(f'[EVAL] {total}/{len(images)}\n')
-                    continue
+        for img_id, img_info in images.items():
+            if limit and total >= limit:
+                break
+            img_path = find_img_path(img_info, data_dir)
+            frame = cv2.imread(img_path)
+            if frame is None:
+                errors += 1
+                continue
+            if task == 'pose':
+                # pose: кандидатов мало, NMS не узкое место → прямой путь
                 objects, meta = pipeline.detect(frame)
-                coco_results.extend(detections_to_coco(objects, img_id, cat_ids))
-                eval_img_ids.append(img_id)
-                pad = meta['pad']
-                pad_left = round(pad[0] / 2 - 0.1)
-                pad_top = round(pad[1] / 2 - 0.1)
-                scale = meta['scale']
-                isz = meta['input_size']
-                sx = (isz - pad[0]) / frame.shape[1]
-                sy = (isz - pad[1]) / frame.shape[0]
-                scales_pads[img_id] = (sx, sy, pad_left, pad_top)
-                preds_by_img[img_id] = []
-                for obj in objects:
-                    x1, y1, x2, y2 = obj['bbox']
-                    kpts_letter = None
-                    if task == 'pose':
-                        kpts_letter = []
-                        for k in (obj.get('keypoints') or []):
-                            if len(k) >= 3:
-                                kpts_letter.append([k[0] * scale + pad_left, k[1] * scale + pad_top, k[2]])
-                            else:
-                                kpts_letter.append([k[0] * scale + pad_left, k[1] * scale + pad_top, 0.0])
-                    preds_by_img[img_id].append({
-                        'bbox_xyxy_letter': [
-                            x1 * scale + pad_left, y1 * scale + pad_top,
-                            x2 * scale + pad_left, y2 * scale + pad_top,
-                        ],
-                        'kpts_letter': kpts_letter,
-                        'score': obj['score'],
-                        'class_id': obj['class_id'],
-                    })
+                scale = meta.get('scale', 1.0)
+                pad = meta.get('pad', (0, 0))
+                acc.add_frame(img_id, objects, scale, pad, frame.shape[:2])
+            else:
+                tensor, scale, pad, shape = _preprocess(pipeline, frame)
+                outputs = pipeline._backend.infer(tensor)
+                sx, sy, pad_left, pad_top = _letter_meta(scale, pad, pipeline.input_size, shape)
+                anns = ann_by_img.get(img_id, [])
                 if task == 'segment':
-                    anns = [a for a in ann_by_img.get(img_id, []) if not a.get('iscrowd', 0)]
-                    tp_m, conf, pred_cls, gt_cls = _seg_tp_per_image(
-                        anns, objects, sx, sy, pad_left, pad_top)
-                    seg_tp.append(tp_m)
-                    seg_conf.append(conf)
-                    seg_pred_cls.append(pred_cls)
-                    seg_gt_cls.append(gt_cls)
-                total += 1
-                if total % 500 == 0:
-                    sys.stderr.write(f'[EVAL] {total}/{len(images)}\n')
+                    anns = [a for a in anns if not a.get('iscrowd', 0)]
+                if _pool is not None:
+                    if task == 'detect':
+                        x = _detect_pre_nms(post_mod, outputs)
+                        fut = (_pool.submit(_detect_tp_worker, post_mod, x, scale, pad, shape, fast_nms,
+                                           anns, sx, sy, pad_left, pad_top)
+                               if x is not None else None)
+                        proto = None
+                    else:
+                        pre = _seg_pre_nms(post_mod, outputs)
+                        fut = (_pool.submit(_seg_nms_only, post_mod, pre[0], fast_nms)
+                               if pre is not None else None)
+                        proto = pre[1] if pre is not None else None
+                    pending.append((img_id, fut, (scale, pad, shape), anns, proto))
+                    while len(pending) > window:
+                        _drain_one(pending, acc, post_mod)
+                else:
+                    objects = post_mod.postprocess(outputs, scale, pad, shape) if post_mod else []
+                    acc.add_frame(img_id, objects, scale, pad, shape)
+            total += 1
+            if total % 500 == 0:
+                sys.stderr.write(f'[EVAL] {total}/{len(images)}\n')
 
-            if _pool is not None:
-                _pool.shutdown()
-                for img_id, fut in futures.items():
-                    futures[img_id] = fut.result() if fut is not None else []
-                for img_id in eval_img_ids:
-                    objects = futures[img_id]
-                    scale, pad, (h, w) = meta_by_img[img_id]
-                    coco_results.extend(detections_to_coco(objects, img_id, cat_ids))
-                    pad_left = round(pad[0] / 2 - 0.1)
-                    pad_top = round(pad[1] / 2 - 0.1)
-                    isz = pipeline.input_size
-                    sx = (isz - pad[0]) / w
-                    sy = (isz - pad[1]) / h
-                    scales_pads[img_id] = (sx, sy, pad_left, pad_top)
-                    preds_by_img[img_id] = []
-                    for obj in objects:
-                        x1, y1, x2, y2 = obj['bbox']
-                        preds_by_img[img_id].append({
-                            'bbox_xyxy_letter': [
-                                x1 * scale + pad_left, y1 * scale + pad_top,
-                                x2 * scale + pad_left, y2 * scale + pad_top,
-                            ],
-                            'kpts_letter': None,
-                            'score': obj['score'],
-                            'class_id': obj['class_id'],
-                        })
-                    anns = [a for a in ann_by_img.get(img_id, []) if not a.get('iscrowd', 0)]
-                    tp_m, conf, pred_cls, gt_cls = _seg_tp_per_image(
-                        anns, objects, sx, sy, pad_left, pad_top)
-                    seg_tp.append(tp_m)
-                    seg_conf.append(conf)
-                    seg_pred_cls.append(pred_cls)
-                    seg_gt_cls.append(gt_cls)
+        if _pool is not None:
+            _pool.shutdown()
+            while pending:
+                _drain_one(pending, acc, post_mod)
 
-        sys.stderr.write(f'[EVAL] mAP ({len(coco_results)} pred)...\n')
+        sys.stderr.write(f'[EVAL] mAP ({len(acc.coco_results)} pred)...\n')
         if os.environ.get('EVAL_DUMP_PREDS'):
             import pickle as _pkl
             _pkl.dump({
-                'preds_by_img': preds_by_img, 'scales_pads': scales_pads,
-                'eval_img_ids': eval_img_ids, 'images': images, 'ann_by_img': ann_by_img,
+                'preds_by_img': acc.dump_preds, 'scales_pads': acc.dump_scales,
+                'eval_img_ids': acc.eval_img_ids, 'images': images, 'ann_by_img': ann_by_img,
             }, open('/app/percept/benchmark/dump_preds.pkl', 'wb'))
             sys.stderr.write('[EVAL] dumped preds to benchmark/dump_preds.pkl\n')
-        metrics = compute_coco_map(coco_results, ann_file, task, eval_img_ids=eval_img_ids)
-        if task in ('detect', 'pose'):
-            metrics.update(
-                compute_inmemory_box_map(images, ann_by_img, preds_by_img, scales_pads, eval_img_ids)
-            )
-        if task == 'pose':
-            metrics.update(
-                compute_inmemory_pose_map(images, ann_by_img, preds_by_img, scales_pads, eval_img_ids)
-            )
-        if task == 'segment':
-            metrics.update(_seg_finalize(seg_tp, seg_conf, seg_pred_cls, seg_gt_cls))
+        metrics = compute_coco_map(acc.coco_results, ann_file, task, eval_img_ids=acc.eval_img_ids)
+        metrics.update(acc.finalize())
         metrics['total'] = total
         metrics['errors'] = errors
-        metrics['predictions'] = len(coco_results)
+        metrics['predictions'] = len(acc.coco_results)
 
     elif task == 'obb':
         def poly_to_xywha(polygon, img_w, img_h):

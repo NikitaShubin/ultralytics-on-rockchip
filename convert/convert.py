@@ -670,6 +670,10 @@ def _calib_img_dir(data_root: Path) -> Path:
         return jpg.parent
     for jpg in root.rglob("*.jpeg"):
         return jpg.parent
+    for jpg in root.rglob("*.png"):
+        return jpg.parent
+    for jpg in root.rglob("*.bmp"):
+        return jpg.parent
     raise RuntimeError(f"Нет изображений для калибровки в {root}")
 
 
@@ -702,7 +706,11 @@ def _build_rknn(onnx_path, quantize, calib_dir=None):
             log(f"Сборка RKNN (int8) с калибровкой из {calib_dir}")
             calib_txt = "/tmp/calib.txt"
             with open(calib_txt, "w") as f:
-                for img_path in sorted(Path(calib_dir).glob("*.jpg"))[:512]:
+                exts = ["*.jpg", "*.jpeg", "*.png", "*.bmp"]
+                imgs = []
+                for ext in exts:
+                    imgs.extend(Path(calib_dir).glob(ext))
+                for img_path in sorted(imgs)[:512]:
                     f.write(str(img_path) + "\n")
             ret = rknn.build(do_quantization=True, dataset=calib_txt)
         else:

@@ -97,7 +97,7 @@ def download_file(urls, dest: Path) -> None:
         print(f'Загрузка {url}...')
         try:
             subprocess.run(
-                ['curl', '-fSL', '--progress-bar', '-L', '--retry', '2',
+                ['curl', '-fSL', '-sS', '-L', '--retry', '2',
                  '--retry-delay', '5', '--connect-timeout', '20',
                  '--speed-limit', '1000', '--speed-time', '15',
                  '-C', '-', '-o', str(tmp), url],

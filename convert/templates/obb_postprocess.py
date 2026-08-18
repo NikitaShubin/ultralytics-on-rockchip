@@ -69,6 +69,55 @@ def process_head(box_dist, cls_scores, angle_raw, stride, grid_h, grid_w):
     return np.column_stack([cx, cy, bw, bh]), ang_f, scores
 
 
+def _rotated_nms(boxes_xywhr, scores, iou_thresh, max_det, classes=None, block=4096):
+    """Блочный greedy NMS для obb — байт-эквивалент полной batch_probiou
+    (fast_nms: triu + sum(0)<=0), память O(block^2) вместо O(N^2).
+
+    Класс-offset (MAX_WH) исключает пересечения между классами, поэтому при
+    заданном classes NMS считается per-class: пар в ~C раз меньше (на 30000
+    кандидатов fp16 = минус OOM и ~15x ускорение). Результат идентичен
+    глобальному greedy.
+
+    Возвращает индексы выбранных боксов в исходной нумерации boxes_xywhr.
+    """
+    from ultralytics.utils.metrics import batch_probiou
+    import torch
+    n = scores.shape[0]
+    if n == 0:
+        return np.empty(0, dtype=np.int64)
+    if classes is None:
+        groups = [np.arange(n)]
+    else:
+        groups = [np.where(classes == cid)[0] for cid in np.unique(classes)]
+    keep = np.empty(0, dtype=np.int64)
+    for g in groups:
+        ng = len(g)
+        if ng == 0:
+            continue
+        b = np.ascontiguousarray(boxes_xywhr[g], dtype=np.float32)
+        sg = scores[g]
+        sorted_idx = torch.argsort(torch.from_numpy(sg), descending=True).numpy()
+        b = b[sorted_idx]
+        nb = (ng + block - 1) // block
+        max_iou = np.zeros(ng, dtype=np.float32)
+        for jb in range(nb):
+            j0, j1 = jb * block, min(ng, (jb + 1) * block)
+            bj = b[j0:j1]
+            for ib in range(jb):
+                i0, i1 = ib * block, min(ng, (ib + 1) * block)
+                iou = batch_probiou(b[i0:i1], bj).numpy()
+                max_iou[j0:j1] = np.maximum(max_iou[j0:j1], iou.max(axis=0))
+            iou_jj = batch_probiou(bj, bj).numpy()
+            if j1 - j0 > 1:
+                max_iou[j0:j1] = np.maximum(max_iou[j0:j1],
+                                            np.triu(iou_jj, k=1).max(axis=0))
+        kl = np.where(max_iou < iou_thresh)[0]
+        keep = np.concatenate([keep, g[sorted_idx[kl]]])
+    if len(keep) > max_det:
+        keep = keep[np.argsort(-scores[keep])[:max_det]]
+    return keep
+
+
 def postprocess(outputs, scale, pad, orig_shape):
     """Postprocess matching ultralytics val non_max_suppression for obb.
 
@@ -128,31 +177,21 @@ def postprocess(outputs, scale, pad, orig_shape):
         filt = x[:, 4].argsort()[::-1][:MAX_NMS]
         x = x[filt]
 
-    # rotated NMS — fast_nms (TorchNMS) + class offset, batch_probiou
+    # rotated NMS — блочный greedy (эквивалент ultralytics fast_nms с полной
+    # batch_probiou-матрицей), память O(BLOCK^2) вместо O(N^2) → нет OOM на
+    # conf=0.001 (fp16/int8 дают ~30000 кандидатов = 3.6GB полной матрицы).
     from ultralytics.utils.metrics import batch_probiou
     import torch
 
     c = x[:, 5:6] * MAX_WH
-    boxes_xywhr = torch.from_numpy(np.column_stack([
+    boxes_xywhr = np.column_stack([
         x[:, :2] + c,  # cx+class_offset, cy+class_offset
         x[:, 2:4],     # w, h
         x[:, -1:],     # angle
-    ]))
-    scores = torch.from_numpy(x[:, 4])
-
-    sorted_idx = torch.argsort(scores, descending=True)
-    boxes_sorted = boxes_xywhr[sorted_idx]
-    ious = batch_probiou(boxes_sorted, boxes_sorted)
-    ious_np = ious.numpy()
-    n = ious_np.shape[0]
-    keep_mask = np.ones(n, dtype=bool)
-    for j in range(1, n):
-        if np.any(ious_np[:j, j] >= IOU_THRESH):
-            keep_mask[j] = False
-
-    sorted_indices = sorted_idx.numpy()
-    keep_sorted = np.where(keep_mask)[0][:MAX_DET]
-    keep = sorted_indices[keep_sorted]
+    ])
+    scores = x[:, 4]
+    keep = _rotated_nms(boxes_xywhr, scores, IOU_THRESH, MAX_DET,
+                        classes=x[:, 5])
     x = x[keep]
 
     if len(x) == 0:
