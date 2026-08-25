@@ -4,6 +4,7 @@
 #
 # В переднем плане:  RUN_FOREGROUND=1 ./run.sh
 # Только PILOT:      RUN_PILOT=1 ./run.sh
+# Без автоочистки:   RUN_NO_CLEANUP=1 ./run.sh
 # Принудительно:     RUN_FORCE=1 ./run.sh
 set -euo pipefail
 
@@ -31,7 +32,9 @@ EXTRA_FLAGS=()
 : "${BENCH_WARMUP:=10}"
 : "${BENCH_MEASURE:=30}"
 : "${BENCH_REPEATS:=3}"
-export BENCH_WARMUP BENCH_MEASURE BENCH_REPEATS
+: "${BENCH_CLEANUP:=1}"
+[[ "${RUN_NO_CLEANUP:-0}" == "1" ]] && BENCH_CLEANUP=0
+export BENCH_WARMUP BENCH_MEASURE BENCH_REPEATS BENCH_CLEANUP
 
 log "Полный бенчмарк (${EXTRA_FLAGS[*]:-FULL, 111 моделей})"
 log "Старт: $(date '+%Y-%m-%d %H:%M:%S')"

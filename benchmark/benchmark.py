@@ -58,6 +58,7 @@ BENCH_REPEATS = int(os.environ.get('BENCH_REPEATS', '3'))
 CONVERT_TIMEOUT = int(os.environ.get('BENCH_CONVERT_TIMEOUT', '10800'))
 EVAL_TIMEOUT = int(os.environ.get('BENCH_EVAL_TIMEOUT', '14400'))
 QUANTIZE = os.environ.get('BENCH_QUANTIZE', 'all')
+CLEANUP_AFTER = os.environ.get('BENCH_CLEANUP', '1') == '1'
 PERCEPT_CONTAINER = 'percept'
 
 # quantize-варианты eval (eval.py --backend/--rknn-suffix и файл в cache/<model>/)
@@ -413,6 +414,34 @@ def _convert_files_missing(model_cache_dir: Path, model_name: str, quantize: str
         v for v in need_convert
         if not (model_cache_dir / EVAL_VARIANTS[v]['file'](model_name)).exists()
     ]
+
+
+def _cleanup_model_cache(model_cache_dir: Path, model_name: str) -> None:
+    """Удалить тяжёлые файлы после успешного завершения всех фаз.
+
+    Безопасно удаляются:
+    - <model>.pt (веса — уже экспортированы в .onnx, повторный экспорт
+      не нужен; _find_nearest() при конвертации ищет .onnx первым)
+    - __pycache__/ (автогенерированные .pyc)
+    Не удаляются (.onnx, .rknn, postprocess.py) — нужны для resume/bench/eval.
+    """
+    if not CLEANUP_AFTER:
+        return
+    removed = []
+    # .pt веса (3–200 МБ)
+    pt = model_cache_dir / f'{model_name}.pt'
+    if pt.exists():
+        sz = pt.stat().st_size
+        pt.unlink()
+        removed.append(f'{model_name}.pt ({sz / 1e6:.1f} МБ)')
+    # __pycache__
+    pycache = model_cache_dir / '__pycache__'
+    if pycache.is_dir():
+        import shutil
+        shutil.rmtree(pycache)
+        removed.append('__pycache__/')
+    if removed:
+        log(f'[ОЧИСТКА] {model_name}: удалено {", ".join(removed)}')
 
 
 def model_is_complete(result: dict, phases: list[str], quantize: str) -> bool:
@@ -925,6 +954,11 @@ def main() -> None:
                             break
                     save_results(existing)
                     log(f'[ГОТОВО] eval {model.name}: {json.dumps(eval_results, ensure_ascii=False)}')
+
+                # Очистка тяжёлых файлов (.pt, __pycache__) после всех фаз
+                entry = next((r for r in existing if r['model'] == model.name), None)
+                if entry and model_is_complete(entry, phases, QUANTIZE):
+                    _cleanup_model_cache(model_cache_dir, model.name)
 
     except (KeyboardInterrupt, Exception) as e:
         if isinstance(e, KeyboardInterrupt):
