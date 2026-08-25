@@ -55,7 +55,7 @@ IMAGENET_VAL_CONTAINER = '/app/datasets/imagenet'
 WARMUP_S = int(os.environ.get('BENCH_WARMUP', '10'))
 MEASURE_S = int(os.environ.get('BENCH_MEASURE', '30'))
 BENCH_REPEATS = int(os.environ.get('BENCH_REPEATS', '3'))
-CONVERT_TIMEOUT = int(os.environ.get('BENCH_CONVERT_TIMEOUT', '7200'))
+CONVERT_TIMEOUT = int(os.environ.get('BENCH_CONVERT_TIMEOUT', '10800'))
 EVAL_TIMEOUT = int(os.environ.get('BENCH_EVAL_TIMEOUT', '14400'))
 QUANTIZE = os.environ.get('BENCH_QUANTIZE', 'all')
 PERCEPT_CONTAINER = 'percept'
@@ -651,7 +651,13 @@ def main() -> None:
             model_cache_dir = CACHE_DIR / model.name
 
             # Убедиться что датасет готов (скачивание если нужно)
-            ensure_dataset(model)
+            try:
+                ensure_dataset(model)
+            except Exception as e:
+                log(f'[ОШИБКА] {model.name} [dataset]: {e}')
+                _fail(f'{model.name} [dataset]', str(e))
+                save_results(existing)
+                continue
 
             # Полный skip если все фазы уже завершены (кроме --force).
             # Для convert фазы дополнительно проверяем наличие файлов: conversion_status
