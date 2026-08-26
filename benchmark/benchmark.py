@@ -417,31 +417,27 @@ def _convert_files_missing(model_cache_dir: Path, model_name: str, quantize: str
 
 
 def _cleanup_model_cache(model_cache_dir: Path, model_name: str) -> None:
-    """Удалить тяжёлые файлы после успешного завершения всех фаз.
+    """Удалить .pt веса после успешного завершения всех фаз.
 
-    Безопасно удаляются:
-    - <model>.pt (веса — уже экспортированы в .onnx, повторный экспорт
-      не нужен; _find_nearest() при конвертации ищет .onnx первым)
-    - __pycache__/ (автогенерированные .pyc)
-    Не удаляются (.onnx, .rknn, postprocess.py) — нужны для resume/bench/eval.
+    Файлы в cache/ root-owned (созданы в контейнере) — удаление
+    через docker compose run --rm (где есть root-доступ).
     """
     if not CLEANUP_AFTER:
         return
-    removed = []
-    # .pt веса (3–200 МБ)
     pt = model_cache_dir / f'{model_name}.pt'
-    if pt.exists():
-        sz = pt.stat().st_size
-        pt.unlink()
-        removed.append(f'{model_name}.pt ({sz / 1e6:.1f} МБ)')
-    # __pycache__
-    pycache = model_cache_dir / '__pycache__'
-    if pycache.is_dir():
-        import shutil
-        shutil.rmtree(pycache)
-        removed.append('__pycache__/')
-    if removed:
-        log(f'[ОЧИСТКА] {model_name}: удалено {", ".join(removed)}')
+    if not pt.exists():
+        return
+    sz = pt.stat().st_size
+    _run_container(
+        CONVERT_COMPOSE, 'convert',
+        ['-c', f'rm -f /app/cache/{model_name}/{model_name}.pt'],
+        timeout=30, tag=f'cleanup {model_name}',
+        entrypoint='bash',
+    )
+    if not pt.exists():
+        log(f'[ОЧИСТКА] {model_name}: удалён {model_name}.pt ({sz / 1e6:.1f} МБ)')
+    else:
+        log(f'[ОЧИСТКА] {model_name}: не удалось удалить {model_name}.pt')
 
 
 def model_is_complete(result: dict, phases: list[str], quantize: str) -> bool:
@@ -955,10 +951,13 @@ def main() -> None:
                     save_results(existing)
                     log(f'[ГОТОВО] eval {model.name}: {json.dumps(eval_results, ensure_ascii=False)}')
 
-                # Очистка тяжёлых файлов (.pt, __pycache__) после всех фаз
-                entry = next((r for r in existing if r['model'] == model.name), None)
-                if entry and model_is_complete(entry, phases, QUANTIZE):
-                    _cleanup_model_cache(model_cache_dir, model.name)
+                # Очистка тяжёлых файлов (.pt) после всех фаз
+                try:
+                    entry = next((r for r in existing if r['model'] == model.name), None)
+                    if entry and model_is_complete(entry, phases, QUANTIZE):
+                        _cleanup_model_cache(model_cache_dir, model.name)
+                except Exception as e:
+                    log(f'[ОЧИСТКА] {model.name}: ошибка очистки (не критично): {e}')
 
     except (KeyboardInterrupt, Exception) as e:
         if isinstance(e, KeyboardInterrupt):
