@@ -55,8 +55,17 @@ IMAGENET_VAL_CONTAINER = '/app/datasets/imagenet'
 WARMUP_S = int(os.environ.get('BENCH_WARMUP', '10'))
 MEASURE_S = int(os.environ.get('BENCH_MEASURE', '30'))
 BENCH_REPEATS = int(os.environ.get('BENCH_REPEATS', '3'))
-CONVERT_TIMEOUT = int(os.environ.get('BENCH_CONVERT_TIMEOUT', '10800'))
-EVAL_TIMEOUT = int(os.environ.get('BENCH_EVAL_TIMEOUT', '14400'))
+def _read_timeout(name: str) -> int | None:
+    """Таймаут из env; None/отсутствие → ждать сколько нужно (без потолка)."""
+    raw = os.environ.get(name)
+    return int(raw) if raw else None
+
+
+CONVERT_TIMEOUT = _read_timeout('BENCH_CONVERT_TIMEOUT')
+EVAL_TIMEOUT = _read_timeout('BENCH_EVAL_TIMEOUT')
+VALIDATE_TIMEOUT = _read_timeout('BENCH_VALIDATE_TIMEOUT')
+BENCH_TIMEOUT = _read_timeout('BENCH_TIMEOUT')
+REPORT_TIMEOUT = _read_timeout('BENCH_REPORT_TIMEOUT')
 QUANTIZE = os.environ.get('BENCH_QUANTIZE', 'all')
 CLEANUP_AFTER = os.environ.get('BENCH_CLEANUP', '1') == '1'
 PERCEPT_CONTAINER = 'percept'
@@ -229,7 +238,7 @@ def _container_dataset_root(data_dir: Path) -> str:
 # ---------------------------------------------------------------------------
 
 def _run_container(compose_file: Path, service: str, args: list[str],
-                   timeout: int, tag: str,
+                   timeout: int | None, tag: str,
                    env: list[str] | None = None,
                    volumes: list[str] | None = None,
                    entrypoint: str = 'python') -> subprocess.CompletedProcess | None:
@@ -237,6 +246,8 @@ def _run_container(compose_file: Path, service: str, args: list[str],
 
     Возвращает CompletedProcess при успешном выходе (rc==0), None при
     таймауте или ненулевом коде. stdout/stderr логируются построчно.
+    При таймауте (timeout задан и истёк) процесс убивается, а накопленный
+    частичный stdout сохраняется в возвращаемом объекте и логируется.
     """
     cmd = ['docker', 'compose', '-f', str(compose_file), 'run', '--rm']
     for v in (volumes or []):
@@ -246,13 +257,30 @@ def _run_container(compose_file: Path, service: str, args: list[str],
     cmd += ['--entrypoint', entrypoint, service] + args
     log(f'ЗАПУСК: {" ".join(cmd[:-6])} ...')
     t0 = time.time()
-    try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-        log(f'[ТАЙМИНГ] {tag} завершён за {time.time() - t0:.0f}с')
-    except subprocess.TimeoutExpired:
-        log(f'[ОШИБКА] {tag} превысил таймаут {timeout}с')
-        return None
 
+    def _run() -> subprocess.CompletedProcess | None:
+        try:
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        except OSError as e:
+            log(f'[ОШИБКА] {tag} не удалось запустить: {e}')
+            return None
+        try:
+            out, err = proc.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            log(f'[ОШИБКА] {tag} превысил таймаут {timeout}с, принудительно останавливаю...')
+            proc.kill()
+            out, err = proc.communicate()
+            _dump_partial(out, err, tag)
+            return subprocess.CompletedProcess(
+                proc.args, -9, stdout=out, stderr=err)
+        return subprocess.CompletedProcess(
+            proc.args, proc.returncode, stdout=out, stderr=err)
+
+    result = _run()
+    log(f'[ТАЙМИНГ] {tag} завершён за {time.time() - t0:.0f}с')
+
+    if result is None:
+        return None
     if result.stdout:
         for line in result.stdout.strip().split('\n'):
             log(f'[{tag} stdout] {line}')
@@ -264,6 +292,17 @@ def _run_container(compose_file: Path, service: str, args: list[str],
         log(f'[ОШИБКА] {tag} завершился с кодом {result.returncode}')
         return None
     return result
+
+
+def _dump_partial(out: str, err: str, tag: str) -> None:
+    """Логировать фрагмент накопленного stdout/stderr убитого процесса."""
+    for stream_name, data in (('stdout', out), ('stderr', err)):
+        if not data:
+            continue
+        tail = data.strip().split('\n')[-50:]
+        log(f'[{tag} {stream_name} до таймаута]')
+        for line in tail:
+            log(f'[{tag} {stream_name}] {line}')
 
 
 def _last_json_line(stdout: str) -> dict | None:
@@ -303,7 +342,7 @@ def run_validate(model_name: str, task: str, temp_dir: Path, data_dir: Path, inp
         CONVERT_COMPOSE, 'convert',
         ['/app/benchmark/validate_bench.py', model_name, task, f'/app/cache/{model_name}',
          data_path, str(input_size)],
-        1800, 'validate',
+        VALIDATE_TIMEOUT, 'validate',
         volumes=[f'{BENCHMARK_DIR}:/app/benchmark', f'{PROJECT_DIR / "datasets"}:/app/datasets'],
     )
     return _last_json_line(result.stdout) if result else None
@@ -330,7 +369,7 @@ def run_fps(model_name: str, task: str, cache_dir: Path, data_dir: Path,
          '--measure', str(MEASURE_S),
          '--repeats', str(BENCH_REPEATS),
          '--quantize', quantize],
-        1200, 'bench',
+        BENCH_TIMEOUT, 'bench',
         env=env,
         volumes=[f'{BENCHMARK_DIR}:/app/benchmark',
                  f'{CACHE_DIR}:/app/cache',
@@ -615,12 +654,49 @@ def phase_is(phases: list[str], name: str) -> bool:
     return 'all' in phases or name in phases
 
 
+def run_report(report_dir: Path | None = None) -> None:
+    """Собрать отчёт с графиками (make_report.py в convert-контейнере).
+
+    report_dir — каталог для отчёта (`--report-dir`); по умолчанию
+    benchmark/results/report.
+    """
+    report_dir = (report_dir or (RESULTS_DIR / 'report')).resolve()
+    log(f'[ОТЧЁТ] Генерация отчёта с графиками (make_report.py) в {report_dir}...')
+    # Хостовый путь -> путь в контейнере (results монтируется в /app/benchmark/results)
+    try:
+        container_out = Path('/app/benchmark/results') / report_dir.relative_to(RESULTS_DIR.resolve())
+    except ValueError:
+        log(f'[ОТЧЁТ] ОШИБКА: --report-dir вне {RESULTS_DIR} не поддерживается (volumes внутри results)')
+        _fail('report', f'--report-dir вне {RESULTS_DIR}')
+        return
+    result = _run_container(
+        CONVERT_COMPOSE, 'convert',
+        ['/app/benchmark/make_report.py', '--out', str(container_out)],
+        REPORT_TIMEOUT, 'report',
+        volumes=[f'{RESULTS_DIR}:/app/benchmark/results'],
+    )
+    if result is None:
+        _fail('report', 'генерация отчёта не удалась')
+        return
+    summary = _last_json_line(result.stdout)
+    if not summary:
+        log('[ОТЧЁТ] не удалось распарсить JSON-ответ make_report.py')
+        return
+    log(f'[ОТЧЁТ] графиков построено: {summary.get("graphs")}')
+
+    report_md = report_dir / 'report.md'
+    if report_md.exists():
+        log(f'[ГОТОВО] отчёт: {report_md}')
+    else:
+        log(f'[ОТЧЁТ] отчёт не найден: {report_md}')
+
+
 def main() -> None:
     import argparse
     parser = argparse.ArgumentParser(description="Оркестратор YOLO бенчмарка")
-    parser.add_argument("--phase", nargs='+', default=['convert', 'validate'],
+    parser.add_argument("--phase", nargs='+', default=['convert', 'validate', 'bench', 'eval'],
                         choices=['convert', 'validate', 'bench', 'eval', 'all'],
-                        help="Фазы бенчмарка (можно перечислить несколько)")
+                        help="Фазы бенчмарка (по умолчанию — все: convert validate bench eval)")
     parser.add_argument("--quantize", choices=["onnx", "none", "int8", "int8-calib", "all"], default="all",
                         help="Какие варианты RKNN тестировать: onnx=CPU only, none=FP16, int8=INT8, int8-calib=INT8 с калибровкой, all=все")
     parser.add_argument("--model", default=None,
@@ -629,6 +705,10 @@ def main() -> None:
                         help="Только PILOT-модели (минимальные размеры)")
     parser.add_argument("--force", action="store_true",
                         help="Перезапускать eval/bench даже если результат уже есть в results.json")
+    parser.add_argument("--skip-report", action="store_true",
+                        help="Не генерировать отчёт с графиками в конце прогона")
+    parser.add_argument("--report-dir", default=None,
+                        help="Каталог для отчёта (по умолчанию benchmark/results/report)")
     cli_args, _ = parser.parse_known_args()
 
     global QUANTIZE
@@ -717,6 +797,14 @@ def main() -> None:
                             'status': 'ОЖИДАНИЕ',
                         })
                         save_results(existing)
+                    else:
+                        for j, r in enumerate(existing):
+                            if r['model'] == model.name and r.get('conversion_status') != 'OK':
+                                existing[j]['conversion_status'] = 'OK'
+                                existing[j].pop('conversion_error', None)
+                                log(f'[ИНФО] {model.name}: файлы convert на месте, исправлен conversion_status')
+                                save_results(existing)
+                                break
                 else:
                     conv_result = run_converter(model.name, model.task, model_cache_dir, model_data_dir)
                     if conv_result is None or conv_result.get('status') != 'OK':
@@ -971,6 +1059,7 @@ def main() -> None:
 
     recompute_status(existing, QUANTIZE)
     write_tsv(existing)
+    save_results(existing)
 
     log(f'\n{"="*60}')
     log(f'БЕНЧМАРК ЗАВЕРШЁН: {len(existing)} моделей')
@@ -986,6 +1075,11 @@ def main() -> None:
             log(f'[ИТОГ] {name}: НЕПОЛНО ({", ".join(missing)})')
         else:
             log(f'[ИТОГ] {name}: OK')
+
+    if not FAILURES and not incomplete and not cli_args.skip_report:
+        run_report(Path(cli_args.report_dir) if cli_args.report_dir else None)
+    elif not cli_args.skip_report:
+        log('[ОТЧЁТ] пропущен: есть сбои или неполные модели')
 
     if FAILURES:
         log(f'\nСбои в прогоне ({len(FAILURES)}):')

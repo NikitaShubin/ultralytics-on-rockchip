@@ -272,7 +272,25 @@ python3 setup_datasets.py --imagenet    # ImageNet val (~6.3 GB) — classify
 
 Оркестратор `benchmark/benchmark.py` запускается на хосте (Orange Pi 5 Pro) и сам поднимает
 контейнеры (`convert` для convert/validate/eval, `percept` для bench). Четыре независимые
-фазы, можно запускать по отдельности:
+фазы, можно запускать по отдельности.
+
+Единая точка входа — корневой `Makefile`; главная команда (полный прогон всех моделей из
+`models.py` FULL + автогенерация отчёта с графиками) — без параметров:
+
+```bash
+make bench                # полный прогон: convert → validate → bench → eval + отчёт
+
+# Фон (по правилам проекта — долгие процессы в tmux/nohup):
+tmux new-session -d -s bench 'make bench > /tmp/bench.log 2>&1'
+
+make bench-pilot          # только PILOT-модели (по одной nano на линейку)
+make bench-model M=yolo26n  # одна модель
+make report               # пересобрать отчёт из готового results.json (без перегона)
+```
+
+Флаги `benchmark.py` — это ограничения полного прогона: `--model`, `--phase`, `--quantize`,
+`--pilot`, `--force`, `--skip-report`, `--report-dir` (по умолчанию `benchmark/results/report`).
+Четыре фазы по отдельности:
 
 ```bash
 cd benchmark
@@ -297,17 +315,11 @@ python benchmark.py --phase eval
 # Конвертация + валидация
 python benchmark.py --phase convert validate
 
-# Всё сразу (convert → validate → bench → eval)
-python benchmark.py --phase all
-
 # Только FPS, только INT8
 python benchmark.py --phase bench --quantize int8
 
 # Одна модель
-python benchmark.py --phase all --model yolo26n
-
-# Только PILOT-модели (по одной nano на линейку)
-python benchmark.py --phase all --pilot
+python benchmark.py --model yolo26n
 ```
 
 ### Квантизация
@@ -329,9 +341,12 @@ python benchmark.py --phase all --pilot
 ### Результаты
 
 - `benchmark/results/results.json` — полные результаты по каждой модели (eval — dict по
-  quantize-вариантам: `['eval']['onnx']`, `['eval']['fp16']`, `['eval']['int8']`, `['eval']['int8-calib']`)
+  quantize-вариантам: `['eval']['onnx']`, `['eval']['fp16']`, `['eval']['int8']`, `['eval']['int8-calib']`);
+  это журнал, по которому работает resume (годится как есть на любой Orange Pi 5 Pro — железо фиксировано)
 - `benchmark/results/summary.tsv` — TSV-сводка для просмотра (метрики эталона берутся из onnx-варианта)
-- `benchmark/results/benchmark.log` — лог со всеми stdout/stderr
+- `benchmark/results/report/report.md` — отчёт с графиками (11 PNG): точность vs время на кадр
+  по задачам/поколениям; генерируется автоматически в конце прогона (`make report` — вручную)
+- `benchmark/results/benchmark.log` — лог со всеми stdout/stderr (не коммитится)
 
 ### Точность (eval.py)
 
@@ -445,15 +460,16 @@ bench_overclock.sh           # Бенчмарк с разгоном CPU/NPU/GPU 
 overclock/
 └── rk3588-opi5pro-oc.dts    # Device tree overlay для разгона Orange Pi 5 Pro
 benchmark/
-├── benchmark.py             # Оркестратор: --phase convert|validate|bench|eval|all
+├── benchmark.py             # Оркестратор: --phase convert|validate|bench|eval; дефолт — полный прогон
 ├── convert_bench.py         # Фаза 1: экспорт + компиляция (4 RKNN/ONNX + postprocess на модель)
 ├── validate_bench.py        # Фаза 2: ONNX vs RKNN FP16+INT8 валидация (NPU/симулятор)
 ├── fps_bench.py             # Фаза 3: FPS + per-core CPU/NPU нагрузка
 ├── eval.py                  # Фаза 4: точность (все quantize-варианты, все 6 задач)
+├── make_report.py           # Генератор отчёта с графиками (read reports from results.json)
 ├── models.py                # Списки моделей (FULL: 111, PILOT: 21)
 ├── run_3way_eval.py         # Interleaved 3-way проверка: ultra-NMS vs std vs RK-opt постпроцесс
-├── bench.sh                 # Обёртка для benchmark.py
-└── results/                 # Результаты (results.json, summary.tsv, benchmark.log)
+└── results/                 # Журнал + отчёт (коммитятся): results.json, summary.tsv, report/
+Makefile                     # Единая точка входа: make bench / bench-pilot / bench-model / report
 convert/
 ├── convert.py               # Конвертер YOLO → ONNX → RKNN (с кешем)
 ├── templates/               # Шаблоны постпроцесса (7 задач: det/seg/cls/pose/obb/sem/detr)
@@ -597,7 +613,7 @@ watch -n1 'cat /sys/class/devfreq/fdab0000.npu/load'
 - Лог-файл в режиме `'a'` (сохраняется история)
 - Статусы: ПРОЙДЕНО / ПРОВАЛ
 - Сервис в docker-compose: `percept` (не `webcam`)
-- `benchmark/bench.sh` передаёт `"$@"` в benchmark.py, останавливает percept перед запуском
+- `benchmark.py` без параметров = полный прогон (`make bench`), отчёт с графиками — автоматом в `benchmark/results/report/`
 - TSV-суммаризация в `benchmark/results/summary.tsv`
 - 4 варианта квантизации: onnx/none(fp16)/int8/int8-calib
 - Фаза eval: точность через eval.py (top1/top5 для cls, mAP для det/seg/pose/obb, mIoU для sem), все 4 варианта, в convert-контейнере
@@ -684,5 +700,5 @@ sudo reboot
 ```
 
 ### Удалённые файлы
-- `run.sh` (legacy) — удалён
+- `run.sh`, `run_nano.sh`, `benchmark/bench.sh` — заменены корневым `Makefile` (`make bench` и др.)
 - `model/yolo11n_postprocess.py` — root-owned, требует sudo для правки

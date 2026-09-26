@@ -5,7 +5,11 @@
 
 ### Данные — не в git
 Все тестовые данные (датасеты, артефакты бенчмарков, логи) скачиваются скриптами on-demand.
-Запрещено коммитить: `benchmark/data/`, `benchmark/results/`, `convert/datasets/`, `cache/`, логи, `.tsv`-результаты.
+Запрещено коммитить: `benchmark/data/`, `convert/datasets/`, `cache/`, логи (`*.log`, `logs/`),
+артефакты eval (`*.pkl`).
+**Исключение (коммитится)**: `benchmark/results/results.json` (журнал/resume), `benchmark/results/summary.tsv`
+(сводка) и `benchmark/results/report/` (отчёт с графиками) — это аддитивные результаты на фиксированном
+железе (Orange Pi 5 Pro), публикуются и позволяют продолжать бенчмарк на любой копии платформы.
 Скрипты автозагрузки: `setup_datasets.py`, `benchmark/setup_datasets.py`.
 YOLO-labels (detect/seg/pose) для эталонного ultralytics `.val()` генерируются из COCO JSON
 скриптом `convert/setup_coco_labels.py` **внутри convert-контейнера** (numpy+cv2+ultralytics;
@@ -33,6 +37,14 @@ YOLO-labels (detect/seg/pose) для эталонного ultralytics `.val()` �
 обязательно использовать **tmux**: `tmux new-session -d -s eval 'docker compose ... > /tmp/xxx.log 2>&1'`,
 потом `tail -f /tmp/xxx.log` / `ps aux | grep [e]val.py`. Сессию снять: `tmux kill-session -t eval`.
 
+### Точка входа
+Единая точка входа — корневой `Makefile`: `make bench` (полный прогон всех моделей + отчёт),
+`make bench-pilot`, `make bench-model M=yolo26n`, `make report` (пересборка отчёта из результатов).
+`run.sh`/`run_nano.sh`/`benchmark/bench.sh` УДАЛЕНЫ. `benchmark.py` без параметров = полный прогон
+(convert+validate+bench+eval) с автогенерацией отчёта; флаги (`--phase/--model/--quantize/--pilot/
+--force/--report-dir/--skip-report`) — только ограничения. `--report-dir` обязан быть ВНУТРИ
+`benchmark/results/` (в контейнер монтируется только results, run_report сам транслирует путь).
+
 ## Work State (автообновляемое)
 
 ### Objective
@@ -57,6 +69,14 @@ RKNN-деплой отложен по решению пользователя. �
   (`docker compose run`): `onnx → --backend cpu`, `fp16/int8/int8-calib → --backend npu --rknn-suffix _fp16/_int8/_int8-calib`.
   `results.json['eval']` — dict по вариантам (onnx/fp16/int8/int8-calib); TSV берёт эталон из onnx-варианта.
   `eval_bench.py` УДАЛЁН.
+- **Таймауты eval/convert/validate/bench = НЕТ (2026-08-28)**: `CONVERT_TIMEOUT`/`EVAL_TIMEOUT`/`VALIDATE_TIMEOUT`/
+  `BENCH_TIMEOUT` в `benchmark.py` — `_read_timeout(env)` → `None` (без потолка) по умолчанию; env-переопределение
+  (`BENCH_CONVERT_TIMEOUT`/`BENCH_EVAL_TIMEOUT`/`BENCH_VALIDATE_TIMEOUT`/`BENCH_TIMEOUT`) остаётся. Причина:
+  жёсткий 4ч-потолок onnx-eval (CPU) убивал легитимную работу тяжёлых моделей (yolov3u → `{}` → resume по кругу).
+  `_run_container` переписан с `subprocess.run` на `Popen+communicate(timeout=...)`: при истечении процесс прибивается
+  (`SIGKILL`), а накопленный частичный stdout/stderr логируется хвостом (`_dump_partial`, 50 строк) для дебага.
+  Системные таймауты НЕ тронуты: ensure_dataset 7200с (:117), docker inspect/stop/kill/start 10-30с (:149-192),
+  cleanup 30с (:434), convert.py датасет 7200с (:326) и DOWNLOAD_TIMEOUT (:505).
 - **eval.py CLI**: добавлен `--rknn-suffix` (прокинут в Pipeline → ModelBackend).
 - **Сопоставление задач**: models.py (`detect/seg/cls/pose/obb/sem`) → eval.py (`detect/segment/classify/pose/obb/semantic`)
   через `TASK_TO_EVAL`; eval.py ожидает КОРЕНЬ датасета (не images/val2017) → новый `_container_dataset_root()`.

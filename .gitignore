@@ -37,9 +37,13 @@ benchmark/temp_models/
 # Benchmark data (auto-downloaded by setup_datasets.py)
 benchmark/data/
 
-# Benchmark results and logs
-benchmark/results/
+# Benchmark results: журнал (results.json), сводка (summary.tsv) и отчёт (report/) —
+# аддитивные данные, КОММИТЯТСЯ. Исключаются только временные файлы (логи).
+benchmark/results/*.log
+benchmark/results/*.pkl
 nano.log
+run.log
+logs/
 
 # Active model directory (deployed on device)
 model/
@@ -52,6 +56,7 @@ fps_before.txt
 fps_after.txt
 oc_results.csv
 results/
+!benchmark/results/
 
 # Ultralytics val artifacts (root-level runs/ from col1)
 runs/
