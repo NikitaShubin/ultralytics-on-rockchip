@@ -1,3 +1,7 @@
+# Имя проекта фиксировано: образ сервиса = percept-percept:latest (от него
+# наследуется convert/Dockerfile), независимо от имени каталога репозитория.
+name: percept
+
 services:
   percept:
     container_name: percept

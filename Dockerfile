@@ -1,5 +1,10 @@
 FROM python:3.11-slim
 
+# pypi.org (Fastly SNI) в этой сети блокируется — pip ходит через зеркало.
+# Переопределяется build-arg'ом, если зеркало недоступно.
+ARG PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/
+ENV PIP_INDEX_URL=${PIP_INDEX_URL} UV_INDEX_URL=${PIP_INDEX_URL}
+
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libv4l-0 ffmpeg && rm -rf /var/lib/apt/lists/*
 

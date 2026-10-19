@@ -3,6 +3,10 @@
 # тестовые зависимости (ultralytics, pycocotools, onnxruntime, rknn-toolkit2).
 FROM percept-percept:latest
 
+# pypi.org (Fastly SNI) в этой сети блокируется — pip ходит через зеркало.
+ARG PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/
+ENV PIP_INDEX_URL=${PIP_INDEX_URL} UV_INDEX_URL=${PIP_INDEX_URL}
+
 RUN apt-get update && apt-get install -y --no-install-recommends \
     wget curl unzip libarchive-tools cmake build-essential \
     libgl1 libglib2.0-0 && \
