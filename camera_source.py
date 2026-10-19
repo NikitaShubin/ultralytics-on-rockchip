@@ -89,7 +89,6 @@ class USBCamera(CameraSource):
             cap = cv2.VideoCapture(dev)
             cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
             cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
-            cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
             cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
             ret, _ = cap.read()
             if ret:
