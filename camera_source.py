@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import threading
 import time
 from abc import ABC, abstractmethod
@@ -14,6 +15,14 @@ import numpy as np
 log = logging.getLogger(__name__)
 
 _NO_CAM_CACHE: dict[int, bytes] = {}
+
+
+def _device_inode(dev: str) -> int | None:
+    """inode узла устройства; меняется при USB-переподключении камеры."""
+    try:
+        return os.stat(dev).st_ino
+    except OSError:
+        return None
 
 
 def _make_no_cam_placeholder(w: int = 640, h: int = 480) -> bytes:
@@ -71,6 +80,9 @@ class USBCamera(CameraSource):
         self._frame: np.ndarray | None = None
         self._frame_id: int = 0
         self._first_frame = threading.Event()
+        self._dev_inode: int | None = None
+        self._last_reopen: float = 0.0
+        self._read_errors = 0
 
     def open(self) -> bool:
         """Поиск и открытие доступной USB камеры."""
@@ -93,11 +105,45 @@ class USBCamera(CameraSource):
             ret, _ = cap.read()
             if ret:
                 self._cap = cap
+                self._dev_inode = _device_inode(dev)
                 return True
             cap.release()
         except OSError as e:
             log.debug('не удалось открыть %s: %s', dev, e)
         return False
+
+    def _reopen_if_replugged(self) -> None:
+        """Переоткрыть камеру, если она отвалилась (USB-переподключение меняет inode).
+
+        После переподключения старый файловый дескриптор даёт ENODEV, и кадры
+        застывают, пока контейнер не перезапустить.
+        """
+        if not self._device:
+            return
+        now = time.monotonic()
+        if now - self._last_reopen < 2.0:
+            return
+        self._last_reopen = now
+        inode = _device_inode(self._device)
+        if inode is None or inode == self._dev_inode:
+            return  # устройство не переподключалось — нечего переоткрывать
+        log.warning(
+            'камера %s переподключена (inode %s → %s), переоткрываем',
+            self._device, self._dev_inode, inode,
+        )
+        cap = cv2.VideoCapture(self._device)
+        if not cap.isOpened():
+            cap.release()
+            return
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        with self._lock:
+            if self._cap is not None:
+                self._cap.release()
+            self._cap = cap
+        self._dev_inode = inode
+        self._read_errors = 0
 
     def _start_thread(self) -> None:
         """Запуск фонового потока захвата."""
@@ -114,11 +160,18 @@ class USBCamera(CameraSource):
                 continue
             ret, frame = self._cap.read()
             if ret:
+                self._read_errors = 0
                 with self._lock:
                     self._frame = frame
                     self._frame_id += 1
                 self._first_frame.set()
                 continue
+            # Чтение не удалось: камера могла отвалиться (USB-переподключение)
+            self._read_errors += 1
+            if self._read_errors in (10, 100):
+                log.warning('кадры не читаются (%s), ошибок: %d',
+                            self._device, self._read_errors)
+            self._reopen_if_replugged()
             if self._device and not Path(self._device).exists():
                 with self._lock:
                     self._cap = None
