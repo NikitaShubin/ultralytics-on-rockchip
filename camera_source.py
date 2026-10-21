@@ -168,7 +168,15 @@ class USBCamera(CameraSource):
             time.sleep(1.0)
             with self._lock:
                 frame_id = self._frame_id
+                cap_open = self._cap is not None
             now = time.monotonic()
+            if not cap_open:
+                # Камера была отключена: если устройство вернулось — открыть заново
+                if self._device and Path(self._device).exists() and now - self._last_reopen > 5.0:
+                    self._last_reopen = now
+                    log.info('камера %s вернулась, открываем заново', self._device)
+                    self._reopen_camera()
+                continue
             if frame_id != last_seen:
                 last_seen = frame_id
                 stuck_since = now
@@ -238,9 +246,16 @@ class USBCamera(CameraSource):
                             self._device, self._read_errors)
             self._reopen_if_replugged()
             if self._device and not Path(self._device).exists():
+                # Устройство исчезло (USB-отвал): отдаём пустой кадр, чтобы
+                # веб показал заглушку «Камера не подключена», и ждём возврата.
                 with self._lock:
+                    if self._cap is not None:
+                        self._cap.release()
                     self._cap = None
-                return
+                    self._frame = None
+                log.warning('камера %s отключена, ждём её возврата', self._device)
+                time.sleep(1.0)
+                continue
             time.sleep(0.05)
             if self._cap is not None:
                 ret, frame = self._cap.read()
@@ -277,7 +292,9 @@ class USBCamera(CameraSource):
 
     @property
     def name(self) -> str:
-        return f'usb:{self._device}' if self._device else 'usb:disconnected'
+        if not self._device or not Path(self._device).exists():
+            return 'usb:disconnected'
+        return f'usb:{self._device}'
 
 
 class FileSource(CameraSource):
