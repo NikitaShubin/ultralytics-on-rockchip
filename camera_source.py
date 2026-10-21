@@ -83,6 +83,7 @@ class USBCamera(CameraSource):
         self._dev_inode: int | None = None
         self._last_reopen: float = 0.0
         self._read_errors = 0
+        self._watchdog: threading.Thread | None = None
 
     def open(self) -> bool:
         """Поиск и открытие доступной USB камеры."""
@@ -146,22 +147,86 @@ class USBCamera(CameraSource):
         self._read_errors = 0
 
     def _start_thread(self) -> None:
-        """Запуск фонового потока захвата."""
+        """Запуск фонового потока захвата и сторожа."""
         self._running = True
         self._first_frame.clear()
         self._thread = threading.Thread(target=self._capture_loop, daemon=True, name='cam-capture')
         self._thread.start()
+        self._watchdog = threading.Thread(target=self._watchdog_loop, daemon=True, name='cam-watchdog')
+        self._watchdog.start()
+
+    def _watchdog_loop(self) -> None:
+        """Сторож: если кадры перестали идти — переоткрыть камеру.
+
+        После ребута или USB-переподключения V4L2 может вернуть ENODEV: буферы
+        не выделяются, и read() залипает навсегда (кадр застывает, хотя камера
+        давно готова). Обнаруживаем это по счётчику кадров и переоткрываем.
+        """
+        last_seen = -1
+        stuck_since = time.monotonic()
+        while self._running:
+            time.sleep(1.0)
+            with self._lock:
+                frame_id = self._frame_id
+            now = time.monotonic()
+            if frame_id != last_seen:
+                last_seen = frame_id
+                stuck_since = now
+                continue
+            if now - stuck_since < 5.0:
+                continue
+            if now - self._last_reopen < 10.0:
+                continue
+            stuck_since = now
+            self._last_reopen = now
+            log.warning('захват камеры завис (кадры не обновляются 5 с) — переоткрываем %s',
+                        self._device)
+            self._reopen_camera()
+
+    def _reopen_camera(self) -> None:
+        """Переоткрыть устройство камеры и перезапустить поток захвата."""
+        dev = self._device
+        if not dev:
+            return
+        with self._lock:
+            old = self._cap
+            self._cap = None
+        if old is not None:
+            try:
+                old.release()
+            except Exception:  # noqa: BLE001 — ошибка закрытия не должна ронять поток
+                pass
+        try:
+            cap = cv2.VideoCapture(dev)
+        except Exception:  # noqa: BLE001
+            return
+        if not cap.isOpened():
+            cap.release()
+            return
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        with self._lock:
+            self._cap = cap
+        self._dev_inode = _device_inode(dev)
+        self._read_errors = 0
+        self._thread = threading.Thread(target=self._capture_loop, daemon=True, name='cam-capture')
+        self._thread.start()
+        log.info('камера %s переоткрыта', dev)
 
     def _capture_loop(self) -> None:
         """Фоновый поток: непрерывно читает кадры с камеры."""
         while self._running:
-            if self._cap is None:
+            cap = self._cap
+            if cap is None:
                 time.sleep(0.1)
                 continue
-            ret, frame = self._cap.read()
+            ret, frame = cap.read()
             if ret:
                 self._read_errors = 0
                 with self._lock:
+                    if self._cap is not cap:
+                        return  # устройство переоткрыто — этот поток больше не нужен
                     self._frame = frame
                     self._frame_id += 1
                 self._first_frame.set()
@@ -199,6 +264,9 @@ class USBCamera(CameraSource):
     def close(self) -> None:
         """Остановить фоновый поток и закрыть камеру."""
         self._running = False
+        if self._watchdog is not None:
+            self._watchdog.join(timeout=1.0)
+            self._watchdog = None
         if self._thread is not None:
             self._thread.join(timeout=1.0)
             self._thread = None
