@@ -62,10 +62,18 @@ def objects_to_api(
     result: list[dict] = []
     for obj in objects:
         entry = dict(obj)
+        # Маска приходит либо под 'mask' (обрезанная по bbox), либо под
+        # 'segmentation' (full-res маска уже в координатах кадра).
         mask = entry.pop('mask', None)
+        offset_bbox = entry.get('bbox')
+        if mask is None:
+            mask = entry.pop('segmentation', None)
+            offset_bbox = None
+        # Маски в прототипном разрешении в API не нужны
+        entry.pop('masks_160', None)
         if mask is not None:
             if mask_format == 'contour':
-                contour = _mask_to_contour(mask, entry.get('bbox'))
+                contour = _mask_to_contour(mask, offset_bbox)
                 if contour:
                     entry['polygon'] = contour
             elif mask_format == 'base64':
@@ -79,8 +87,25 @@ def objects_to_api(
         if entry.get('angle') is not None:
             cx, cy, w, h = entry['bbox'][:4]
             entry['bbox'] = [cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2]
-        result.append(entry)
+        result.append(_json_safe(entry))
     return result
+
+
+def _json_safe(value):
+    """Привести numpy-типы к JSON-совместимым (ndarray → list, np scalar → число)."""
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, np.bool_):
+        return bool(value)
+    if isinstance(value, np.integer):
+        return int(value)
+    if isinstance(value, np.floating):
+        return float(value)
+    if isinstance(value, dict):
+        return {k: _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(v) for v in value]
+    return value
 
 
 def _mask_to_contour(
