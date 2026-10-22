@@ -235,18 +235,26 @@ def postprocess(outputs, scale, pad, orig_shape):
             })
         return results
 
-    # Full-res masks (upsample masks_160 to orig, nearest, cropped by bbox)
+    # Full-res masks: masks_160 (160x160, letterboxed space) → input_size →
+    # crop by padding → scale to original frame, so the mask matches the bbox
+    # (which is already in original coordinates).
     results = []
+    inp = int(INPUT_SIZE)
+    # Размер изображения внутри letterbox-пространства inp x inp
+    crop_w = min(inp, int(round(orig_w * gain)))
+    crop_h = min(inp, int(round(orig_h * gain)))
     for i in range(len(x)):
         x1, y1, x2, y2 = x[i, :4].astype(int)
         c = int(x[i, 5])
         mask_crop = np.zeros((orig_h, orig_w), dtype=np.uint8)
-        bx1, by1 = max(0, x1), max(0, y1)
-        bx2, by2 = min(orig_w, x2), min(orig_h, y2)
-        if bx2 > bx1 and by2 > by1:
-            m = cv2.resize(masks_160[i].astype(np.uint8), (orig_w, orig_h),
+        if x2 > x1 and y2 > y1:
+            m = cv2.resize(masks_160[i].astype(np.uint8), (inp, inp),
                            interpolation=cv2.INTER_NEAREST)
-            mask_crop[by1:by2, bx1:bx2] = m[by1:by2, bx1:bx2] * 255
+            # убрать padding letterbox: изображение занимает crop_w x crop_h
+            m = m[pad_top:pad_top + crop_h, pad_left:pad_left + crop_w]
+            if m.size > 0:
+                mask_crop = cv2.resize(m, (orig_w, orig_h),
+                                       interpolation=cv2.INTER_NEAREST) * 255
         results.append({
             "bbox": [int(x1), int(y1), int(x2), int(y2)],
             "score": float(x[i, 4]),

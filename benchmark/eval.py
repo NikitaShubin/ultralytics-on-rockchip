@@ -1045,12 +1045,16 @@ def _seg_finish(pp, x, bboxes_letter, proto, scale, pad, orig_shape):
         if not pp.EVAL_PRECISE:
             x1, y1, x2, y2 = (int(x1), int(y1), int(x2), int(y2))
             mask_crop = np.zeros((orig_h, orig_w), dtype=np.uint8)
-            bx1, by1 = max(0, x1), max(0, y1)
-            bx2, by2 = min(orig_w, x2), min(orig_h, y2)
-            if bx2 > bx1 and by2 > by1:
-                m = cv2.resize(masks_160[i].astype(np.uint8), (orig_w, orig_h),
+            if x2 > x1 and y2 > y1:
+                inp = int(getattr(pp, 'INPUT_SIZE', 640))
+                m = cv2.resize(masks_160[i].astype(np.uint8), (inp, inp),
                                interpolation=cv2.INTER_NEAREST)
-                mask_crop[by1:by2, bx1:bx2] = m[by1:by2, bx1:bx2] * 255
+                crop_w = min(inp, int(round(orig_w * gain)))
+                crop_h = min(inp, int(round(orig_h * gain)))
+                m = m[pad_top:pad_top + crop_h, pad_left:pad_left + crop_w]
+                if m.size > 0:
+                    mask_crop = cv2.resize(m, (orig_w, orig_h),
+                                           interpolation=cv2.INTER_NEAREST) * 255
             seg = mask_crop
         else:
             seg = masks_160[i]

@@ -71,6 +71,8 @@ def objects_to_api(
             offset_bbox = None
         # Маски в прототипном разрешении в API не нужны
         entry.pop('masks_160', None)
+        # Карта классов (semantic) — массив пикселей, в JSON не годится
+        entry.pop('class_map', None)
         if mask is not None:
             if mask_format == 'contour':
                 contour = _mask_to_contour(mask, offset_bbox)
@@ -87,6 +89,9 @@ def objects_to_api(
         if entry.get('angle') is not None:
             cx, cy, w, h = entry['bbox'][:4]
             entry['bbox'] = [cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2]
+        # semantic: останется пустой dict после удаления class_map — не отдаётся
+        if not any(v for v in entry.values() if not isinstance(v, (list, dict)) or v):
+            continue
         result.append(_json_safe(entry))
     return result
 
@@ -111,14 +116,24 @@ def _json_safe(value):
 def _mask_to_contour(
     mask: np.ndarray,
     bbox: list[int] | None = None,
+    max_points: int = 200,
 ) -> list[float] | None:
-    """Извлечь наибольший внешний контур из бинарной маски как плоский [x1,y1,x2,y2,...]."""
+    """Извлечь наибольший внешний контур из бинарной маски как плоский [x1,y1,x2,y2,...].
+
+    bbox — смещение контура (только для маски, обрезанной по bbox);
+    для полноразмерной маски координаты уже в системе кадра.
+    """
     if mask.size <= 1:
         return None
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if not contours:
         return None
     c = max(contours, key=cv2.contourArea)
+    if len(c) > max_points:
+        # Аппроксимация: контур не должен раздувать JSON (бывает по тысяче точек)
+        peri = cv2.arcLength(c, True)
+        eps = peri / max_points
+        c = cv2.approxPolyDP(c, eps, True)
     ox, oy = (bbox[:2] if bbox else (0, 0))
     flat: list[float] = []
     for pt in c[:, 0, :]:

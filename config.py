@@ -50,8 +50,13 @@ class Config:
         self.web_mode: WebMode = WebMode(int(os.environ.get('WEB_MODE', '0')))
         self.cam_mode: CameraMode = CameraMode(os.environ.get('CAM_MODE', 'auto'))
         self.test_mode: bool = os.environ.get('TEST_MODE', '0') == '1'
-        self.cam_width: int = int(os.environ.get('CAM_W', '640'))
-        self.cam_height: int = int(os.environ.get('CAM_H', '480'))
+        self.cam_width: int = int(os.environ.get('CAM_W', '0'))
+        self.cam_height: int = int(os.environ.get('CAM_H', '0'))
+        # Разрешение захвата по умолчанию:
+        #   'model'  — рабочее разрешение модели (input_size: 640 у detect, 1024 у sem/obb)
+        #   'source' — максимальное разрешение, которое отдаёт камера
+        # Явные CAM_W/CAM_H имеют приоритет над обоими режимами.
+        self.cam_resolution: str = os.environ.get('CAM_RESOLUTION', 'model')
         self.cam_source: str = os.environ.get('CAM_SOURCE', '')
         self.cam_fps: int = int(os.environ.get('CAM_FPS', '30'))
         self.model_dir: str = os.environ.get('MODEL_DIR', '/app/model')
@@ -95,6 +100,13 @@ class Config:
         )
         parser.add_argument('--cam-width', type=int, default=cfg.cam_width)
         parser.add_argument('--cam-height', type=int, default=cfg.cam_height)
+        parser.add_argument(
+            '--cam-resolution',
+            choices=['model', 'source'],
+            default=cfg.cam_resolution,
+            help='разрешение захвата: model — рабочее разрешение модели, '
+                 'source — максимальное разрешение камеры',
+        )
         parser.add_argument('--cam-source', default=cfg.cam_source)
         parser.add_argument('--cam-fps', type=int, default=cfg.cam_fps)
         parser.add_argument('--model-dir', default=cfg.model_dir)
@@ -115,6 +127,7 @@ class Config:
         cfg.cam_mode = CameraMode(args.cam_mode)
         cfg.cam_width = args.cam_width
         cfg.cam_height = args.cam_height
+        cfg.cam_resolution = args.cam_resolution
         cfg.cam_source = args.cam_source
         cfg.cam_fps = args.cam_fps
         cfg.model_dir = args.model_dir

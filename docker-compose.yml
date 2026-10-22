@@ -36,8 +36,11 @@ services:
       - MODEL=${MODEL:-}
       - WEB_MODE=${WEB_MODE:-2}
       - CAM_MODE=${CAM_MODE:-auto}
-      - CAM_W=${CAM_W:-640}
-      - CAM_H=${CAM_H:-480}
+      - CAM_W=${CAM_W:-0}
+      - CAM_H=${CAM_H:-0}
+      # Разрешение захвата: model — рабочее разрешение модели (input_size),
+      # source — максимальное разрешение камеры; 0 = авто (не задано явно)
+      - CAM_RESOLUTION=${CAM_RESOLUTION:-model}
       - TEST_MODE=${TEST_MODE:-1}
       - JPEG_QUALITY=${JPEG_QUALITY:-85}
       - LOG_LEVEL=${LOG_LEVEL:-INFO}

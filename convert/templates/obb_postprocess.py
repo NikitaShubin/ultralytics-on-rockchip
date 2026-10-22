@@ -69,6 +69,59 @@ def process_head(box_dist, cls_scores, angle_raw, stride, grid_h, grid_w):
     return np.column_stack([cx, cy, bw, bh]), ang_f, scores
 
 
+def _covariance_matrix_np(boxes, floor=0.01):
+    """(N,5) xywhr → (a, b, c): порт ultralytics _get_covariance_matrix."""
+    w2 = boxes[:, 2] ** 2 / 12 + floor
+    h2 = boxes[:, 3] ** 2 / 12 + floor
+    c = boxes[:, 4]
+    cos, sin = np.cos(c), np.sin(c)
+    a = w2 * cos ** 2 + h2 * sin ** 2
+    b = w2 * sin ** 2 + h2 * cos ** 2
+    cc = (w2 - h2) * cos * sin
+    return a, b, cc
+
+
+def batch_probiou_np(obb1, obb2, eps=1e-7):
+    """Вероятностный IoU повернутых боксов (N,5)x(M,5) → (N,M).
+
+    Порт ultralytics.utils.metrics.batch_probiou на numpy: прод-образ
+    percept не содержит ни torch, ни ultralytics (это осознанное решение —
+    рантайм зависит только от rknnlite + numpy).
+    """
+    obb1 = np.asarray(obb1, dtype=np.float64)
+    obb2 = np.asarray(obb2, dtype=np.float64)
+    x1 = obb1[:, 0][:, None]
+    y1 = obb1[:, 1][:, None]
+    x2 = obb2[:, 0][None, :]
+    y2 = obb2[:, 1][None, :]
+    a1, b1, c1 = (v[:, None] for v in _covariance_matrix_np(obb1))
+    a2, b2, c2 = (v[None, :] for v in _covariance_matrix_np(obb2))
+    den = (a1 + a2) * (b1 + b2) - (c1 + c2) ** 2 + eps
+    t1 = (((a1 + a2) * (y1 - y2) ** 2 + (b1 + b2) * (x1 - x2) ** 2) / den) * 0.25
+    t2 = (((c1 + c2) * (x2 - x1) * (y1 - y2)) / den) * 0.5
+    det1 = np.clip(a1 * b1 - c1 ** 2, 0, None)
+    det2 = np.clip(a2 * b2 - c2 ** 2, 0, None)
+    num = (a1 + a2) * (b1 + b2) - (c1 + c2) ** 2
+    t3 = np.log(num / (4 * np.sqrt(det1 * det2) + eps) + eps) * 0.5
+    bd = np.clip(t1 + t2 + t3, eps, 100.0)
+    hd = np.sqrt(1.0 - np.exp(-bd) + eps)
+    return 1 - hd
+
+
+def _probiou(a, b):
+    """Вероятностный IoU: в convert-контейнере есть ultralytics → эталон
+    (torch); в прод-образе нет — numpy-порт. Разница пар < 3e-4 (float64
+    vs float32), порядок NMS сохраняется."""
+    try:
+        from ultralytics.utils.metrics import batch_probiou
+        import torch
+        return batch_probiou(
+            torch.from_numpy(np.ascontiguousarray(a))
+        ).numpy()
+    except ImportError:
+        return batch_probiou_np(a, b)
+
+
 def _rotated_nms(boxes_xywhr, scores, iou_thresh, max_det, classes=None, block=4096):
     """Блочный greedy NMS для obb — байт-эквивалент полной batch_probiou
     (fast_nms: triu + sum(0)<=0), память O(block^2) вместо O(N^2).
@@ -80,8 +133,6 @@ def _rotated_nms(boxes_xywhr, scores, iou_thresh, max_det, classes=None, block=4
 
     Возвращает индексы выбранных боксов в исходной нумерации boxes_xywhr.
     """
-    from ultralytics.utils.metrics import batch_probiou
-    import torch
     n = scores.shape[0]
     if n == 0:
         return np.empty(0, dtype=np.int64)
@@ -96,7 +147,7 @@ def _rotated_nms(boxes_xywhr, scores, iou_thresh, max_det, classes=None, block=4
             continue
         b = np.ascontiguousarray(boxes_xywhr[g], dtype=np.float32)
         sg = scores[g]
-        sorted_idx = torch.argsort(torch.from_numpy(sg), descending=True).numpy()
+        sorted_idx = np.argsort(-sg, kind='stable')
         b = b[sorted_idx]
         nb = (ng + block - 1) // block
         max_iou = np.zeros(ng, dtype=np.float32)
@@ -105,9 +156,9 @@ def _rotated_nms(boxes_xywhr, scores, iou_thresh, max_det, classes=None, block=4
             bj = b[j0:j1]
             for ib in range(jb):
                 i0, i1 = ib * block, min(ng, (ib + 1) * block)
-                iou = batch_probiou(b[i0:i1], bj).numpy()
+                iou = _probiou(b[i0:i1], bj)
                 max_iou[j0:j1] = np.maximum(max_iou[j0:j1], iou.max(axis=0))
-            iou_jj = batch_probiou(bj, bj).numpy()
+            iou_jj = _probiou(bj, bj)
             if j1 - j0 > 1:
                 max_iou[j0:j1] = np.maximum(max_iou[j0:j1],
                                             np.triu(iou_jj, k=1).max(axis=0))
@@ -180,9 +231,7 @@ def postprocess(outputs, scale, pad, orig_shape):
     # rotated NMS — блочный greedy (эквивалент ultralytics fast_nms с полной
     # batch_probiou-матрицей), память O(BLOCK^2) вместо O(N^2) → нет OOM на
     # conf=0.001 (fp16/int8 дают ~30000 кандидатов = 3.6GB полной матрицы).
-    from ultralytics.utils.metrics import batch_probiou
-    import torch
-
+    # Реализация на numpy: в прод-образе нет torch/ultralytics.
     c = x[:, 5:6] * MAX_WH
     boxes_xywhr = np.column_stack([
         x[:, :2] + c,  # cx+class_offset, cy+class_offset

@@ -258,15 +258,22 @@ def visualize(frame, objects):
 
         kpts = obj.get("keypoints", [])
         if kpts:
-            kpts_arr = np.array(kpts, dtype=np.int32)
+            # ВАЖНО: видимость (третья координата) — дробная (0..1), поэтому
+            # массив приводим к float, а к целым — только координаты. Иначе
+            # np.int32 округляет 0.99 → 0 и точки отбрасываются по порогу 0.5.
+            kpts_arr = np.array(kpts, dtype=np.float32)
+            xy = kpts_arr[:, :2].astype(np.int32)
             vis = kpts_arr[:, 2] > 0.5
             for (i, j), color in zip(COCO_SKELETON, SKELETON_COLORS):
-                if vis[i] and vis[j]:
-                    cv2.line(frame, kpts_arr[i, :2], kpts_arr[j, :2], color, thick)
-            for i, (x, y, v) in enumerate(kpts_arr):
-                if v > 0.5:
-                    cv2.circle(frame, (x, y), rad, KP_COLORS[i % len(KP_COLORS)], -1)
-                    cv2.circle(frame, (x, y), rad, (255, 255, 255), max(1, thick // 2))
+                if i < len(vis) and j < len(vis) and vis[i] and vis[j]:
+                    cv2.line(frame, (int(xy[i, 0]), int(xy[i, 1])),
+                             (int(xy[j, 0]), int(xy[j, 1])), color, thick)
+            for i in range(len(kpts_arr)):
+                if kpts_arr[i, 2] > 0.5:
+                    cv2.circle(frame, (int(xy[i, 0]), int(xy[i, 1])), rad,
+                               KP_COLORS[i % len(KP_COLORS)], -1)
+                    cv2.circle(frame, (int(xy[i, 0]), int(xy[i, 1])), rad,
+                               (255, 255, 255), max(1, thick // 2))
 
         cv2.putText(frame, label, (x1, y1 - 5),
                     cv2.FONT_HERSHEY_SIMPLEX, fs, (255, 255, 255), fthick)

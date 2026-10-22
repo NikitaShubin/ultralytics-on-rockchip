@@ -16,6 +16,21 @@ log = logging.getLogger(__name__)
 
 _NO_CAM_CACHE: dict[int, bytes] = {}
 
+# Типичные разрешения USB-камер (от больших к меньшим) — перебираются при
+# выборе формата захвата. Реальный набор определяется возможностями камеры.
+CAMERA_RESOLUTIONS: tuple[tuple[int, int], ...] = (
+    (3840, 2160), (1920, 1080), (1600, 1200), (1280, 720), (1024, 768),
+    (960, 720), (800, 600), (720, 480), (640, 480), (320, 240), (176, 144),
+    (160, 120),
+)
+
+# Форматы пикселей в порядке проверки. MJPG — предпочтительный: меньше
+# USB-трафика, работает у камер в «урезанном» режиме после сбоя USB.
+_CANDIDATE_FOURCC: tuple[tuple[str, int], ...] = (
+    ('MJPG', cv2.VideoWriter_fourcc(*'MJPG')),
+    ('YUYV', cv2.VideoWriter_fourcc(*'YUYV')),
+)
+
 
 def _device_inode(dev: str) -> int | None:
     """inode узла устройства; меняется при USB-переподключении камеры."""
@@ -67,11 +82,30 @@ class USBCamera(CameraSource):
     Кадры читаются в фоновом потоке. Основной поток получает последний
     готовый кадр мгновенно. USB glitch от NPU inference (DMA ~50ms)
     обрабатывается в фоне и не блокирует pipeline.
+
+    Разрешение захвата:
+      - явное (width/height) — используется как есть;
+      - 'model'  — рабочее разрешение модели (target_size = input_size);
+      - 'source' — максимальное разрешение, которое отдаёт камера.
+    Фактический формат проверяется после открытия: камера может вернуть
+    другой размер (например, при сбое USB — 176x144 вместо запрошенного).
     """
 
-    def __init__(self, width: int = 640, height: int = 480) -> None:
+    def __init__(
+        self,
+        width: int = 0,
+        height: int = 0,
+        resolution_mode: str = 'model',
+        target_size: int = 0,
+    ) -> None:
         self.width = width
         self.height = height
+        self.resolution_mode = resolution_mode
+        self.target_size = target_size
+        self._format: tuple[int, int] | None = None
+        self._fourcc: str = ''
+        self._desired: tuple[int, int] | None = None
+        self._fmt_attempts = 0
         self._cap: cv2.VideoCapture | None = None
         self._device: str = ''
         self._lock = threading.Lock()
@@ -92,20 +126,81 @@ class USBCamera(CameraSource):
             if self._try_device(dev_str):
                 self._device = dev_str
                 self._start_thread()
-                log.info('подключено к %s (фоновый захват)', dev_str)
+                log.info('подключено к %s (фоновый захват) формат=%sx%s',
+                         dev_str, self._format[0] if self._format else '?',
+                         self._format[1] if self._format else '?')
                 return True
         return False
+
+    def _candidates(self) -> list[tuple[int, int]]:
+        """Список разрешений-кандидатов в порядке убывания приоритета."""
+        if self.width > 0 and self.height > 0:
+            return [(self.width, self.height)]
+        if self.resolution_mode == 'source':
+            return list(CAMERA_RESOLUTIONS)
+        target = self.target_size or 640
+        exact = [r for r in CAMERA_RESOLUTIONS if max(r) == target]
+        # Если рабочего разрешения нет — берём ближайшее БОЛЬШЕЕ (кадр потом
+        # приведётся к input_size моделью, качество не теряется).
+        bigger = [r for r in CAMERA_RESOLUTIONS if max(r) > target]
+        smaller = [r for r in CAMERA_RESOLUTIONS if max(r) < target]
+        return exact + list(reversed(bigger)) + smaller
+
+    def _desired_format(self) -> tuple[int, int] | None:
+        """Желаемый формат захвата — для контроля watchdog.
+
+        В режиме 'source' формат не контролируем (камера отдаёт свой максимум),
+        поэтому None. В режиме 'model' — рабочее разрешение модели.
+        """
+        if self.resolution_mode == 'source':
+            return None
+        cands = self._candidates()
+        return cands[0] if cands else None
+
+    def _select_format(self, cap: cv2.VideoCapture) -> tuple[int, int, str] | None:
+        """Подобрать поддерживаемый камерой формат (fourcc + размер).
+
+        MJPG проверяется первым: он есть у большинства веб-камер, требует
+        втрое меньше USB-трафика и работает даже когда камера не смогла
+        переключиться на YUYV (после сбоя USB остаётся минимальный формат).
+        """
+        for name, fourcc in _CANDIDATE_FOURCC:
+            cap.set(cv2.CAP_PROP_FOURCC, fourcc)
+            for w, h in self._candidates():
+                cap.set(cv2.CAP_PROP_FRAME_WIDTH, w)
+                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, h)
+                aw = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+                ah = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                if aw == w and ah == h:
+                    return aw, ah, name
+        return None
+
+    def _current_format(self, cap: cv2.VideoCapture) -> tuple[int, int, str]:
+        """Фактический формат камеры (используется, если ничего не применилось)."""
+        w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        code = int(cap.get(cv2.CAP_PROP_FOURCC))
+        name = ''.join(chr((code >> 8 * i) & 0xFF) for i in range(4)).strip('\x00 ')
+        return w, h, name
 
     def _try_device(self, dev: str) -> bool:
         """Попытка открыть устройство и считать кадр."""
         try:
             cap = cv2.VideoCapture(dev)
-            cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
-            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
+            fmt = self._select_format(cap)
+            if fmt is None:
+                # Ни один желаемый формат не применился (камера в урезанном
+                # режиме) — принимаем фактический, но предупреждаем.
+                fmt = self._current_format(cap)
+                log.warning('%s: желаемый формат недоступен, берём фактический %sx%s (%s)',
+                            dev, fmt[0], fmt[1], fmt[2] or '?')
             cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
             ret, _ = cap.read()
             if ret:
                 self._cap = cap
+                self._format = (fmt[0], fmt[1])
+                self._fourcc = fmt[2]
+                self._desired = self._desired_format()
                 self._dev_inode = _device_inode(dev)
                 return True
             cap.release()
@@ -136,15 +231,20 @@ class USBCamera(CameraSource):
         if not cap.isOpened():
             cap.release()
             return
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
+        fmt = self._select_format(cap)
+        if fmt is None:
+            fmt = self._current_format(cap)
         cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         with self._lock:
             if self._cap is not None:
                 self._cap.release()
             self._cap = cap
+            self._format = (fmt[0], fmt[1])
+            self._fourcc = fmt[2]
         self._dev_inode = inode
         self._read_errors = 0
+        log.info('камера %s переоткрыта, формат %sx%s (%s)',
+                 self._device, fmt[0], fmt[1], fmt[2] or '?')
 
     def _start_thread(self) -> None:
         """Запуск фонового потока захвата и сторожа."""
@@ -168,15 +268,32 @@ class USBCamera(CameraSource):
             time.sleep(1.0)
             with self._lock:
                 frame_id = self._frame_id
-                cap_open = self._cap is not None
+                cap = self._cap
+                fmt = self._format
             now = time.monotonic()
-            if not cap_open:
+            if cap is None:
                 # Камера была отключена: если устройство вернулось — открыть заново
                 if self._device and Path(self._device).exists() and now - self._last_reopen > 5.0:
                     self._last_reopen = now
                     log.info('камера %s вернулась, открываем заново', self._device)
                     self._reopen_camera()
                 continue
+            if fmt is not None and now - self._last_reopen > 60.0:
+                cur = (int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)),
+                       int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)))
+                desired = self._desired
+                if (desired and cur != desired
+                        and cur[0] * cur[1] < desired[0] * desired[1]):
+                    self._last_reopen = now
+                    self._fmt_attempts += 1
+                    if self._fmt_attempts <= 5:
+                        log.warning('камера отдаёт %sx%s вместо %sx%s — переоткрываем',
+                                    cur[0], cur[1], desired[0], desired[1])
+                        self._reopen_camera()
+                        continue
+                    if self._fmt_attempts == 6:
+                        log.warning('формат %sx%s недоступен для камеры, оставляем как есть',
+                                    cur[0], cur[1])
             if frame_id != last_seen:
                 last_seen = frame_id
                 stuck_since = now
@@ -211,16 +328,19 @@ class USBCamera(CameraSource):
         if not cap.isOpened():
             cap.release()
             return
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
+        fmt = self._select_format(cap)
+        if fmt is None:
+            fmt = self._current_format(cap)
         cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         with self._lock:
             self._cap = cap
+            self._format = (fmt[0], fmt[1])
+            self._fourcc = fmt[2]
         self._dev_inode = _device_inode(dev)
         self._read_errors = 0
         self._thread = threading.Thread(target=self._capture_loop, daemon=True, name='cam-capture')
         self._thread.start()
-        log.info('камера %s переоткрыта', dev)
+        log.info('камера %s переоткрыта, формат %sx%s (%s)', dev, fmt[0], fmt[1], fmt[2] or '?')
 
     def _capture_loop(self) -> None:
         """Фоновый поток: непрерывно читает кадры с камеры."""
@@ -430,14 +550,18 @@ class CameraManager:
     def __init__(
         self,
         cam_mode: str = 'auto',
-        width: int = 640,
-        height: int = 480,
+        width: int = 0,
+        height: int = 0,
         file_path: str = '',
+        resolution_mode: str = 'model',
+        target_size: int = 0,
     ) -> None:
         self.cam_mode = cam_mode
         self.width = width
         self.height = height
         self.file_path = file_path
+        self.resolution_mode = resolution_mode
+        self.target_size = target_size
         self._source: CameraSource | None = None
         self._fallback_count = 0
         self._max_fallback = 2
@@ -461,7 +585,12 @@ class CameraManager:
             self._skip_gige = True
 
         if self.cam_mode in ('auto', 'usb'):
-            source = USBCamera(self.width, self.height)
+            source = USBCamera(
+                self.width,
+                self.height,
+                resolution_mode=self.resolution_mode,
+                target_size=self.target_size,
+            )
             if source.open():
                 self._source = source
                 self._skip_gige = False

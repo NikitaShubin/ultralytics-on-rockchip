@@ -7,8 +7,8 @@
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><circle cx='50' cy='50' r='40' fill='none' stroke='%230f0' stroke-width='6'/><circle cx='50' cy='50' r='18' fill='%230f0'/></svg>">
 <style>
 * { margin: 0; padding: 0; box-sizing: border-box; }
-html, body { width: 100%; height: 100%; overflow: hidden; background: #000; }
-canvas { width: 100vw; height: 100vh; object-fit: contain; display: block; }
+html, body { width: 100%; height: 100%; overflow: hidden; background: #000; display: flex; align-items: center; justify-content: center; }
+canvas { display: block; }
 #info {
   position: fixed; bottom: 8px; left: 8px; color: #0f0;
   font: 13px/1.4 monospace; pointer-events: none;
@@ -61,6 +61,24 @@ let serverFps = 0;
 let clientFpsHistory = [];
 let clientFps = 0;
 let lastFrameId = -1;
+// Масштаб отображения: css-пикселей на пиксель кадра. Нужен, чтобы рамки и
+// подписи выглядели одинаково при любом разрешении камеры.
+let viewScale = 1;
+
+function fitCanvas() {
+  // Вписать кадр в окно с сохранением пропорций (object-fit у canvas не работает)
+  const ratio = canvas.height / canvas.width;
+  const availW = window.innerWidth;
+  const availH = window.innerHeight;
+  let w = availW;
+  let h = w * ratio;
+  if (h > availH) { h = availH; w = h / ratio; }
+  canvas.style.width = Math.round(w) + 'px';
+  canvas.style.height = Math.round(h) + 'px';
+  viewScale = w / canvas.width;
+}
+
+window.addEventListener('resize', () => { if (canvas.width) fitCanvas(); });
 
 async function poll() {
   try {
@@ -78,6 +96,7 @@ async function poll() {
     img.onload = () => {
       canvas.width = img.width;
       canvas.height = img.height;
+      fitCanvas();
       ctx.clearRect(0, 0, canvas.width, canvas.height);
       ctx.drawImage(img, 0, 0);
       URL.revokeObjectURL(url);
@@ -108,11 +127,40 @@ function updateClientFps() {
 function drawObject(obj, idx) {
   const color = colorForClass(obj.class_name || '');
   const label = `${obj.class_name || ''} ${(obj.score || 0).toFixed(2)}`;
+  // Толщины и размеры шрифтов задаём в css-пикселях: делим на масштаб,
+  // чтобы разметка выглядела одинаково при любом разрешении кадра.
+  const px = (v) => v / viewScale;
+
+  // Маска в base64 (MASK_FORMAT=base64): рисуется отдельным слоем
+  if (obj.mask_png) {
+    const mi = new Image();
+    mi.onload = () => {
+      const tmp = document.createElement('canvas');
+      tmp.width = canvas.width; tmp.height = canvas.height;
+      const tctx = tmp.getContext('2d');
+      tctx.drawImage(mi, 0, 0, canvas.width, canvas.height);
+      const data = tctx.getImageData(0, 0, canvas.width, canvas.height).data;
+      ctx.save();
+      ctx.globalAlpha = 0.4;
+      const imgData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+      for (let i = 0; i < data.length; i += 4) {
+        if (data[i + 3] > 0) {
+          imgData.data[i] = data[i];
+          imgData.data[i + 1] = data[i + 1];
+          imgData.data[i + 2] = data[i + 2];
+          imgData.data[i + 3] = 255;
+        }
+      }
+      ctx.putImageData(imgData, 0, 0);
+      ctx.restore();
+    };
+    mi.src = 'data:image/png;base64,' + obj.mask_png;
+  }
 
   if (obj.polygon) {
     ctx.save();
     ctx.strokeStyle = color;
-    ctx.lineWidth = 2;
+    ctx.lineWidth = px(2);
     ctx.beginPath();
     const pts = obj.polygon;
     ctx.moveTo(pts[0], pts[1]);
@@ -123,36 +171,26 @@ function drawObject(obj, idx) {
     ctx.fill();
     ctx.stroke();
     ctx.restore();
-    const cx = pts.reduce((s, v, i) => s + (i % 2 === 0 ? v : 0), 0) / (pts.length / 2);
-    const cy = pts.reduce((s, v, i) => s + (i % 2 === 1 ? v : 0), 0) / (pts.length / 2);
-    ctx.font = 'bold 14px sans-serif';
-    ctx.textBaseline = 'bottom';
-    ctx.strokeStyle = '#000';
-    ctx.lineWidth = 3;
-    ctx.lineJoin = 'round';
-    ctx.strokeText(label, cx, cy - 4);
-    ctx.fillStyle = '#fff';
-    ctx.fillText(label, cx, cy - 4);
   }
 
   if (obj.bbox) {
     const [x1, y1, x2, y2] = obj.bbox;
     ctx.strokeStyle = color;
-    ctx.lineWidth = 2;
+    ctx.lineWidth = px(2);
     ctx.strokeRect(x1, y1, x2 - x1, y2 - y1);
-    if (!obj.polygon) {
-      ctx.font = 'bold 20px sans-serif';
-      ctx.textBaseline = 'top';
-      ctx.strokeStyle = '#000';
-      ctx.lineWidth = 3;
-      ctx.lineJoin = 'round';
-      ctx.textAlign = 'left';
-      const lx = x1 + 10;
-      const ly = y1 + 10 + idx * 28;
-      ctx.strokeText(label, lx, ly);
-      ctx.fillStyle = '#fff';
-      ctx.fillText(label, lx, ly);
-    }
+    // Подпись всегда привязана к рамке объекта (а не к полигону маски):
+    // иначе при «уехавшей» маске текст оказывается далеко от объекта.
+    ctx.font = 'bold ' + px(16) + 'px sans-serif';
+    ctx.textBaseline = 'top';
+    ctx.strokeStyle = '#000';
+    ctx.lineWidth = px(3);
+    ctx.lineJoin = 'round';
+    ctx.textAlign = 'left';
+    const lx = x1 + px(6);
+    const ly = Math.max(px(2), y1 - px(18)) + idx * px(2);
+    ctx.strokeText(label, lx, ly);
+    ctx.fillStyle = '#fff';
+    ctx.fillText(label, lx, ly);
   }
 
   if (obj.keypoints && obj.keypoints.length > 0) {
@@ -163,7 +201,7 @@ function drawObject(obj, idx) {
         const b = obj.keypoints[j];
         if (a[2] > 0.5 && b[2] > 0.5) {
           ctx.strokeStyle = SKELETON_COLORS[k % SKELETON_COLORS.length];
-          ctx.lineWidth = 3;
+          ctx.lineWidth = px(3);
           ctx.beginPath();
           ctx.moveTo(a[0], a[1]);
           ctx.lineTo(b[0], b[1]);
@@ -176,11 +214,11 @@ function drawObject(obj, idx) {
       if (kp[2] > 0.5) {
         ctx.fillStyle = KP_COLORS[i % KP_COLORS.length];
         ctx.beginPath();
-        ctx.arc(kp[0], kp[1], 4, 0, Math.PI * 2);
+        ctx.arc(kp[0], kp[1], px(4), 0, Math.PI * 2);
         ctx.fill();
         ctx.fillStyle = '#fff';
         ctx.beginPath();
-        ctx.arc(kp[0], kp[1], 2, 0, Math.PI * 2);
+        ctx.arc(kp[0], kp[1], px(2), 0, Math.PI * 2);
         ctx.fill();
       }
     }
