@@ -122,6 +122,18 @@ RKNN-деплой отложен по решению пользователя. �
   **segsmoke УДАЛЁН (2026-08-11)** — был дублем convert-сервиса.
 
 ### Important Details
+- **Прод-образ percept БЕЗ torch/ultralytics (осознанно)**: постпроцессы шаблонов обязаны работать только на
+  numpy+cv2. OBB-шаблон раньше импортировал `ultralytics.utils.metrics.batch_probiou` → в проде падал весь
+  видеопоток (ModuleNotFoundError в каждом кадре → пайплайн-поток умирал → «камера не подключена»). Теперь
+  `_probiou()`: в convert-контейнере (есть ultralytics) — эталон torch, иначе numpy-порт `batch_probiou_np`
+  (расхождение пар < 3e-4, float64 vs float32). Урок:.templates НЕ должны тянуть eval-only зависимости.
+- **video_loop._capture_loop защищён try/except**: ошибка модели/постпроцесса убивает только объекты кадра
+  (кадр отдаётся пустым, лог раз в 10с), НЕ весь поток. Раньше исключение молча убивало _capture_loop →
+  frame замирал и сервис показывал заглушку «камера не подключена».
+- **Камера: разрешение/формат по умолчанию от модели** (`CAM_RESOLUTION=model`, `CAM_W/H=0`): USBCamera
+  выбирает формат MJPG→YUYV, размер = working size модели (input_size); `source` = максимум камеры.
+  Logitech C525: MJPG работает всегда (640×480 в «урезанном» режиме, до 1920×1080 в норме), YUYV залипает
+  на 176×144 после USB-сбоев (set не применяется даже с хоста) — поэтому MJPG первый кандидат.
 - **System freezes under sustained CPU load** (even 2 containers) due to 8GB RAM exhaustion + thermal throttling. Workaround: run 1 container at a time with `--memory=4g` or for eval use `--limit 500`.
 - **YOLO26 export — end2end по умолчанию**: ультралайтс 8.4.105 экспортирует yolo26 в ONNX с NMS в графе (выход `[1,300,6]`), НЕ raw. `.val()` умеет оба формата: `DetectionPredictor.postprocess` → `non_max_suppression(..., end2end=model.end2end)`. Для честного сравнения (как yolo11) std ONNX экспортируется с `end2end=False` → raw (`benchmark/export_std_onnx.py:58`).
 - **YOLO26 — НЕТ DFL**: box = 4 канала (ltrb-отступы) напрямую; `reg_max=1` → `NO_DFL=True` в шаблонах. RK-opt per-stride: тройка [box(4), cls(C, sigmoid), sm(1)] × nl; seg добавляет coeff(32)+proto(160); sem = один выход (см. ниже).
