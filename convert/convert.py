@@ -865,12 +865,13 @@ def _deploy_to_model(model_name: str, quantize: str, info: dict) -> None:
     (MODEL_DIR / "quantize.txt").write_text(quantize)
     log(f"model_name={model_name}, quantize={quantize}")
 
-    _signal_reload()
+    _signal_reload(model_name)
 
 
-def _signal_reload():
+def _signal_reload(model_name: str = ''):
     import urllib.request
-    urls = ["http://localhost:5000/reload", "http://percept:5000/reload"]
+    query = f"?model={model_name}" if model_name else ""
+    urls = [f"http://localhost:5000/reload{query}", f"http://percept:5000/reload{query}"]
     for url in urls:
         try:
             resp = urllib.request.urlopen(url, timeout=5)

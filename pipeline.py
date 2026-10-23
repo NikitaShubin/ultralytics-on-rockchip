@@ -81,6 +81,13 @@ class Pipeline:
     def reload(self, model_name: str = '', backend: str | None = None,
                rknn_suffix: str | None = None) -> None:
         """Перезагрузка модели и постпроцесса (потокобезопасно)."""
+        if not model_name:
+            # Деплой-сигнал может приходить без имени модели: берём его из
+            # model/model_name.txt, который записывает _deploy_to_model —
+            # иначе заголовок/статус UI показывают предыдущую модель.
+            name_file = self.model_dir / 'model_name.txt'
+            if name_file.exists():
+                model_name = name_file.read_text().strip() or model_name
         if model_name:
             self.model_name = model_name
         if backend is not None:
