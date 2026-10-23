@@ -13,6 +13,7 @@ MAX_NMS = 30000
 MAX_WH = 7680
 NUM_CLASSES = {{NUM_CLASSES}}
 COCO_CLASSES = {{COCO_CLASSES}}
+EVAL_PRECISE = False
 
 def dfl_nodfl(position):
     return position
@@ -108,18 +109,20 @@ def batch_probiou_np(obb1, obb2, eps=1e-7):
     return 1 - hd
 
 
-def _probiou(a, b):
-    """Вероятностный IoU: в convert-контейнере есть ultralytics → эталон
-    (torch); в прод-образе нет — numpy-порт. Разница пар < 3e-4 (float64
-    vs float32), порядок NMS сохраняется."""
-    try:
-        from ultralytics.utils.metrics import batch_probiou
-        import torch
-        return batch_probiou(
-            torch.from_numpy(np.ascontiguousarray(a))
-        ).numpy()
-    except ImportError:
-        return batch_probiou_np(a, b)
+def _get_probiou():
+    """Выбор реализации batch_probiou.
+
+    EVAL_PRECISE (eval-режим, ultralytics доступен в convert-контейнере) —
+    torch-версия (байт-эквивалент ultralytics .val()); в проде (EVAL_PRECISE
+    не выставляется, torch/ultralytics не установлены) — numpy-порт.
+    """
+    if EVAL_PRECISE:
+        from ultralytics.utils.metrics import batch_probiou as fn
+
+        def wrapper(a, b):
+            return fn(a, b).numpy()
+        return wrapper
+    return batch_probiou_np
 
 
 def _rotated_nms(boxes_xywhr, scores, iou_thresh, max_det, classes=None, block=4096):
@@ -133,6 +136,7 @@ def _rotated_nms(boxes_xywhr, scores, iou_thresh, max_det, classes=None, block=4
 
     Возвращает индексы выбранных боксов в исходной нумерации boxes_xywhr.
     """
+    bp = _get_probiou()
     n = scores.shape[0]
     if n == 0:
         return np.empty(0, dtype=np.int64)
@@ -156,9 +160,9 @@ def _rotated_nms(boxes_xywhr, scores, iou_thresh, max_det, classes=None, block=4
             bj = b[j0:j1]
             for ib in range(jb):
                 i0, i1 = ib * block, min(ng, (ib + 1) * block)
-                iou = _probiou(b[i0:i1], bj)
+                iou = bp(b[i0:i1], bj)
                 max_iou[j0:j1] = np.maximum(max_iou[j0:j1], iou.max(axis=0))
-            iou_jj = _probiou(bj, bj)
+            iou_jj = bp(bj, bj)
             if j1 - j0 > 1:
                 max_iou[j0:j1] = np.maximum(max_iou[j0:j1],
                                             np.triu(iou_jj, k=1).max(axis=0))
@@ -263,7 +267,7 @@ def postprocess(outputs, scale, pad, orig_shape):
             "bbox": [float(cx), float(cy), float(w), float(h)],
             "score": float(conf),
             "class_id": cls_id,
-            "class_name": str(cls_id),
+            "class_name": COCO_CLASSES[cls_id] if cls_id < len(COCO_CLASSES) else str(cls_id),
             "angle": ang,
         })
     return results

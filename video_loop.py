@@ -35,7 +35,8 @@ class VideoLoop:
     _frame_id: int = 0
     _fps_counter: list[float] = field(default_factory=list)
     _fps: float = 0.0
-    _last_err_log: float = 0.0
+    _err_ts: float = 0.0
+    _err_count: int = 0
 
     def register_consumer(self, cb: Callable[[DetectorFrame], None]) -> None:
         """Регистрация callback для получения каждого обработанного кадра."""
@@ -76,10 +77,13 @@ class VideoLoop:
                 objects, _ = self.pipeline.detect(frame)
                 if self.pipeline._semantic_mode and self.pipeline._visualize:
                     frame = self.pipeline._visualize(frame, objects)
-            except Exception as e:  # noqa: BLE001 — ошибка модели не должна убивать видеопоток
-                if time.monotonic() - self._last_err_log > 10:
-                    self._last_err_log = time.monotonic()
-                    log.exception('ошибка конвейера, кадр отдаётся без объектов')
+            except Exception as exc:  # ошибка постпроцесса не должна убивать весь поток
+                self._err_count += 1
+                now = time.monotonic()
+                if now - self._err_ts > 5.0:
+                    log.error('ошибка обработки кадра #%d (всего за окно: %d): %s',
+                              self._frame_id, self._err_count, exc, exc_info=True)
+                    self._err_ts = now
                 objects = []
             total_ms = (time.monotonic() - process_start) * 1000
             self._update_fps()

@@ -190,28 +190,28 @@ def create_app(
     @app.route('/frame')
     def frame() -> Response:
         nonlocal _last_jpeg, _last_frame_id, _last_frame_time
-        if _last_jpeg is None or time.time() - _last_frame_time > 2.0:
+        if _last_jpeg is None:
             return Response(_make_no_cam_placeholder(), mimetype='image/jpeg')
-        return Response(
-            _last_jpeg,
-            mimetype='image/jpeg',
-            headers={
-                'Cache-Control': 'no-cache, no-store, must-revalidate',
-                'X-Frame-Id': str(_last_frame_id),
-            },
-        )
+        headers = {
+            'Cache-Control': 'no-cache, no-store, must-revalidate',
+            'X-Frame-Id': str(_last_frame_id),
+        }
+        if time.time() - _last_frame_time > 2.0:
+            headers['X-Frame-Stale'] = '1'
+        return Response(_last_jpeg, mimetype='image/jpeg', headers=headers)
 
     @app.route('/objects')
     def objects() -> dict:
         nonlocal _last_frame_time
         stale = time.time() - _last_frame_time > 2.0
         return {
-            'objects': [] if stale else _last_objects,
-            'count': 0 if stale else len(_last_objects),
-            'fps': 0.0 if stale else _last_fps,
+            'objects': _last_objects,
+            'count': len(_last_objects),
+            'fps': _last_fps,
             'frame_id': _last_frame_id,
             'model': pipeline.model_name,
             'quantize': pipeline.quantize or 'fp16',
+            'stale': stale,
         }
 
     @app.route('/reload')
