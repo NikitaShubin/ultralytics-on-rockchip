@@ -134,6 +134,12 @@ RKNN-деплой отложен по решению пользователя. �
   выбирает формат MJPG→YUYV, размер = working size модели (input_size); `source` = максимум камеры.
   Logitech C525: MJPG работает всегда (640×480 в «урезанном» режиме, до 1920×1080 в норме), YUYV залипает
   на 176×144 после USB-сбоев (set не применяется даже с хоста) — поэтому MJPG первый кандидат.
+- **Камера после USB-сбоев падает на full-speed (12 Мбит/с)**: high-speed-пара порта камере недоступна
+  (dmesg: `usb 4-1 ... error -71`, «Maybe the USB cable is bad?»), v4l2 показывает только форматы 160…640px.
+  Лечение только физическое: переткнуть камеру в свободный USB-порт (лучше USB3/A — он совместим с USB2-камерой,
+  камера получает 480 Мбит/с и весь набор форматов до 1920×1080). Сервис подхватывает переподключение сам
+  (watchdog по inode в camera_source). `USBDEVFS_RESET` (ioctl 0x5514 через docker --privileged)
+  восстанавливает камеру, но остаётся на full-speed.
 - **System freezes under sustained CPU load** (even 2 containers) due to 8GB RAM exhaustion + thermal throttling. Workaround: run 1 container at a time with `--memory=4g` or for eval use `--limit 500`.
 - **YOLO26 export — end2end по умолчанию**: ультралайтс 8.4.105 экспортирует yolo26 в ONNX с NMS в графе (выход `[1,300,6]`), НЕ raw. `.val()` умеет оба формата: `DetectionPredictor.postprocess` → `non_max_suppression(..., end2end=model.end2end)`. Для честного сравнения (как yolo11) std ONNX экспортируется с `end2end=False` → raw (`benchmark/export_std_onnx.py:58`).
 - **YOLO26 — НЕТ DFL**: box = 4 канала (ltrb-отступы) напрямую; `reg_max=1` → `NO_DFL=True` в шаблонах. RK-opt per-stride: тройка [box(4), cls(C, sigmoid), sm(1)] × nl; seg добавляет coeff(32)+proto(160); sem = один выход (см. ниже).
