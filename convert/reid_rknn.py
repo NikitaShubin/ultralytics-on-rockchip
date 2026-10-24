@@ -26,8 +26,8 @@ import cv2
 import numpy as np
 from rknn.api import RKNN
 
-SRC = '/app/convert/model/reid/osnet_x0_25_msmt17.onnx'
-DST = '/app/convert/model/reid/osnet_x0_25_msmt17.rknn'
+SRC = os.environ.get('REID_SRC', '/app/convert/model/reid/osnet_x0_25_msmt17.onnx')
+DST = os.environ.get('REID_DST', '/app/convert/model/reid/osnet_x0_25_msmt17.rknn')
 CALIB_DIR = '/reid_calib'
 W, H, BATCH = 128, 256, 16
 _MEAN = np.array([0.485, 0.456, 0.406], np.float32)

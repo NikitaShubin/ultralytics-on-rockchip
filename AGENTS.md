@@ -379,6 +379,30 @@ RKNN-деплой отложен по решению пользователя. �
   (nid ~19 при n ~23, maxid 23–28 — рост спавнов из-за окклюзий/пересечений). По критерию ≤1 fps
   ReID на дефолт НЕ проходит: **дефолт `TRACKER_REID` не активируется, ReID — только опция**.
 - Деградация fps при `TRACKER=on` БЕЗ ReID отсутствует (fps 9.5 == baseline).
+- **Поиск «квантуемой» ReID-модели (2026-10-24, пилот)**: официальный torchreid zoo (HF
+  `kaiyangzhou/osnet`) — собраны и прогнаны int8-RKNN (кропы people.mp4, метрики: pairwise-corr
+  = корреляция int8-vs-fp32 pairwise-матриц сходства — главный прогностик для ReID):
+  | модель | cos(i8,fp32) | pairwise-corr | int8 NPU speed | CPU fp32 | вывод |
+  |---|---|---|---|---|---|
+  | osnet_x0_25 | 0.19-0.35 | — | 67-76 мс/b16 | 73-76 мс | коллапс, сломано |
+  | osnet_x1_0 | 0.24 | **0.755** | 102 мс/b16 | 974 мс | без дискриминации |
+  | osnet_x0_5 | — | **0.918** | 58 мс/b16 | ~450 мс | corr ок, скорость лучшая |
+  | osnet_ibn_x1_0 | 0.559→0.96* | 0.962 | 278 мс/b16 | ~910 мс | квантуемо, медленно |
+  | osnet_ain_x1_0 | 0.559* | **0.980** | 297 мс/b16 | ~910 мс | квантуемо, медленно |
+  (*) per-embed cos смещён (логический сдвиг направлений), но ОТНОШЕНИЯ между персонами
+  сохраняются на 92-98% — ReID-структура близка; «same/cross по синт. меткам» невалидны.
+  **Плоский head (standard OSBlock, GAP+FC) = ломается на RKNN int8 систематически**
+  (x0.25/x1.0), **AIN/IBN (instance-norm, особы от conv1 IN/attention) квантуются**, НО
+  NPU не ускоряет их (elementwise-heavy attention/IN ≈ 280-300 мс/b16) — fps-критерий
+  «ReID бесплатно» ещё дальше от цели NPU-варианта. Артефакты: `model/reid/alternatives/`
+  (onnx+rknn, в гит НЕ кладётся). Скрипты: torchreid osnet.py (MIT) + чекпоинты HF
+  kaiyangzhou/osnet; build/convert в `/tmp/opencode/reidq/` (не персистентно).
+  `convert/reid_rknn.py` теперь принимает env `REID_SRC`/`REID_DST` (переопределение путей).
+- **Про boxmot**: в актуальном master (v25) ReID-модели = families {osnet (x0.25…x1.0, ain,
+  ibn), csl_tinyvit} — полного «зоопарка» больше нет; чекпоинты cualquiera torchreid-совместимы,
+  но целенаправленно mobilenetv2/resnet50_fc512 не проверены (torchreid mobilenetv2.py/
+  resnet.py есть в boxmot master; могли бы quantize — но boxmot их не распространяет как
+  обученные msmt17 (только lmbn_n_*.pt 37MB,uby resnet50 heavy ≈ 300+ мс/b16) — смысл marginal.
 - После теста дефолт-деплой восстановлен: `CAM_MODE=file CAM_SOURCE=/app/video/people.mp4`,
   TRACKER/TRACKER_REID=off.
 
