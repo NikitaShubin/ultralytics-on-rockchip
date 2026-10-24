@@ -398,6 +398,25 @@ RKNN-деплой отложен по решению пользователя. �
   (onnx+rknn, в гит НЕ кладётся). Скрипты: torchreid osnet.py (MIT) + чекпоинты HF
   kaiyangzhou/osnet; build/convert в `/tmp/opencode/reidq/` (не персистентно).
   `convert/reid_rknn.py` теперь принимает env `REID_SRC`/`REID_DST` (переопределение путей).
+- **Split-схема (RK-opt стиль: ствол int8 NPU + голова fp32 CPU) и калибровки (2026-10-24)**:
+  trunk (featuremaps.conv1..conv5) → int8 RKNN, голова (GAP+FC+BN) → fp32 CPU ONNX (~11 мс
+  batch16). torch checkpoint (kaiyangzhou/osnet combineall ep150) грузится в torchreid
+  архитектуру (MIT) чисто (missing=0). Методика сравнения: 16 кропов people.mp4 × 3 кадра,
+  e32 = свежий fp32 ONNX (не anriha), метрики cos(int8_i vs fp32_i)/corr pairwise-матриц/разброс.
+  | trunk x0.25 int8 + head fp32 | cos | corr | e2e/batch16 |
+  |---|---|---|---|
+  | normal+channel (4 конфига калибровки ниже — все ~0.90) | 0.34 | 0.898 | 44.6-47.7 мс |
+  | **mmse** (24 мин конверт) | 0.309 | 0.904 | 45.0 мс |
+  | **kl_divergence** | 0.282 | 0.896 | 46.6 мс |
+  | **method=layer** | 0.286 | 0.895 | 44.8 мс |
+  | x0.5 trunk split | 0.145 | 0.899 | 60.0 мс |
+  **ВЫВОД**: plain-osnet ствол int8 на RK3588 hard-capped corr≈0.90, per-векторный cos 0.1-0.34 —
+  никакая калибровка (normal/mmse/kl/layer, x0.25/x0.5/x1.0) не поднимает; голова НЕ виновата
+  (user-гипотеза «перенести голову» проверена — не лечит). `w8a16` на rk3588 НЕ поддерживается
+  toolkit'ом. Лучший NPU-кандидат остаётся ain_x1_0 int8 (corr 0.98, но 297 мс/b16 — ~7.4x от
+  fps-бюджета кадра). Практический деплой ReID = ONNX-CPU fp32 (76 мс/b16, точный), env- knobs
+  квантования теперь в `reid_rknn.py` (`REID_QALGO`/`REID_QMETHOD`/`REID_QDTYPE`). Прогонщик
+  hmjMENTS: `/tmp/opencode/reidq/` (build_split.py, probe5/6.py, conv5-7.log, watcher.log).
 - **Про boxmot**: в актуальном master (v25) ReID-модели = families {osnet (x0.25…x1.0, ain,
   ibn), csl_tinyvit} — полного «зоопарка» больше нет; чекпоинты cualquiera torchreid-совместимы,
   но целенаправленно mobilenetv2/resnet50_fc512 не проверены (torchreid mobilenetv2.py/

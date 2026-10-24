@@ -90,6 +90,9 @@ def _write_calib(batches: list[np.ndarray]) -> str:
 def main() -> None:
     quant = os.environ.get('REID_QUANT', 'int8').lower()
     calib_src = os.environ.get('REID_CALIB_SRC', '/app/video/people.mp4')
+    qalgo = os.environ.get('REID_QALGO', 'normal').lower()
+    qdtype = os.environ.get('REID_QDTYPE', 'w8a8').lower()
+    qmethod = os.environ.get('REID_QMETHOD', 'channel').lower()
     rk = RKNN(verbose=False)
     cfg = dict(
         target_platform='rk3588',
@@ -97,8 +100,8 @@ def main() -> None:
         std_values=[[0.229, 0.224, 0.225]],
     )
     if quant == 'int8':
-        cfg.update(quantized_dtype='w8a8', quantized_algorithm='normal',
-                   quantized_method='channel')
+        cfg.update(quantized_dtype=qdtype, quantized_algorithm=qalgo,
+                   quantized_method=qmethod)
     print('-- config', quant)
     ret = rk.config(**cfg)
     if ret:
