@@ -1,29 +1,24 @@
 import numpy as np
 import cv2
-from PIL import Image
-from torchvision.transforms import Resize, CenterCrop, ToTensor, Compose
+from PIL import Image  # Pillow — легкая зависимость, есть в прод-образе (torchvision/torch — НЕТ)
 
 INPUT_SIZE = {{INPUT_SIZE}}
 NUM_CLASSES = {{NUM_CLASSES}}
 COCO_CLASSES = {{COCO_CLASSES}}
 
-# Точная копия ultralytics classify_transforms: Resize(224, bilinear) +
-# CenterCrop(224) + ToTensor(/255). НЕ letterbox!
-_transforms = Compose([
-    Resize(INPUT_SIZE, interpolation=2),
-    CenterCrop(INPUT_SIZE),
-    ToTensor(),
-])
-
 
 def preprocess(frame):
-    """Resize короткой стороны до INPUT_SIZE + CenterCrop + /255.
+    """Replicate torchvision-классификационного препроцесса с одним PIL.
 
-    Matches ultralytics classify_transforms exactly.
-    Returns (tensor [0,1], scale, pad) — scale/pad dummy для cls.
+    torchvision Resize(INPUT_SIZE) → ТОЧНО (INPUT_SIZE, INPUT_SIZE) через
+    PIL Image.resize(..., BILINEAR) (антиалиасинг при downscale, эталон);
+    CenterCrop(INPUT_SIZE) на квадрате — no-op; ToTensor → /255 + HWC→CHW.
+    Returns (tensor [0,1], 1.0, (0,0)) — scale/pad фиктивные для cls.
     """
     pil = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-    tensor = _transforms(pil).unsqueeze(0).numpy()
+    pil = pil.resize((INPUT_SIZE, INPUT_SIZE), Image.BILINEAR)
+    tensor = np.asarray(pil, dtype=np.float32) / 255.0
+    tensor = tensor.transpose(2, 0, 1)[None]
     return tensor, 1.0, (0, 0)
 
 

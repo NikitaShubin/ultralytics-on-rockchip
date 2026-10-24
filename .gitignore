@@ -99,3 +99,6 @@ overclock/oc_state.conf
 
 # OpenCode internal
 .opencode/
+
+# Тестовые видео (замена камеры, not in git)
+video/

@@ -31,11 +31,16 @@ services:
       - ./templates:/app/templates:ro
       - ./benchmark:/app/benchmark:rw
       - ./datasets:/app/datasets:ro
+      # Временная замена камеры: каталог с видеофайлами (см. CAM_MODE/CAM_SOURCE)
+      - ./video:/app/video:ro
     environment:
       - BACKEND=${BACKEND:-npu}
       - MODEL=${MODEL:-}
       - WEB_MODE=${WEB_MODE:-2}
       - CAM_MODE=${CAM_MODE:-auto}
+      # Замена камеры видеофайлом (медленная отладка): CAM_MODE=file
+      # + CAM_SOURCE=/app/video/<файл> (зацикливается). Откат: CAM_MODE=auto.
+      - CAM_SOURCE=${CAM_SOURCE:-}
       - CAM_W=${CAM_W:-0}
       - CAM_H=${CAM_H:-0}
       # Разрешение захвата: model — рабочее разрешение модели (input_size),
