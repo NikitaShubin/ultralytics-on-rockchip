@@ -39,6 +39,14 @@ IOU_GATE_LOW = 0.4
 # Кадров жизни трека без детекции (при ~10 fps это ~3 с).
 MAX_AGE = 30
 
+# Фузия IoU- и appearance-расстояния ( когда есть и то, и другое ):
+# cost = W_IOU*(1-iou) + W_REID*(1-cos).
+W_IOU = 0.5
+W_REID = 0.5
+COST_GATE_HIGH = 0.6   # проход 1
+COST_GATE_LOW = 0.45   # проход 2
+FEAT_EMA = 0.15
+
 
 def _iou_matrix(a: np.ndarray, b: np.ndarray) -> np.ndarray:
     """IoU пар боксов: (N,4) и (M,4) в xyxy → (N,M)."""
@@ -101,12 +109,12 @@ class _KalmanXYAH:
 
 
 class _Track:
-    """Один трек: Kalman-состояние + метаданные класса."""
+    """Один трек: Kalman-состояние + метаданные класса (+ feat ReID)."""
 
-    __slots__ = ('tid', 'mean', 'cov', 'cls', 'score', 'hits', 'age')
+    __slots__ = ('tid', 'mean', 'cov', 'cls', 'score', 'hits', 'age', 'feat')
 
     def __init__(self, tid: int, mean: np.ndarray, cov: np.ndarray,
-                 cls: int, score: float) -> None:
+                 cls: int, score: float, feat: np.ndarray | None = None) -> None:
         self.tid = tid
         self.mean = mean
         self.cov = cov
@@ -114,6 +122,7 @@ class _Track:
         self.score = score
         self.hits = 1
         self.age = 0
+        self.feat = None if feat is None else feat / max(1e-9, np.linalg.norm(feat))
 
 
 class Tracker:
@@ -170,13 +179,32 @@ class Tracker:
         pred = (np.array([_xyah_to_xyxy(t.mean) for t in self._tracks])
                 if self._tracks else np.zeros((0, 4)))
 
-        pairs = self._run_association(pred, dets)
+        # ReID-подсистема (если подключена): эмбеддинги уверенных детекций,
+        # батч ограничен BATCH энкодера; сбой энкодера деградирует до IoU.
+        det_feats: dict[int, np.ndarray] = {}
+        if self.embedder is not None and dets:
+            try:
+                order = sorted(range(len(dets)), key=lambda k: -dets[k][4])
+                order = order[:getattr(self.embedder, 'BATCH', 16)]
+                picked, embs = self.embedder.embed(
+                    frame, [np.asarray(dets[k][:4]) for k in order])
+                det_feats = {order[p]: e for p, e in zip(picked, embs)}
+            except Exception:
+                log.debug('ReID: эмбеддинг не удался (пропуск)', exc_info=True)
+
+        pairs = self._run_association(pred, dets, det_feats)
         updated: list[_Track] = []
         for ti, k in pairs:
             t = self._tracks[ti]
             t.mean, t.cov = self._kf.update(t.mean, t.cov,
                                             _xyxy_to_xyah(np.asarray(dets[k][:4])))
             t.score, t.hits, t.age = float(dets[k][4]), t.hits + 1, 0
+            if det_feats and det_feats.get(k) is not None:
+                if t.feat is None:
+                    t.feat = det_feats[k]
+                else:
+                    t.feat = FEAT_EMA * det_feats[k] + (1 - FEAT_EMA) * t.feat
+                t.feat = t.feat / max(1e-9, np.linalg.norm(t.feat))
             objects[det_idx[k]]['track_id'] = t.tid
             updated.append(t)
 
@@ -186,7 +214,8 @@ class Tracker:
             if k in used_dets or d[4] < TRACK_HIGH_THRESH:
                 continue
             mean, cov = self._kf.initiate(_xyxy_to_xyah(np.asarray(d[:4])))
-            t = _Track(self._next_id, mean, cov, int(d[5]), float(d[4]))
+            t = _Track(self._next_id, mean, cov, int(d[5]), float(d[4]),
+                       feat=det_feats.get(k) if det_feats else None)
             self._next_id += 1
             self._tracks.append(t)
             objects[det_idx[k]]['track_id'] = t.tid
@@ -218,22 +247,32 @@ class Tracker:
             det_idx.append(i)
         return dets, det_idx
 
-    def _run_association(self, pred: np.ndarray, dets: list[list[float]]
+    def _run_association(self, pred: np.ndarray, dets: list[list[float]],
+                         det_feats: dict[int, np.ndarray]
                          ) -> list[tuple[int, int]]:
         """Два прохода ассоциации: высокий conf, затем слабые → свободные.
 
-        Возвращает пары (индекс трека, индекс детекции).
+        Возвращает пары (индекс трека, индекс детекции). При наличии
+        эмбеддингов стоимость = W_IOU*(1-IoU) + W_REID*(1-cos), гейт — по
+        фузии; без эмбеддингов — чистый IoU (прежнее поведение).
         """
         if not self._tracks or not dets:
             return []
         dets_arr = np.asarray(dets, dtype=np.float64)
         track_cls = np.array([t.cls for t in self._tracks])
+        track_feats = [t.feat for t in self._tracks]
+
+        def dsub_feat(ids: list[int]) -> list:
+            return [det_feats.get(i) for i in ids]
+
         matched: dict[int, int] = {}
         used_tracks: set[int] = set()
 
-        high = np.where(dets_arr[:, 4] >= TRACK_HIGH_THRESH)[0] if dets else np.zeros(0, int)
-        for pair in self._associate(pred, track_cls, dets_arr[high], IOU_GATE_HIGH):
-            ti, hi = pair
+        high = np.where(dets_arr[:, 4] >= TRACK_HIGH_THRESH)[0] if dets \
+            else np.zeros(0, int)
+        for ti, hi in self._associate(pred, track_cls, dets_arr[high],
+                                      IOU_GATE_HIGH, COST_GATE_HIGH,
+                                      track_feats, dsub_feat(list(high))):
             if ti not in used_tracks:
                 matched[ti] = int(high[hi])
                 used_tracks.add(ti)
@@ -245,14 +284,22 @@ class Tracker:
             free = [i for i in range(len(self._tracks)) if i not in used_tracks]
             pred_f = pred[free] if free else np.zeros((0, 4))
             cls_f = track_cls[free] if free else np.zeros(0, dtype=int)
-            for ft, li in self._associate(
-                    pred_f, cls_f, dets_arr[low], IOU_GATE_LOW):
-                matched[free[ft]] = low[li]
+            feat_f = [track_feats[i] for i in free]
+            for ft_, li in self._associate(pred_f, cls_f, dets_arr[low],
+                                           IOU_GATE_LOW, COST_GATE_LOW,
+                                           feat_f, dsub_feat(low)):
+                matched[free[ft_]] = low[li]
         return list(matched.items())
 
     def _associate(self, pred_boxes: np.ndarray, track_cls: np.ndarray,
-                   dets: np.ndarray, iou_gate: float) -> list[tuple[int, int]]:
-        """Hungarian по классам: [(track, det_subidx)], гейт по IoU."""
+                   dets: np.ndarray, iou_gate: float, cost_gate: float,
+                   track_feats: list, det_feats_sub: list
+                   ) -> list[tuple[int, int]]:
+        """Hungarian по классам: [(track, det_subidx)].
+
+        Трек feat (или чей-то — None) без парности → чистый IoU с гейтом
+        `iou_gate`; парные → фузия с appearance-расстоянием и гейт `cost_gate`.
+        """
         res: list[tuple[int, int]] = []
         if pred_boxes.shape[0] == 0 or dets.shape[0] == 0:
             return res
@@ -263,12 +310,29 @@ class Tracker:
             d_ids = np.where(det_cls == cls)[0]
             if not t_ids.size or not d_ids.size:
                 continue
-            sub = iou[np.ix_(t_ids, d_ids)]
-            ok = sub >= iou_gate
-            cost = np.where(ok, 1.0 - sub, 1e6)
-            rows, cols = linear_sum_assignment(cost)
+            sub_iou = iou[np.ix_(t_ids, d_ids)]
+            cost = 1.0 - sub_iou
+            # Фузия с appearance: только где ЭМБЕДМА есть у обоих.
+            ok_pair = np.zeros(sub_iou.shape, dtype=bool)
+            t_mat = [track_feats[int(i)] for i in t_ids]
+            d_mat = [det_feats_sub[int(i)] for i in d_ids]
+            t_have = [f is not None for f in t_mat]
+            d_have = [f is not None for f in d_mat]
+            if any(t_have) and any(d_have):
+                t_idx = [i for i, f in enumerate(t_mat) if f is not None]
+                d_idx = [j for j, f in enumerate(d_mat) if f is not None]
+                tf = np.stack([t_mat[i] for i in t_idx])
+                df = np.stack([d_mat[j] for j in d_idx])
+                sim = tf @ df.T
+                fused = (W_IOU * (1.0 - sub_iou[np.ix_(t_idx, d_idx)])
+                         + W_REID * (1.0 - sim))
+                cost[np.ix_(t_idx, d_idx)] = fused
+                ok_pair[np.ix_(t_idx, d_idx)] = True
+            gate = np.where(ok_pair, cost <= cost_gate, sub_iou >= iou_gate)
+            pair_cost = np.where(gate, cost, 1e6)
+            rows, cols = linear_sum_assignment(pair_cost)
             for r, c in zip(rows, cols):
-                if cost[r, c] < 1e5:
+                if pair_cost[r, c] < 1e5:
                     res.append((int(t_ids[r]), int(d_ids[c])))
         return res
 

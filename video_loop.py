@@ -64,6 +64,13 @@ class VideoLoop:
         self._track_sig = None
         if self._tracker is not None:
             log.info('трекер включён (CMC=%s)', self.config.tracker_cmc)
+            if self.config.tracker_reid == 'on':
+                try:
+                    from reid import ReidEngine
+                    self._tracker.embedder = ReidEngine()
+                    log.info('ReID: подключён (osnet, NPU-RKNN)')
+                except Exception as exc:
+                    log.error('ReID не подключен (работаем без него): %s', exc)
         self._running = True
         while self._running:
             if not self._cam.open():

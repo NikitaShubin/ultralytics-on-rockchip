@@ -352,7 +352,41 @@ RKNN-деплой отложен по решению пользователя. �
   (ID стабильны, окклюзия 5 кадров удерживает ID, слабые det, OBB→AABB трекается, CMC-панорама 8px/кадр).
 - Dockerfile: COPY tracker.py reid.py. knowledge: onnxruntime грузит скачанный osnet (CPU) — проверено.
 
+### Трекинг: Фаза 2 ReID (2026-10-24)
+- **ТЕСТИРОВАННЫЙ КОНТРОЛЬ ЛИЦЕНЗИИ**: ultralytics-пакет = **AGPL-3.0** (метаданные pypi-колеса 8.4.182
+  подтверждают: `License: AGPL-3.0`). Встроенные трекеры ultralytics нам НЕЛЬЗЯ копировать — привяжет
+  весь percept-сервис к AGPL (то же правило, что с boxmot). Режим: читать как референс в convert-контейнере,
+  свой код писать по статьям. Прод-образ остаётся БЕЗ torch/ultralytics.
+- **`convert/reid_rknn.py` — конвертер ONNX→RKNN** (env `REID_QUANT=int8|fp16`,
+  `REID_CALIB_SRC=/app/video/people.mp4` — РЕАЛЬНАЯ калибровка кропами из видео, иначе `.npy`
+  (16,3,256,128)); зеркали mkdir; запуск:
+  `docker compose -f convert/docker-compose.yml run --rm -v ./video:/app/video:ro --entrypoint python3 convert /app/convert/reid_rknn.py`
+- **Результаты NPU-osnet (RK3588, percept-percept:latest, полный /dev)**:
+  - fp16 RKNN: 135–178 мс/batch16 (была тоже сравнена с CPU ~76 мс — МЕДЛЕННЕЕ!);
+  - int8 RKNN (синт. и с РЕАЛЬНОЙ видео-калибровкой): косина vs fp32 = **0.19** на ИДЕНТИЧНЫЙ вход —
+    квантование osnet/rcnn global-conv на RKNN СЛОМАНО (меж-ID-косина 0.999 от 0.983 fp32);
+    скорость int8 67–75 мс == CPU-холостной 73–76 мс — NПУ никакого WIN не даёт.
+  - вывод: ReID на NPU не целесообразен в текущей форме: единственный жизнеспособный путь — ONNX CPU.
+- **`reid.ReidEngine` (Фаза 2)**: `backend='rknn'|'onnx'`; `embed(frame, boxes)` — кропы RGB
+  128×256 → (K,512) L2-норм; батч фиксированный 16 (паддинг+слайс); RKNN путь требует
+  `/app/model/reid/osnet_x0_25_msmt17.rknn` (конвертация отдельной командой), иначе процессов нет.
+- **Интеграция трекера + ReID**: Track._feat (EMA 0.15), фузия стоимости
+  `cost = 0.5*(1-IoU) + 0.5*(1-cos)`, гейт по фузии 0.6 (проход 1) / 0.45 (проход 2); у пар без
+  эмбеддинга — прежний IoU-гейт. Эмбеддер сбоит/отсутствует → деградация до чистого IoU (прозрачно).
+  `video_loop`: `TRACKER_REID=on` создаёт `ReidEngine()` (RKNN-маршрут), сбой → лог+работа без ReID.
+- **e2e (people.mp4)**: `TRACKER=on TRACKER_REID=on` → **fps 4.0–4.5** (embed 67–76 мс/кадр +
+  yolo-infer ~60 мс + трекер 4.7 мс: NPU-и-CPU-конкурент) vs fps 9–12 без ReID; track_id появились
+  (nid ~19 при n ~23, maxid 23–28 — рост спавнов из-за окклюзий/пересечений). По критерию ≤1 fps
+  ReID на дефолт НЕ проходит: **дефолт `TRACKER_REID` не активируется, ReID — только опция**.
+- Деградация fps при `TRACKER=on` БЕЗ ReID отсутствует (fps 9.5 == baseline).
+- После теста дефолт-деплой восстановлен: `CAM_MODE=file CAM_SOURCE=/app/video/people.mp4`,
+  TRACKER/TRACKER_REID=off.
+
 ### Next Move
+0. **Трекинг РЕАЛИЗОВАН (2026-10-24, Фазы 1+2)**: `TRACKER=on` — активная опция (fps-equal, ~2.7мс);
+   ReID (`TRACKER_REID=on`) — только опция (fps 4-4.5 из-за 67-76мс embed; NPU int8 квант сломан,
+   fp16 медленнее CPU). След. шаги по трекингу — по мере запросов: полевое сравнение LONG (флукт.
+   спавнов с/без ReID на длинных записях), возможно батарейный ONNX-CPU ReID (каденция N>1 кадров).
 1. **Полный бенчмарк yolo26n-det ЗАВЕРШЁН (2026-08-11)**: `benchmark.py --phase all --model yolo26n`.
    validate OK (58с), bench: CPU=5.2 / FP16=12.98 / INT8=17.31 / INT8-calib=17.29 fps.
    eval (5000): **onnx map50=0.5684/map50_95=0.4085**, fp16 0.5677/0.4082, int8 0.5590/0.3986,
@@ -373,6 +407,10 @@ RKNN-деплой отложен по решению пользователя. �
 
 ### Relevant Files
 - `PLAN.md` — план/статус всей работы (источник истины)
+- `tracker.py` — свой трекер (Kalman XYAH, ByteTrack-стиль 2-pass, CMC, ReID-фузия визуальных
+  эмбеддингов, сбросы по loops/смене модели); `reid.py` — ReidEngine + докачка весов osnet
+- `convert/reid_rknn.py` — конвертер osnet ONNX→RKNN (int8/fp16); практич. вывод: int8 квант сломан,
+  fp16 медленнее CPU — ReID только ONNX-CPU опция
 - `convert/templates/detect_postprocess.py` — multi-label + class-aware NMS + EVAL_PRECISE, оба формата (std + per-stride)
 - `convert/templates/obb_postprocess.py` — fast_nms (batch_probiou), multi-label, оба формата
 - `convert/templates/pose_postprocess.py` — kpts `(offset*2.0+grid-0.5)*stride`, sigmoid(cls/kpts), оба формата
