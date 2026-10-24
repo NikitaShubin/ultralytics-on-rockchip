@@ -35,6 +35,21 @@ _SOURCES: dict[str, list[str]] = {
         'osnet_x0_25_msmt17.onnx',
     ],
 }
+# Поддержанные RKNN-артефакты (первый существующий будет RKNN-дефолтом).
+# `layout` — как ReidEngine подаёт кропы в rknnlite (uint8):
+#   osnet_x1_0_market (swdee-рецепт, int8, WORKS) — NHWC,
+#   osnet_x0_25_msmt17 (первая попытка) — NCHW, но КВАНТ СЛОМАН (collapse),
+#     как fallback не используется.
+_RKNN_FILES: list[tuple[str, str]] = [
+    ('osnet_x1_0_market.rknn', 'nhwc'),
+    # ('osnet_x0_25_msmt17.rknn', 'nchw'),  # брошен: int8-квант collapse (corr 0.19)
+]
+
+# Поддержанные ONNX-артефакты (CPU-фолбэк, работает корректно).
+_ONNX_FILES: list[tuple[str, str]] = [
+    ('osnet_x0_25_msmt17.onnx', 'nchw'),
+]
+
 # Гост-размер не guardar; считается валидным файлом всё > 0.5 МБ.
 _MIN_WEIGHT_BYTES = 500_000
 
@@ -89,19 +104,22 @@ if __name__ == '__main__':
 
 
 class ReidEngine:
-    """Эмбеддинг-энкодер ReID: osnet_x0_25 (RKNN/NPU либо ONNX/CPU).
+    """Эмбеддинг-энкодер ReID (RKNN/NPU либо ONNX/CPU).
+
+    RKNN-дефолт: **osnet_x1_0_market** (маршрут swdee/go-rknnlite, int8,
+    batch16 — I 65–75 мс/batch16; качество — same-person cos 0.89–0.94,
+    different 0.55 — pairwise-corr с эталоном swdee = 1.0). У нашего int8
+    x0.25_msmt17 квант сломан (collapse, corr 0.19) → не используется.
+    RKNN-артефакт (`model/reid/osnet_x1_0_market.rknn`) создаётся:
+      docker compose -f convert/docker-compose.yml run --rm \
+          --entrypoint python3 convert /app/convert/reid_market.py
+    CPU-фолбэк: osnet_x0_25_msmt17 (ONNX, ~76 мс/batch16, скачивается
+    ensure_reid_weights()).
 
     `embed(frame, boxes)` — кропы (xyxy в координатах кадра) →
-    (K, 512) L2-нормированные эмбеддинги. Фиксированный батч 16: если боксов
-    больше — паддинг нулями и слайс; меньше — паддинг и слайс.
+    (K, 512) L2-нормированные эмбеддинги. Фиксированный батч 16.
 
-    RKNN-модель (/app/model/reid/osnet_x0_25_msmt17.rknn) создаётся:
-      docker compose -f convert/docker-compose.yml run --rm \
-          --entrypoint python3 convert /app/convert/reid_rknn.py
-    Normalization (mean/std ImageNet) запечены в RKNN; ONNX-путь делает их сам.
-
-    Цены (замеры на RK3588): batch16 = ~67–100 мс (int8/fp16 NPU) или ~76 мс
-    (CPU) — поэтому ReID по умолчанию выключен и включается env TRACKER_REID.
+    Запуск вручную: python3 reid.py  (печатает выбранный backend).
     """
 
     BATCH = 16
@@ -112,26 +130,40 @@ class ReidEngine:
         base = Path(weights_dir) if weights_dir else REID_DIR
         self._rknn_mod = None
         self._sess = None
+        self._nchw = True  # как ReidEngine.resize() кладёт кропы (NCHW по умолчанию)
         try:
             if backend == 'rknn':
                 from rknnlite.api import RKNNLite as _mod
-                self._rknn_mod = _mod
-                rknn_path = base / 'osnet_x0_25_msmt17.rknn'
-                if not rknn_path.is_file():
-                    raise FileNotFoundError(rknn_path)
+                found = None
+                for fname, layout in _RKNN_FILES:
+                    p = base / fname
+                    if p.is_file():
+                        found = (p, layout)
+                        break
+                if found is None:
+                    raise FileNotFoundError(
+                        f'нет RKNN-кандидатов в {base} (! or документация reid_market.py)')
+                rknn_path, layout = found
+                self._nchw = (layout != 'nhwc')
                 self._rk = _mod(verbose=False)
                 self._rk.load_rknn(str(rknn_path))
                 if self._rk.init_runtime():
                     raise RuntimeError('rknnlite init_runtime не прошёл')
-                log.info('ReID: RKNN NPU (osnet_x0_25)')
+                log.info('ReID: RKNN NPU (%s, %s)',
+                         rknn_path.name, 'NCHW' if self._nchw else 'NHWC')
             else:
                 import onnxruntime as ort
-                onnx_path = base / 'osnet_x0_25_msmt17.onnx'
-                if not onnx_path.is_file():
+                onnx_path = None
+                for fname, _ in _ONNX_FILES:
+                    p = base / fname
+                    if p.is_file():
+                        onnx_path = p
+                        break
+                if onnx_path is None:
                     onnx_path = Path(str(ensure_reid_weights()))
                 self._sess = ort.InferenceSession(
                     str(onnx_path), providers=['CPUExecutionProvider'])
-                log.info('ReID: ONNX CPU (osnet_x0_25)')
+                log.info('ReID: ONNX CPU (%s)', onnx_path.name)
         except Exception as exc:
             log.error('ReID: движок не поднялся (%s backend): %s', backend, exc)
             raise
@@ -142,7 +174,9 @@ class ReidEngine:
         k = min(len(boxes), self.BATCH)
         if k == 0 or frame is None:
             return [], np.zeros((0, 512), np.float32)
-        crops = np.zeros((self.BATCH, 3, 256, 128), np.uint8)
+        shape = ((self.BATCH, 3, 256, 128) if self._nchw
+                 else (self.BATCH, 256, 128, 3))
+        crops = np.zeros(shape, np.uint8)
         for i in range(k):
             x1, y1, x2, y2 = (float(v) for v in boxes[i][:4])
             h, w = frame.shape[:2]
@@ -152,7 +186,7 @@ class ReidEngine:
                 continue
             crop = cv2.cvtColor(frame[y1:y2 + 1, x1:x2 + 1], cv2.COLOR_BGR2RGB)
             crop = cv2.resize(crop, (128, 256), interpolation=cv2.INTER_LINEAR)
-            crops[i] = crop.transpose(2, 0, 1)
+            crops[i] = crop if not self._nchw else crop.transpose(2, 0, 1)
         feats = self._infer(crops)[:k]
         norm = np.linalg.norm(feats, axis=1, keepdims=True)
         return list(range(k)), feats / np.maximum(norm, 1e-9)

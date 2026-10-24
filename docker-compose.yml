@@ -54,10 +54,13 @@ services:
       - JPEG_QUALITY=${JPEG_QUALITY:-85}
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
       - MASK_FORMAT=${MASK_FORMAT:-contour}
-      # Трекинг: по умолчанию выключен (деплой работает как раньше).
-      # TRACKER=on включает; TRACKER_CMC=sof|off — компенсация движения камеры;
-      # TRACKER_REID (Фаза 2) — нейро-ReID osnet: off | on (веса докачаются в model/reid).
-      - TRACKER=${TRACKER:-off}
+      # Трекинг: включён по умолчанию (fps-нейтрален, ~0.5% кадра).
+      # TRACKER=on/off; TRACKER_CMC=sof|off — компенсация движения камеры;
+      # TRACKER_REID (Фаза 2) — нейро-ReID: on | off. RKNN-маршрут osnet_x1_0_market
+      # (int8 NPU, ~70 мс/batch16) — дефолт при наличии model/reid/osnet_x1_0_market.rknn
+      # (конвертер: convert/reid_market.py); падение → фолбэк ONNX-CPU x0.25
+      # (докачка весов reid.py). Совместимость: убрать TRACKER/TRACKER_REID=off.
+      - TRACKER=${TRACKER:-on}
       - TRACKER_CMC=${TRACKER_CMC:-sof}
-      - TRACKER_REID=${TRACKER_REID:-off}
+      - TRACKER_REID=${TRACKER_REID:-on}
     restart: unless-stopped

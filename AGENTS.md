@@ -425,11 +425,48 @@ RKNN-деплой отложен по решению пользователя. �
 - После теста дефолт-деплой восстановлен: `CAM_MODE=file CAM_SOURCE=/app/video/people.mp4`,
   TRACKER/TRACKER_REID=off.
 
+### Трекинг: Фаза 3 — рабочий int8-NPU маршрут ReID (2026-10-24)
+- **Прорыв по кейсу пользователя «поищи в интернете»**: готовые решения есть —
+  `swdee/go-rknnlite` (production-пример ReID DeepSORT на RK3588, их тест-фото с GT
+  в `go-rknnlite-data`: same-person Euclidean 0.42–0.46, different 0.68–0.87 —
+  **int8 работает нормально**) + репозиторий рецептов `swdee/go-rknnlite-build/osnet-market1501/`
+  (чекпоинт 10.4 МБ + 200 калибровочных картинок Market1501 committed). Ещё референсы:
+  `Zhou-sx/yolov5_Deepsort_rknn` (★480, прод-DeepSORT с osnet rknn) и их серия клонов.
+- **Рецепт swdee (воспроизводим раз-в-раз)**: torchreid osnet_x1_0 (num_classes=751, MIT
+  код torchreid) + чекпоинт `osnet_x1_0_market...` → статический ONNX [1,3,256,128]
+  opset 13 → RKNN int8 (`mean=[255*0.485,255*0.456,255*0.406]`, `std=[255*0.229,...]`,
+  дефолт-квант normal/channel, калибровка 200 market-картинками, `rknn_batch_size=16`).
+- **Проверка на нашем риге (swdee-тест GT кропы A1–A4/B,C,D, RK3588 NPU)**:
+  | модель | euc same | euc diff | pairwise-corr vs swdee |
+  |---|---|---|---|
+  | swdee эталон batch8 | 0.33/0.41/0.44 | 0.93/0.94/0.95 | — |
+  | наша реплика batch8 | 0.34/0.41/0.44 | 0.93/0.93/0.95 | **1.0** |
+  | наша реплика batch16 | 0.34/0.41/0.44 | 0.93/0.93/0.95 | **1.0** |
+  | наш старый int8 x0.25_msmt17 | 0.15/0.15/0.16 | 0.18/0.20/0.22 | 0.69 (collapse) |
+  **Виноват чекпоинт, а не пайплайн**: `msmt17_combineall` (ep150 amsgrad, узкие
+  активации x0.25) под int8-квантом смерти, plain **market1501 квантуется чисто**.
+- **ВНИМАНИЕ: RKNN-модель требует NHWC-вход** [B,256,128,3] uint8 (NCHW даёт
+  косы same/diff 0.86/0.85 — нет дискриминации). rknnlite принимает ОДИН стек-батч.
+- **Деплой**: `model/reid/osnet_x1_0_market.rknn` (4.7 МБ, batch16) — self-contained
+  конвертер `convert/reid_market.py` (скачал pth+картинки из GitHub, собрал onnx+rknn,
+  артефакт байт-в-байт совпал с ручной репликой). `reid.py`: RKNN-дефолт =
+  osnet_x1_0_market (NHWC), фолбэк ONNX-CPU x0.25_msmt17 (докачка, остался).
+  Старый ломаный int8 x0.25 убран из_candidates (declared в `_RKNN_FILES` комментарий-статус).
+- **e2e полевой A/B (people.mp4, 60с окно, трекер on)**: `TRACKER_REID=on` (NPU x1.0): fps
+  avg **9.99** (min 8, max 11), уникальных track_id 47 (max 46) vs baseline без ReID
+  fps **9.42** (min 6.5, max 11), unique 47 (max 47) — **fps-нейтрален** (в отличие от
+  CPU-маршрута 4.0–4.5 fps), но ID-хаос в 60с окне НЕ сокращает (спавны те же).
+  Простор по кейсу: сравнить на LONG-записи, возможно tune порогов cost-гейтов
+  (эмбеддинг x1.0 market: same-person cos 0.89–0.94, diff 0.55).
+- **Дефолт compose changed (решение пользователя)**: `TRACKER=on` И `TRACKER_REID=on`
+  — «пусть будет по дефолту, полезность решим по метрикам». Откат: env
+  `TRACKER=off` / `TRACKER_REID=off`.
+
 ### Next Move
-0. **Трекинг РЕАЛИЗОВАН (2026-10-24, Фазы 1+2)**: `TRACKER=on` — активная опция (fps-equal, ~2.7мс);
-   ReID (`TRACKER_REID=on`) — только опция (fps 4-4.5 из-за 67-76мс embed; NPU int8 квант сломан,
-   fp16 медленнее CPU). След. шаги по трекингу — по мере запросов: полевое сравнение LONG (флукт.
-   спавнов с/без ReID на длинных записях), возможно батарейный ONNX-CPU ReID (каденция N>1 кадров).
+0. **Трекинг: Фазы 1–3 — NPU-ReID маршрут РАБОТАЕТ** (fps-equal, int8 NPU corr 1.0 к эталону
+   swdee). Дефолт compose: TRACKER=on + TRACKER_REID=on. Открыто: полевая LONG-оценка
+   полезности ReID (ID-спавны/пере-распознавание окклюзий) на длинной записи + возможно
+   пороги фузии; откат TRACKER_REID=off, если метрик пользы нет.
 1. **Полный бенчмарк yolo26n-det ЗАВЕРШЁН (2026-08-11)**: `benchmark.py --phase all --model yolo26n`.
    validate OK (58с), bench: CPU=5.2 / FP16=12.98 / INT8=17.31 / INT8-calib=17.29 fps.
    eval (5000): **onnx map50=0.5684/map50_95=0.4085**, fp16 0.5677/0.4082, int8 0.5590/0.3986,
@@ -451,9 +488,11 @@ RKNN-деплой отложен по решению пользователя. �
 ### Relevant Files
 - `PLAN.md` — план/статус всей работы (источник истины)
 - `tracker.py` — свой трекер (Kalman XYAH, ByteTrack-стиль 2-pass, CMC, ReID-фузия визуальных
-  эмбеддингов, сбросы по loops/смене модели); `reid.py` — ReidEngine + докачка весов osnet
-- `convert/reid_rknn.py` — конвертер osnet ONNX→RKNN (int8/fp16); практич. вывод: int8 квант сломан,
-  fp16 медленнее CPU — ReID только ONNX-CPU опция
+  эмбеддингов, сбросы по loops/смене модели); `reid.py` — ReidEngine (RKNN osnet_x1_0_market
+  NHWC-дефолт) + докачка весов osnet ONNX
+- `convert/reid_market.py` — self-contained конвертер рабочего ReID-маршрута
+  (osnet_x1_0_market → RKNN int8 batch16 по рецепту swdee); `convert/reid_rknn.py` —
+  старый конвертер osnet_x0.25/msmt (int8 квант сломан, остаётся для истории/env-knobs)
 - `convert/templates/detect_postprocess.py` — multi-label + class-aware NMS + EVAL_PRECISE, оба формата (std + per-stride)
 - `convert/templates/obb_postprocess.py` — fast_nms (batch_probiou), multi-label, оба формата
 - `convert/templates/pose_postprocess.py` — kpts `(offset*2.0+grid-0.5)*stride`, sigmoid(cls/kpts), оба формата
