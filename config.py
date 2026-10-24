@@ -59,6 +59,12 @@ class Config:
         self.cam_resolution: str = os.environ.get('CAM_RESOLUTION', 'model')
         self.cam_source: str = os.environ.get('CAM_SOURCE', '')
         self.cam_fps: int = int(os.environ.get('CAM_FPS', '30'))
+        # Трекинг (по умолчанию выключен — деплой работает без него):
+        # TRACKER=on|off; TRACKER_CMC — компенсация движения камеры sof|off;
+        # TRACKER_REID — нейро-ReID (osnet, RKNN/ONNX), Фаза 2: off now.
+        self.tracker: str = os.environ.get('TRACKER', 'off')
+        self.tracker_cmc: str = os.environ.get('TRACKER_CMC', 'sof')
+        self.tracker_reid: str = os.environ.get('TRACKER_REID', 'off')
         self.model_dir: str = os.environ.get('MODEL_DIR', '/app/model')
         self.host: str = os.environ.get('HOST', '0.0.0.0')
         self.port: int = int(os.environ.get('PORT', '5000'))
@@ -109,6 +115,18 @@ class Config:
         )
         parser.add_argument('--cam-source', default=cfg.cam_source)
         parser.add_argument('--cam-fps', type=int, default=cfg.cam_fps)
+        parser.add_argument(
+            '--tracker',
+            choices=['off', 'on'],
+            default=cfg.tracker,
+            help='трекинг объектов (по умолчанию off — поведения не меняем)',
+        )
+        parser.add_argument(
+            '--tracker-cmc',
+            choices=['sof', 'off'],
+            default=cfg.tracker_cmc,
+            help='компенсация движения камеры при трекинге (LK-поток)',
+        )
         parser.add_argument('--model-dir', default=cfg.model_dir)
         parser.add_argument('--host', default=cfg.host)
         parser.add_argument('--port', type=int, default=cfg.port)
@@ -130,6 +148,8 @@ class Config:
         cfg.cam_resolution = args.cam_resolution
         cfg.cam_source = args.cam_source
         cfg.cam_fps = args.cam_fps
+        cfg.tracker = args.tracker
+        cfg.tracker_cmc = args.tracker_cmc
         cfg.model_dir = args.model_dir
         cfg.host = args.host
         cfg.port = args.port

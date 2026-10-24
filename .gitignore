@@ -102,3 +102,6 @@ overclock/oc_state.conf
 
 # Тестовые видео (замена камеры, not in git)
 video/
+
+# ReID-веса (докачиваются reid.py по требованию)
+model/reid/

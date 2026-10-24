@@ -6,5 +6,6 @@ onnxruntime
 websockets
 pypylon
 pillow
+scipy
 ruff
 mypy

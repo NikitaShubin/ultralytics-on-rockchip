@@ -12,9 +12,11 @@ if TYPE_CHECKING:
     from collections.abc import Callable
 
 import cv2
+import numpy as np
 
 from camera_source import CameraManager
 from detector_frame import DetectorFrame
+from tracker import Tracker
 
 if TYPE_CHECKING:
     from config import Config
@@ -37,6 +39,10 @@ class VideoLoop:
     _fps: float = 0.0
     _err_ts: float = 0.0
     _err_count: int = 0
+    _trk_err_ts: float = 0.0
+    _trk_err_count: int = 0
+    _tracker: Tracker | None = None
+    _track_sig: tuple | None = None
 
     def register_consumer(self, cb: Callable[[DetectorFrame], None]) -> None:
         """Регистрация callback для получения каждого обработанного кадра."""
@@ -52,6 +58,12 @@ class VideoLoop:
             resolution_mode=self.config.cam_resolution,
             target_size=self.pipeline.input_size,
         )
+        # Трекер создаётся только при TRACKER != off: дефолт-деплой не меняется.
+        self._tracker = (Tracker(cmc=self.config.tracker_cmc)
+                         if self.config.tracker == 'on' else None)
+        self._track_sig = None
+        if self._tracker is not None:
+            log.info('трекер включён (CMC=%s)', self.config.tracker_cmc)
         self._running = True
         while self._running:
             if not self._cam.open():
@@ -85,6 +97,7 @@ class VideoLoop:
                               self._frame_id, self._err_count, exc, exc_info=True)
                     self._err_ts = now
                 objects = []
+            self._update_tracks(objects, frame)
             total_ms = (time.monotonic() - process_start) * 1000
             self._update_fps()
 
@@ -106,6 +119,31 @@ class VideoLoop:
             for cb in self.consumers:
                 cb(det_frame)
             await asyncio.sleep(0)
+
+    def _update_tracks(self, objects: list, frame: 'cv2.MatLike | np.ndarray') -> None:
+        """Ассоциация треков с текущими объектами (если TRACKER=on).
+
+        Сброс трекера при: смене/переоткрытии источника, зацикливании
+        видеофайла (склейка = скачок сцены), смене модели до reload'а.
+        Ошибка трекера изолируется тем же образом, что и постпроцесс.
+        """
+        if self._tracker is None:
+            return
+        sig = (self._cam.name if self._cam else '',
+               self._cam.loops if self._cam else 0,
+               self.pipeline.model_name)
+        if sig != self._track_sig:
+            self._tracker.reset()
+            self._track_sig = sig
+        try:
+            self._tracker.update(objects, frame)
+        except Exception as exc:
+            self._trk_err_count += 1
+            now = time.monotonic()
+            if now - self._trk_err_ts > 5.0:
+                log.error('ошибка трекера кадра #%d (всего за окно: %d): %s',
+                          self._frame_id, self._trk_err_count, exc, exc_info=True)
+                self._trk_err_ts = now
 
     def _update_fps(self) -> None:
         """Обновление скользящего FPS (окно 2 секунды)."""

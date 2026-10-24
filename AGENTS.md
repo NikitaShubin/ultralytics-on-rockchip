@@ -329,6 +329,29 @@ RKNN-деплой отложен по решению пользователя. �
   sem (int8-calib конвертация + eval/fps int8). Ночной прогон — `bash /tmp/phase5.sh` в tmux-сессии `eval`,
   лог `/tmp/phase5_all.log`.
 
+### Трекинг объектов (2026-10-24, Фаза 1)
+- **`tracker.py` — свой трекер** (boxmot НЕ используется — только референс; AGPL снимается):
+  Kalman XYAH на numpy + двухпроходная ассоциация (ByteTrack-стиль: высокий conf ≥0.5 → треки,
+  затем слабые 0.1–0.5 → свободные треки; новые треки только из уверенных), класс-консистентность,
+  Hungarian = scipy.optimize.linear_sum_assignment (scipy добавлен в requirements прод-образа).
+  CMC (компенсация движения камеры, вкл по умолчанию при TRACKER=on): cv2 LK-поток +
+  estimateAffinePartial2D (RANSAC) на даунскейле 320px → аффинный сдвиг mean треков до предсказания.
+  Реализация по статьям ByteTrack/Bot-SORT, не copy-paste.
+- **Дефолт деплоя не изменился**: `TRACKER=off` (env/CLI `--tracker on|off`, `TRACKER_CMC=sof|off`).
+  Трекер живёт в `video_loop._update_tracks` после `pipeline.detect` — постпроцессы/eval-контракт не тронуты.
+  Сбросы: зацикливание FileSource (`FileSource.loops`/`CameraManager.loops`), смена модели,
+  переоткрытие источника. Ошибка трекера изолирована try/except (асобыный rate-limited лог), не убивает поток.
+- **UI**: `templates/index.html` — `colorForTrack` (золотой угол HSL) + `#id` в лейбле при наличии
+  track_id; без трекера — прежний цвет по классу.
+- **`reid.py` — докачка весов по требованию (ultralytics-стиль)**: osnet_x0_25_msmt17 ONNX (907КБ, HF
+  `anriha/osnet_x0_25_msmt17`) → `model/reid/` (compose: вложенный rw-маунт; в гит НЕ кладётся,
+  `.gitignore` `model/reid/`), атомарно (.part → rename), зеркало env `TRACKER_REID_URL`.
+  ONNX фиксированный батч **[16,3,256,128] → (16,512)** — годится сразу под RKNN-конверсию (Фаза 2).
+- Замеры (RK3588): `Tracker.update()` 25 объектов/720p — **2.7 мс** ядро, **4.7 мс** с CMC (~5% кадра
+  @11fps); e2e fps 11–12 == baseline без трекера; юнит-тесты/усечённые синтетические — все пройдены
+  (ID стабильны, окклюзия 5 кадров удерживает ID, слабые det, OBB→AABB трекается, CMC-панорама 8px/кадр).
+- Dockerfile: COPY tracker.py reid.py. knowledge: onnxruntime грузит скачанный osnet (CPU) — проверено.
+
 ### Next Move
 1. **Полный бенчмарк yolo26n-det ЗАВЕРШЁН (2026-08-11)**: `benchmark.py --phase all --model yolo26n`.
    validate OK (58с), bench: CPU=5.2 / FP16=12.98 / INT8=17.31 / INT8-calib=17.29 fps.

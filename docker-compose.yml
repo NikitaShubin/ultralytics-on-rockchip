@@ -18,6 +18,8 @@ services:
       - /usr/lib/librknnrt.so:/usr/lib/librknnrt.so
       - /proc/device-tree/compatible:/proc/device-tree/compatible:ro
       - ./model:/app/model:ro
+      # ReID-веса докачиваются кодом (reid.py) по требованию — не в гите.
+      - ./model/reid:/app/model/reid
       - ./test:/app/test:rw
       - ./percept:/app/percept:ro
       - ./main.py:/app/main.py
@@ -27,6 +29,8 @@ services:
       - ./config.py:/app/config.py
       - ./camera_source.py:/app/camera_source.py
       - ./video_loop.py:/app/video_loop.py
+      - ./tracker.py:/app/tracker.py
+      - ./reid.py:/app/reid.py
       - ./websocket_server.py:/app/websocket_server.py
       - ./templates:/app/templates:ro
       - ./benchmark:/app/benchmark:rw
@@ -50,4 +54,10 @@ services:
       - JPEG_QUALITY=${JPEG_QUALITY:-85}
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
       - MASK_FORMAT=${MASK_FORMAT:-contour}
+      # Трекинг: по умолчанию выключен (деплой работает как раньше).
+      # TRACKER=on включает; TRACKER_CMC=sof|off — компенсация движения камеры;
+      # TRACKER_REID (Фаза 2) — нейро-ReID osnet: off | on (веса докачаются в model/reid).
+      - TRACKER=${TRACKER:-off}
+      - TRACKER_CMC=${TRACKER_CMC:-sof}
+      - TRACKER_REID=${TRACKER_REID:-off}
     restart: unless-stopped

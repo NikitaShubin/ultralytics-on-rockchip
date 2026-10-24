@@ -422,10 +422,12 @@ class FileSource(CameraSource):
 
     def __init__(self, path: str) -> None:
         self.path = path
+        self.loops = 0  # число зацикливаний (для сброса трекера на склейке)
         self._cap: cv2.VideoCapture | None = None
 
     def open(self) -> bool:
         """Открыть видеофайл."""
+        self.loops = 0
         self._cap = cv2.VideoCapture(self.path)
         if not self._cap.isOpened():
             return False
@@ -439,6 +441,7 @@ class FileSource(CameraSource):
         ret, frame = self._cap.read()
         if not ret:
             self._cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+            self.loops += 1
             ret, frame = self._cap.read()
         return frame if ret else None
 
@@ -634,3 +637,8 @@ class CameraManager:
     @property
     def name(self) -> str:
         return self._source.name if self._source else 'disconnected'
+
+    @property
+    def loops(self) -> int:
+        """Счётчик зацикливаний источника (только FileSource, иначе 0)."""
+        return getattr(self._source, 'loops', 0) if self._source else 0

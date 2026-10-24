@@ -53,6 +53,12 @@ function colorForClass(cls) {
   return colorCache[cls];
 }
 
+// Палитра по track_id: золотой угол по HSL — соседние ID визуально различимы.
+function colorForTrack(tid) {
+  const hue = (tid * 137.508) % 360;
+  return `hsl(${hue.toFixed(1)}, 90%, 55%)`;
+}
+
 const canvas = document.getElementById('c');
 const ctx = canvas.getContext('2d');
 const info = document.getElementById('info');
@@ -125,8 +131,10 @@ function updateClientFps() {
 }
 
 function drawObject(obj, idx) {
-  const color = colorForClass(obj.class_name || '');
-  const label = `${obj.class_name || ''} ${(obj.score || 0).toFixed(2)}`;
+  // С трекером: цвет по track_id (устойчивый к смене класса детекции), ID в лейбле.
+  const hasTrack = obj.track_id !== undefined;
+  const color = hasTrack ? colorForTrack(obj.track_id) : colorForClass(obj.class_name || '');
+  const label = `${obj.class_name || ''} ${(obj.score || 0).toFixed(2)}${hasTrack ? ' #' + obj.track_id : ''}`;
   // Толщины и размеры шрифтов задаём в css-пикселях: делим на масштаб,
   // чтобы разметка выглядела одинаково при любом разрешении кадра.
   const px = (v) => v / viewScale;
