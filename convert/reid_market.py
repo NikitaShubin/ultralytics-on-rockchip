@@ -23,8 +23,8 @@ import urllib.request
 from pathlib import Path
 
 ROOT = Path('/app/convert')
-REID_DIR = ROOT.parent / 'model' / 'reid'
-OUT_RKNN = REID_DIR / 'osnet_x1_0_market.rknn'
+# Хостовый model/reid биндится в convert-контейнер как /app/convert/model/reid.
+REID_DIR = ROOT / 'model' / 'reid'
 WORK = Path(os.environ.get('REID_WORK_DIR', '/tmp/reid_market_work'))
 PTH = 'osnet_x1_0_market_256x128_amsgrad_ep150_stp60_lr0.0015_b64_fb10_softmax_labelsmooth_flip.pth'
 PTH_URL = ('https://raw.githubusercontent.com/swdee/go-rknnlite-build/master/'
@@ -80,7 +80,10 @@ def build_onnx() -> Path:
 def convert_rknn(onnx: Path) -> Path:
     from rknn.api import RKNN
 
-    rknn_out = WORK / 'osnet_x1_0_market.rknn'
+    quant = os.environ.get('REID_QUANT', 'int8').lower()
+    do_quant = (quant == 'int8')
+    suffix = '' if do_quant else f'_{quant}'
+    rknn_out = WORK / f'osnet_x1_0_market{suffix}.rknn'
     rk = RKNN(verbose=False)
     ret = rk.config(mean_values=[[255*0.485, 255*0.456, 255*0.406]],
                     std_values=[[255*0.229, 255*0.224, 255*0.225]],
@@ -89,21 +92,26 @@ def convert_rknn(onnx: Path) -> Path:
     ret = rk.load_onnx(model=str(onnx))
     assert ret == 0, ret
     batch = int(os.environ.get('REID_BATCH', '16'))
-    ret = rk.build(do_quantization=True, dataset=str(WORK / 'subset.txt'),
+    ret = rk.build(do_quantization=do_quant,
+                   dataset=str(WORK / 'subset.txt') if do_quant else None,
                    rknn_batch_size=batch)
     assert ret == 0, ret
     ret = rk.export_rknn(str(rknn_out))
     assert ret == 0, ret
     rk.release()
-    print(f'RKNN собран: {rknn_out} (batch={batch})')
+    print(f'RKNN собран: {rknn_out} (batch={batch}, {quant})')
     return rknn_out
 
 
 def main() -> None:
+    quant = os.environ.get('REID_QUANT', 'int8').lower()
+    suffix = '' if quant == 'int8' else f'_{quant}'
+    out = REID_DIR / f'osnet_x1_0_market{suffix}.rknn'
     REID_DIR.mkdir(parents=True, exist_ok=True)
     WORK.mkdir(parents=True, exist_ok=True)
-    if OUT_RKNN.is_file():
-        print(f'уже на месте: {OUT_RKNN}')
+    if out.is_file():
+        print(f'уже на месте: {out}')
+        onnx_done()
         return
     _fetch(OSNET_URL, WORK / 'torchreid_osnet.py')
     _fetch(PTH_URL, WORK / PTH)
@@ -128,8 +136,12 @@ def main() -> None:
 
     onnx = build_onnx()
     rknn = convert_rknn(onnx)
-    OUT_RKNN.write_bytes(rknn.read_bytes())
-    print(f'установлен: {OUT_RKNN} ({OUT_RKNN.stat().st_size} Б)')
+    out.write_bytes(rknn.read_bytes())
+    print(f'установлен: {out} ({out.stat().st_size} Б)')
+
+
+def onnx_done() -> None:
+    print('online weights уже есть, пропускаю сборку')
 
 
 if __name__ == '__main__':

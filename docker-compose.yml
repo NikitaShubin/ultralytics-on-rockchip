@@ -63,4 +63,7 @@ services:
       - TRACKER=${TRACKER:-on}
       - TRACKER_CMC=${TRACKER_CMC:-sof}
       - TRACKER_REID=${TRACKER_REID:-on}
+      # Переопределение RKNN-файла ReID (имя в model/reid/ или абсолютный путь);
+      # пусто = дефолт по reid.py.
+      - TRACKER_REID_RKNN=${TRACKER_REID_RKNN:-}
     restart: unless-stopped

@@ -448,16 +448,42 @@ RKNN-деплой отложен по решению пользователя. �
 - **ВНИМАНИЕ: RKNN-модель требует NHWC-вход** [B,256,128,3] uint8 (NCHW даёт
   косы same/diff 0.86/0.85 — нет дискриминации). rknnlite принимает ОДИН стек-батч.
 - **Деплой**: `model/reid/osnet_x1_0_market.rknn` (4.7 МБ, batch16) — self-contained
-  конвертер `convert/reid_market.py` (скачал pth+картинки из GitHub, собрал onnx+rknn,
-  артефакт байт-в-байт совпал с ручной репликой). `reid.py`: RKNN-дефолт =
-  osnet_x1_0_market (NHWC), фолбэк ONNX-CPU x0.25_msmt17 (докачка, остался).
-  Старый ломаный int8 x0.25 убран из_candidates (declared в `_RKNN_FILES` комментарий-статус).
+  конвертер `convert/reid_market.py` (скачал pth+картинки из GitHub, собрал onnx+rknn;
+  md5 артефакта НЕ стабилен — rknn-компилятор недетерминирован, функциональная
+  эквивалентность проверена: pairwise-corr 1.0 против эталона swdee). `reid.py`:
+  RKNN-дефолт = osnet_x1_0_market (NHWC), фолбэк ONNX-CPU x0.25_msmt17 (докачка,
+  остался); env `TRACKER_REID_RKNN` переопределяет RKNN-файл (имя в model/reid/ или
+  абсолютный путь). Старый ломаный int8 x0.25 убран из кандидатов
+  (declared в `_RKNN_FILES` комментарий-статус). `convert/reid_market.py` теперь
+  поддерживает env `REID_QUANT=fp16` (fp16-вариант `osnet_x1_0_market_fp16.rknn`,
+  6.9 МБ, ~193 мс/b16, качество даже чуть лучше int8); файлы model/reid root-owned —
+  копировать/убирать только из-под docker.
 - **e2e полевой A/B (people.mp4, 60с окно, трекер on)**: `TRACKER_REID=on` (NPU x1.0): fps
   avg **9.99** (min 8, max 11), уникальных track_id 47 (max 46) vs baseline без ReID
   fps **9.42** (min 6.5, max 11), unique 47 (max 47) — **fps-нейтрален** (в отличие от
   CPU-маршрута 4.0–4.5 fps), но ID-хаос в 60с окне НЕ сокращает (спавны те же).
   Простор по кейсу: сравнить на LONG-записи, возможно tune порогов cost-гейтов
   (эмбеддинг x1.0 market: same-person cos 0.89–0.94, diff 0.55).
+- **Матрица fps (yolo26n-seg, people.mp4 e2e, 60-с окна, ~20-26 персон, 2026-10-24)**:
+  | YOLO | ReID | трекер | CMC | fps avg | fps med |
+  |---|---|---|---|---|---|
+  | fp16 | — | off | — | 6.48 | 6.5 |
+  | fp16 | — | on | sof | 6.11 | 6.0 |
+  | fp16 | fp16 | on | sof | 5.88 | 6.0 |
+  | fp16 | int8 | on | sof | 6.14 | 6.0 |
+  | int8 | — | off | — | 8.18 | 8.0 |
+  | int8 | — | on | sof | 7.27 | 7.0 |
+  | int8 | int8 | on | sof | 6.87 | 7.0 |
+  | fp16 | — | on | off | 6.31 | 6.5 |
+  | fp16 | int8 | on | off | 6.23 | 6.0 |
+  | int8 | — | on | off | 7.92 | 8.0 |
+  | int8 | int8 | on | off | 7.27 | 7.0 |
+  Опоры: bench без трекера fp16 6.94 / int8 8.06 (совпадает с №№1/5); вклад ReID-int8
+  ~0-0.4 fps (шум), ReID-fp16 до −0.4; трекер −0.4-0.9; int8-YOLO +1.7-1.7 сег-постпроцесс
+  критичен. ReID-NPU не проходит полезность в этой coverage (спавны не сокращает).
+- **CMC on PEOPLE.MP4 (стабильный фон)**: `TRACKER_CMC=off` стабильно быстрее
+  (+0.4…+0.65 fps int8-конфиги, шум на fp16); CMC (LK-поток+RANSAC ~45-60 мс/кадр)
+  полезен только при дрожащей камере; для стационара держать `TRACKER_CMC=off`.
 - **Дефолт compose changed (решение пользователя)**: `TRACKER=on` И `TRACKER_REID=on`
   — «пусть будет по дефолту, полезность решим по метрикам». Откат: env
   `TRACKER=off` / `TRACKER_REID=off`.
@@ -466,7 +492,8 @@ RKNN-деплой отложен по решению пользователя. �
 0. **Трекинг: Фазы 1–3 — NPU-ReID маршрут РАБОТАЕТ** (fps-equal, int8 NPU corr 1.0 к эталону
    swdee). Дефолт compose: TRACKER=on + TRACKER_REID=on. Открыто: полевая LONG-оценка
    полезности ReID (ID-спавны/пере-распознавание окклюзий) на длинной записи + возможно
-   пороги фузии; откат TRACKER_REID=off, если метрик пользы нет.
+   пороги фузии; откат TRACKER_REID=off, если метрик пользы нет. Статический фон →
+   рассмотреть дефолт TRACKER_CMC=off (env при дрожащих камерах).
 1. **Полный бенчмарк yolo26n-det ЗАВЕРШЁН (2026-08-11)**: `benchmark.py --phase all --model yolo26n`.
    validate OK (58с), bench: CPU=5.2 / FP16=12.98 / INT8=17.31 / INT8-calib=17.29 fps.
    eval (5000): **onnx map50=0.5684/map50_95=0.4085**, fp16 0.5677/0.4082, int8 0.5590/0.3986,

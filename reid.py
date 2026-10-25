@@ -135,11 +135,24 @@ class ReidEngine:
             if backend == 'rknn':
                 from rknnlite.api import RKNNLite as _mod
                 found = None
-                for fname, layout in _RKNN_FILES:
-                    p = base / fname
+                override = os.environ.get('TRACKER_REID_RKNN', '')
+                if override:
+                    p = Path(override)
+                    if not p.is_absolute():
+                        p = base / p
+                    if p.suffix == '':
+                        p = p.with_suffix('.rknn')
                     if p.is_file():
-                        found = (p, layout)
-                        break
+                        found = (p, 'nhwc')
+                    else:
+                        raise FileNotFoundError(
+                            f'TRACKER_REID_RKNN указан, но файла нет: {p}')
+                if found is None:
+                    for fname, layout in _RKNN_FILES:
+                        p = base / fname
+                        if p.is_file():
+                            found = (p, layout)
+                            break
                 if found is None:
                     raise FileNotFoundError(
                         f'нет RKNN-кандидатов в {base} (! or документация reid_market.py)')
