@@ -488,12 +488,43 @@ RKNN-деплой отложен по решению пользователя. �
   — «пусть будет по дефолту, полезность решим по метрикам». Откат: env
   `TRACKER=off` / `TRACKER_REID=off`.
 
+### Трекинг: Фаза 4 — ByteTrack-расширения (2026-10-26)
+- **Понижение порога детекции `TRACKER_CONF`** (дефолт 0.25 = без понижения):
+  трекер клиента (ByteTrack-стиль) умеет удерживать ID слабыми детекциями
+  (0.1–0.5) — но детекции до CONF 0.25 из постпроцесса не выходят: слабые
+  «молодые» объекты отвалантаны детектором. При env `TRACKER_CONF=0.1..0.24`
+  постпроцесс-модуль патчится runtime (`CONF_THRESH=v` в `sys.modules[
+  'postprocess_mod']`, idempotent каждый кадр перед detect в
+  `video_loop._ensure_conf()`), а слабые unmatched после ассоциации
+  скрываются из API (`video_loop._apply_conf`) — спавнят треки только
+  ≥TRACK_HIGH (0.5); «ложняки» (unmatched низкие) не видны и не спавнят.
+- **Coast (уход в прогноз)**: трекер и ТАК живёт без ассоциации до
+  `MAX_AGE=30` кадров (Kalman продолжает предсказывать) — новые env-кнобы:
+  `TRACKER_MAX_AGE` (дефолт 30) и `TRACKER_COAST=on|off` (деф. off) — при on
+  lost-треки добавляются в объекты кадра (`_emit_lost` в tracker.py):
+  `{bbox(прогноз), score, class_id/class_name, track_id, lost:true, trail}`.
+  Прокидывается в UI: пунктирный bbox + «(lost)» в подписи.
+- **Хвосты траекторий `TRACKER_TRAILS=on|off`** (деф. off): Track хранит
+  deque центров bbox (maxlen TRAIL_LEN=24) — объекту в API добавляется
+  `trail: [[x,y]...]`; на фронте рисуется линия (цвет по track_id, alpha
+  0.55). Trail живёт и на coast-треках (догоняется прогнозом).
+- Реализация: `Tracker(cmc, max_age, trails, coast)`, фильтр слабых после
+  ассоциации — в `video_loop._update_tracks`, `DETECT_DEFAULT_CONF=0.25`
+  (конф. в video_loop; CONF байтится в постпроцессе от конвертера).
+- Проверено (live-камера yolo26n fp16 + TRACKER_CONF=0.15 + trails + coast):
+  fps 11.29 (vs baseline CMC=sof 10.69 — σв рамках шума), trail до 24 точек,
+  lost-треки (skateboard/car score 0.21) рисуются пунктиром по прогнозу.
+- compose прокидывает env: TRACKER_CONF/TRACKER_MAX_AGE/TRACKER_COAST/
+  TRACKER_TRAILS (дефолт = старое поведение, деплой не меняется).
+
 ### Next Move
-0. **Трекинг: Фазы 1–3 — NPU-ReID маршрут РАБОТАЕТ** (fps-equal, int8 NPU corr 1.0 к эталону
+0. **Трекинг: Фазы 1–4 — NPU-ReID маршрут РАБОТАЕТ** (fps-equal, int8 NPU corr 1.0 к эталону
    swdee). Дефолт compose: TRACKER=on + TRACKER_REID=on. Открыто: полевая LONG-оценка
    полезности ReID (ID-спавны/пере-распознавание окклюзий) на длинной записи + возможно
    пороги фузии; откат TRACKER_REID=off, если метрик пользы нет. Статический фон →
-   рассмотреть дефолт TRACKER_CMC=off (env при дрожащих камерах).
+   рассмотреть дефолт TRACKER_CMC=off (env при дрожащих камерах). Фаза 4 добавила
+   ByteTrack-кнобы (TRACKER_CONF/MAX_AGE/COAST/TRAILS) — зубрить long-валидацию на
+   живой камере (trails/coast в реальных сценариях отклика пользователя).
 1. **Полный бенчмарк yolo26n-det ЗАВЕРШЁН (2026-08-11)**: `benchmark.py --phase all --model yolo26n`.
    validate OK (58с), bench: CPU=5.2 / FP16=12.98 / INT8=17.31 / INT8-calib=17.29 fps.
    eval (5000): **onnx map50=0.5684/map50_95=0.4085**, fp16 0.5677/0.4082, int8 0.5590/0.3986,
@@ -515,7 +546,8 @@ RKNN-деплой отложен по решению пользователя. �
 ### Relevant Files
 - `PLAN.md` — план/статус всей работы (источник истины)
 - `tracker.py` — свой трекер (Kalman XYAH, ByteTrack-стиль 2-pass, CMC, ReID-фузия визуальных
-  эмбеддингов, сбросы по loops/смене модели); `reid.py` — ReidEngine (RKNN osnet_x1_0_market
+  эмбеддингов, сбросы по loops/смене модели, Фаза 4: coast/lost-треки + trail-хвосты);
+  `reid.py` — ReidEngine (RKNN osnet_x1_0_market
   NHWC-дефолт) + докачка весов osnet ONNX
 - `convert/reid_market.py` — self-contained конвертер рабочего ReID-маршрута
   (osnet_x1_0_market → RKNN int8 batch16 по рецепту swdee); `convert/reid_rknn.py` —

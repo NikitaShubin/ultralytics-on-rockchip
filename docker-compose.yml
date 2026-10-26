@@ -63,6 +63,16 @@ services:
       - TRACKER=${TRACKER:-on}
       - TRACKER_CMC=${TRACKER_CMC:-sof}
       - TRACKER_REID=${TRACKER_REID:-on}
+      # Порог детекции при трекере (ByteTrack): < 0.5 включает понижение —
+      # слабые детекции не спавнят треки, но живят существующие ID, а
+      # unmatched не отображаются (ложняки отсеиваются трекером).
+      - TRACKER_CONF=${TRACKER_CONF:-0.25}
+      # Сколько кадров трек «уходит в прогноз» Kalman без ассоциации.
+      - TRACKER_MAX_AGE=${TRACKER_MAX_AGE:-30}
+      # Визуализация lost-треков (пунктир по прогнозу Kalman).
+      - TRACKER_COAST=${TRACKER_COAST:-off}
+      # Хвосты траекторий (TRACKER_TRAILS=on) — линия центров bbox.
+      - TRACKER_TRAILS=${TRACKER_TRAILS:-off}
       # Переопределение RKNN-файла ReID (имя в model/reid/ или абсолютный путь);
       # пусто = дефолт по reid.py.
       - TRACKER_REID_RKNN=${TRACKER_REID_RKNN:-}

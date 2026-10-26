@@ -181,11 +181,28 @@ function drawObject(obj, idx) {
     ctx.restore();
   }
 
+  // Хвост траектории (TRACKER_TRAILS=on): линия по центрам bbox,
+  // в тон уровня использованного цвета трека (цвета по track_id).
+  if (obj.trail && obj.trail.length >= 2) {
+    ctx.save();
+    ctx.strokeStyle = color;
+    ctx.lineWidth = px(1.5);
+    ctx.globalAlpha = 0.55;
+    ctx.beginPath();
+    ctx.moveTo(obj.trail[0][0], obj.trail[0][1]);
+    for (const [cx_, cy_] of obj.trail.slice(1)) ctx.lineTo(cx_, cy_);
+    ctx.stroke();
+    ctx.restore();
+  }
+
   if (obj.bbox) {
     const [x1, y1, x2, y2] = obj.bbox;
     ctx.strokeStyle = color;
     ctx.lineWidth = px(2);
+    // Lost-трек (TRACKER_COAST=on): пунктир — Kalman-прогноз, не детекция.
+    if (obj.lost) ctx.setLineDash([6, 4]);
     ctx.strokeRect(x1, y1, x2 - x1, y2 - y1);
+    ctx.setLineDash([]);
     // Подпись всегда привязана к рамке объекта (а не к полигону маски):
     // иначе при «уехавшей» маске текст оказывается далеко от объекта.
     ctx.font = 'bold ' + px(16) + 'px sans-serif';
@@ -194,11 +211,12 @@ function drawObject(obj, idx) {
     ctx.lineWidth = px(3);
     ctx.lineJoin = 'round';
     ctx.textAlign = 'left';
+    const labelLost = obj.lost ? label + ' (lost)' : label;
     const lx = x1 + px(6);
     const ly = Math.max(px(2), y1 - px(18)) + idx * px(2);
-    ctx.strokeText(label, lx, ly);
+    ctx.strokeText(labelLost, lx, ly);
     ctx.fillStyle = '#fff';
-    ctx.fillText(label, lx, ly);
+    ctx.fillText(labelLost, lx, ly);
   }
 
   if (obj.keypoints && obj.keypoints.length > 0) {

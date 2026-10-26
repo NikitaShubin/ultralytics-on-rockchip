@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import sys
 import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
@@ -17,6 +18,9 @@ import numpy as np
 from camera_source import CameraManager
 from detector_frame import DetectorFrame
 from tracker import Tracker
+
+# Порог детекции "из коробки" (CONF_THRESH постпроцесса из конвертера).
+DETECT_DEFAULT_CONF = 0.25
 
 if TYPE_CHECKING:
     from config import Config
@@ -43,6 +47,9 @@ class VideoLoop:
     _trk_err_count: int = 0
     _tracker: Tracker | None = None
     _track_sig: tuple | None = None
+    # ByteTrack-понижение порога детекции (TRACKER_CONF): постпроцесс
+    # отдаёт детекции от _tracking_conf; unmatched ниже TRACK_HIGH скрыты.
+    _tracking_conf: float = 0.0
 
     def register_consumer(self, cb: Callable[[DetectorFrame], None]) -> None:
         """Регистрация callback для получения каждого обработанного кадра."""
@@ -59,8 +66,15 @@ class VideoLoop:
             target_size=self.pipeline.input_size,
         )
         # Трекер создаётся только при TRACKER != off: дефолт-деплой не меняется.
-        self._tracker = (Tracker(cmc=self.config.tracker_cmc)
-                         if self.config.tracker == 'on' else None)
+        self._tracker = None
+        if self.config.tracker == 'on':
+            self._tracker = Tracker(
+                cmc=self.config.tracker_cmc,
+                max_age=self.config.tracker_max_age,
+                trails=self.config.tracker_trails,
+                coast=self.config.tracker_coast,
+            )
+            self._lower_conf()
         self._track_sig = None
         if self._tracker is not None:
             log.info('трекер включён (CMC=%s)', self.config.tracker_cmc)
@@ -93,6 +107,7 @@ class VideoLoop:
             self._frame_id += 1
             process_start = time.monotonic()
             try:
+                self._ensure_conf()
                 objects, _ = self.pipeline.detect(frame)
                 if self.pipeline._semantic_mode and self.pipeline._visualize:
                     frame = self.pipeline._visualize(frame, objects)
@@ -151,6 +166,49 @@ class VideoLoop:
                 log.error('ошибка трекера кадра #%d (всего за окно: %d): %s',
                           self._frame_id, self._trk_err_count, exc, exc_info=True)
                 self._trk_err_ts = now
+        self._apply_conf(objects)
+
+    def _lower_conf(self) -> None:
+        """Понижение порога детекции под трекер (ByteTrack-стиль).
+
+        Постпроцесс-шаблон держит CONF_THRESH на уровне модуля (0.25 из
+        конвертера). При трекере это теряет «слабые» кандидаты, которые
+        способны удержать существующий ID (окклюзия/движение): разрешаем
+        отдачу с TRACKER_CONF (< 0.25) — спавнить треки они не могут
+        (гейт TRACK_HIGH), посторонние ложняки трекер отфильтрует, а
+        unmatched слабые скрываются из API (см. _apply_conf).
+        """
+        conf = self.config.tracker_conf
+        if conf > 0 and conf < DETECT_DEFAULT_CONF:
+            self._tracking_conf = conf
+            log.info('TRACKER_CONF=%.2f: понижение порога детекции (ByteTrack)', conf)
+
+    def _ensure_conf(self) -> None:
+        """Idempotent-патч CONF_THRESH модуля постпроцесса текущего кадра.
+
+        Модуль постпроцесса пересоздаётся при /reload модели (CONF_THRESH
+        сбрасывается в 0.25) — восстанавливаем понижение до детекции.
+        """
+        if not self._tracking_conf:
+            return
+        mod = sys.modules.get('postprocess_mod')
+        if mod is None:
+            return
+        cur = getattr(mod, 'CONF_THRESH', None)
+        if cur is not None and cur > self._tracking_conf:
+            mod.CONF_THRESH = self._tracking_conf
+
+    def _apply_conf(self, objects: list) -> None:
+        """Скрытие unmatched слабых детекций после ассоциации.
+
+        При пониженном пороге детекция отдаёт в трекер больше кандидатов,
+        но unmatched ниже TRACK_HIGH (0.5) — «шум»: спавнить треки они не
+        могут и в кадре не видны; трекер их использует только для
+        удержания ID. Lost-треки (TRACKER_COAST) имеют track_id — видны.
+        """
+        if self._tracking_conf and self._tracker is not None:
+            objects[:] = [o for o in objects
+                          if o.get('track_id') is not None]
 
     def _update_fps(self) -> None:
         """Обновление скользящего FPS (окно 2 секунды)."""

@@ -65,6 +65,23 @@ class Config:
         self.tracker: str = os.environ.get('TRACKER', 'off')
         self.tracker_cmc: str = os.environ.get('TRACKER_CMC', 'sof')
         self.tracker_reid: str = os.environ.get('TRACKER_REID', 'off')
+        # TRACKER_CONF — нижний порог детекции при трекере (ByteTrack-стиль:
+        # слабые детекции не спавнят треки, но живят существующие; ложняки
+        # отсеиваются трекером). Работает только при значении < TRACK_HIGH
+        # (0.5) и не выше значения постпроцесса (0.25); unmatched-детекции
+        # ниже TRACK_HIGH скрыты из API (их «видит» только трекер).
+        self.tracker_conf: float = float(os.environ.get('TRACKER_CONF', '0.25'))
+        # TRACKER_MAX_AGE — сколько кадров трек «уходит в прогноз» (Kalman
+        # продолжает экстраполировать) без ассоциации. 30 кадров ~ 1.2–3 с.
+        self.tracker_max_age: int = int(os.environ.get('TRACKER_MAX_AGE', '30'))
+        # TRACKER_COAST — отдавать lost-треки в API (пунктирный bbox по
+        # предсказанию Kalman) — визуализация объекта, временно скрытого
+        # окклюзией. При TRACKER_COAST=off lost-треки живут, но не видны.
+        self.tracker_coast: bool = os.environ.get('TRACKER_COAST', 'off') == 'on'
+        # TRACKER_TRAILS — хвосты траекторий (deque центров bbox, до 24
+        # кадров) в объектах API → рисуются на фронте.
+        self.tracker_trails: bool = (os.environ.get('TRACKER_TRAILS', 'off')
+                                     == 'on')
         self.model_dir: str = os.environ.get('MODEL_DIR', '/app/model')
         self.host: str = os.environ.get('HOST', '0.0.0.0')
         self.port: int = int(os.environ.get('PORT', '5000'))

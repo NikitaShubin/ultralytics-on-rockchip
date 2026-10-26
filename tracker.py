@@ -26,6 +26,7 @@ from typing import Callable
 
 import cv2
 import numpy as np
+from collections import deque
 from scipy.optimize import linear_sum_assignment
 
 log = logging.getLogger(__name__)
@@ -37,7 +38,12 @@ TRACK_LOW_THRESH = 0.1
 IOU_GATE_HIGH = 0.2
 IOU_GATE_LOW = 0.4
 # Кадров жизни трека без детекции (при ~10 fps это ~3 с).
+# Track «уходит в прогноз»: Kalman продолжает предсказывать позицию —
+# трак не умирает, пока объект理论上 может вернуться в кадр.
 MAX_AGE = 30
+
+# Длина хвоста траектории (центров bbox) при TRACKER_TRAILS=on.
+TRAIL_LEN = 24
 
 # Фузия IoU- и appearance-расстояния ( когда есть и то, и другое ):
 # cost = W_IOU*(1-iou) + W_REID*(1-cos).
@@ -111,10 +117,12 @@ class _KalmanXYAH:
 class _Track:
     """Один трек: Kalman-состояние + метаданные класса (+ feat ReID)."""
 
-    __slots__ = ('tid', 'mean', 'cov', 'cls', 'score', 'hits', 'age', 'feat')
+    __slots__ = ('tid', 'mean', 'cov', 'cls', 'score', 'hits', 'age', 'feat',
+                 'name', 'trail')
 
     def __init__(self, tid: int, mean: np.ndarray, cov: np.ndarray,
-                 cls: int, score: float, feat: np.ndarray | None = None) -> None:
+                 cls: int, score: float, feat: np.ndarray | None = None,
+                 name: str | None = None) -> None:
         self.tid = tid
         self.mean = mean
         self.cov = cov
@@ -123,6 +131,9 @@ class _Track:
         self.hits = 1
         self.age = 0
         self.feat = None if feat is None else feat / max(1e-9, np.linalg.norm(feat))
+        self.name = name
+        # Хвост траектории (центры bbox, старые → новые); None = отключён.
+        self.trail: deque | None = None
 
 
 class Tracker:
@@ -132,14 +143,25 @@ class Tracker:
         cmc: 'sof' — компенсация движения камеры (LK-поток + RANSAC),
              'off' — отключена (статическая камера).
         cmc_size: ширина рабочего изображения CMC (px): скорость ~ 1/размер².
+        max_age: сколько кадров трек живёт «в прогнозе» без детекций.
+        trails: копить хвосты траекторий (TRACKER_TRAILS) → obj['trail'].
+        coast: отдавать lost-треки (TRACKER_COAST) в объекты кадра.
     """
 
-    def __init__(self, cmc: str = 'sof', cmc_size: int = 320) -> None:
+    def __init__(self, cmc: str = 'sof', cmc_size: int = 320,
+                 max_age: int = MAX_AGE, trails: bool = False,
+                 coast: bool = False) -> None:
         self._kf = _KalmanXYAH()
         self._tracks: list[_Track] = []
         self._next_id = 0
         self._cmc = cmc != 'off'
         self._cmc_size = cmc_size
+        # TRACKER_MAX_AGE: сколько кадров трек остаётся «в прогнозе»
+        # (Kalman продолжает предсказывать) без ассоциации с детекцией.
+        self._max_age = max(1, int(max_age))
+        # Хвосты траекторий (TRACKER_TRAILS) и lost-треки (TRACKER_COAST).
+        self._trails = bool(trails)
+        self._coast = bool(coast)
         self._prev_gray: np.ndarray | None = None
         self._cmc_missing = 0  # подряд кадров без оценённого сдвига
         # Хук Фазы 2 (ReID): callable(frame, boxes_xyxy) → (N, D) эмбеддингов.
@@ -164,6 +186,20 @@ class Tracker:
 
         if not dets and not self._tracks:
             self._prev_gray = cur_gray
+            return
+
+        if not dets:
+            # Только потерянные треки: Kalman продолжает предсказывать,
+            # трек стареет — до max_age (TRACKER_MAX_AGE).
+            for t in self._tracks:
+                self._kf.predict(t.mean, t.cov)
+                if t.trail is not None:
+                    t.trail.append((float(t.mean[0]), float(t.mean[1])))
+                t.age += 1
+            self._tracks = [t for t in self._tracks if t.age <= self._max_age]
+            self._prev_gray = cur_gray
+            if self._coast:
+                self._emit_lost(objects)
             return
 
         # CMC до предсказания: аффинный сдвиг треков (движение камеры).
@@ -206,6 +242,13 @@ class Tracker:
                     t.feat = FEAT_EMA * det_feats[k] + (1 - FEAT_EMA) * t.feat
                 t.feat = t.feat / max(1e-9, np.linalg.norm(t.feat))
             objects[det_idx[k]]['track_id'] = t.tid
+            if t.name is None:
+                t.name = objects[det_idx[k]].get('class_name')
+            if t.trail is not None:
+                t.trail.append(((dets[k][0] + dets[k][2]) / 2.0,
+                                (dets[k][1] + dets[k][3]) / 2.0))
+                objects[det_idx[k]]['trail'] = [[float(x), float(y)]
+                                                for x, y in t.trail]
             updated.append(t)
 
         # Новые треки — только из оставшихся уверенных детекций.
@@ -215,16 +258,54 @@ class Tracker:
                 continue
             mean, cov = self._kf.initiate(_xyxy_to_xyah(np.asarray(d[:4])))
             t = _Track(self._next_id, mean, cov, int(d[5]), float(d[4]),
-                       feat=det_feats.get(k) if det_feats else None)
+                       feat=det_feats.get(k) if det_feats else None,
+                       name=objects[det_idx[k]].get('class_name'))
+            if self._trails:
+                t.trail = deque([(float((d[0] + d[2]) / 2.0),
+                                  float((d[1] + d[3]) / 2.0))],
+                                maxlen=TRAIL_LEN)
             self._next_id += 1
             self._tracks.append(t)
             objects[det_idx[k]]['track_id'] = t.tid
+            if t.trail is not None:
+                objects[det_idx[k]]['trail'] = [[float(x), float(y)]
+                                                for x, y in t.trail]
             updated.append(t)
 
         for t in self._tracks:
             if t not in updated:
                 t.age += 1
-        self._tracks = [t for t in self._tracks if t.age <= MAX_AGE]
+        self._tracks = [t for t in self._tracks if t.age <= self._max_age]
+        if self._coast:
+            self._emit_lost(objects)
+
+    def _emit_lost(self, objects: list[dict]) -> None:
+        """Lost-треки (age>0): предсказанный bbox + хвост, помечены lost.
+
+        Kalman продолжает экстраполяцию по прошлой динамике (CMC-сдвиг
+        уже применён), объект не рисуется как «real» — UI показывает его
+        пунктиром. Новые детекции не спавнятся из lost-треков.
+        """
+        updated_ids = set()
+        for t in self._tracks:
+            if t.age == 0:
+                updated_ids.add(t.tid)
+        for t in self._tracks:
+            if t.tid in updated_ids:
+                continue
+            x1, y1, x2, y2 = _xyah_to_xyxy(t.mean)
+            entry: dict = {
+                'bbox': [float(x1), float(y1), float(x2), float(y2)],
+                'score': round(float(t.score), 4),
+                'class_id': int(t.cls),
+                'track_id': t.tid,
+                'lost': True,
+            }
+            if t.name:
+                entry['class_name'] = t.name
+            if t.trail is not None and len(t.trail) >= 2:
+                entry['trail'] = [[float(x), float(y)] for x, y in t.trail]
+            objects.append(entry)
 
     # ------------------------------------------------------------- внутреннее
     @staticmethod
