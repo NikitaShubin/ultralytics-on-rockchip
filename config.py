@@ -67,10 +67,11 @@ class Config:
         self.tracker_reid: str = os.environ.get('TRACKER_REID', 'off')
         # TRACKER_CONF — нижний порог детекции при трекере (ByteTrack-стиль:
         # слабые детекции не спавнят треки, но живят существующие; ложняки
-        # отсеиваются трекером). Работает только при значении < TRACK_HIGH
-        # (0.5) и не выше значения постпроцесса (0.25); unmatched-детекции
-        # ниже TRACK_HIGH скрыты из API (их «видит» только трекер).
-        self.tracker_conf: float = float(os.environ.get('TRACKER_CONF', '0.25'))
+        # отсеиваются трекером). Дефолт 0.1 — как дефолт-трекер ultralytics
+        # (второй проход 0.1–0.5). Работает при < DETECT_DEFAULT_CONF (0.25);
+        # unmatched-детекции ниже TRACK_HIGH (0.5) скрыты из API (их видит
+        # только трекер).
+        self.tracker_conf: float = float(os.environ.get('TRACKER_CONF', '0.1'))
         # TRACKER_MAX_AGE — сколько кадров трек «уходит в прогноз» (Kalman
         # продолжает экстраполировать) без ассоциации. 30 кадров ~ 1.2–3 с.
         self.tracker_max_age: int = int(os.environ.get('TRACKER_MAX_AGE', '30'))
@@ -79,8 +80,10 @@ class Config:
         # окклюзией. При TRACKER_COAST=off lost-треки живут, но не видны.
         self.tracker_coast: bool = os.environ.get('TRACKER_COAST', 'off') == 'on'
         # TRACKER_TRAILS — хвосты траекторий (deque центров bbox, до 24
-        # кадров) в объектах API → рисуются на фронте.
-        self.tracker_trails: bool = (os.environ.get('TRACKER_TRAILS', 'off')
+        # кадров) в объектах API → рисуются на фронте. По умолчанию on:
+        # визуализация траекторий видна в вебморде сразу; отключается
+        # env-ом TRACKER_TRAILS=off.
+        self.tracker_trails: bool = (os.environ.get('TRACKER_TRAILS', 'on')
                                      == 'on')
         self.model_dir: str = os.environ.get('MODEL_DIR', '/app/model')
         self.host: str = os.environ.get('HOST', '0.0.0.0')
